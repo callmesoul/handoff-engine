@@ -1,0 +1,25 @@
+# 两端通用的局域网通知 outbox 发送与重试服务。
+# create/终态写入只负责入队；本服务独占密钥完成签名与投递。
+# EnvironmentFile 中放 HANDOFF_NOTIFY_SECRET。
+
+[Unit]
+Description=Handoff LAN notification outbox sender
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=handoff
+Group=handoff
+WorkingDirectory=/srv/handoff/store
+EnvironmentFile=/etc/handoff/notifier.env
+Environment=PYTHONPATH=/opt/handoff/app/src
+ExecStart=/opt/handoff/app/.venv/bin/python -m handoff.cli --root /srv/handoff/store notifier
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

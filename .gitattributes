@@ -1,0 +1,26 @@
+# 行尾统一。
+#
+# 背景：本仓在 Windows（core.autocrlf=true）和 WSL（无 autocrlf）两侧同时检出。
+# Windows 侧 checkout 会把工作区写成 CRLF，WSL 侧 git 于是认为整文件被改——
+# 表现为 VSCode 里一屏假改动，更糟的是 deploy/autoupdate/selfupdate.py 的
+# 「工作区脏就拒绝更新」会把这种假脏当成真脏，自动更新永久停摆。
+#
+# 规则优先于 core.autocrlf，两侧行为一致。
+
+* text=auto eol=lf
+
+# Windows 原生脚本保留 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.sqlite3 binary
+*.pyc binary

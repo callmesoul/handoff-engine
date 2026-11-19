@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.handoff-run/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.coverage
+
+.workbuddy/
+
+# 本机覆盖，不进 Git
+config/local.yaml
+.venv-win/
+
+# 编辑器状态，随时变
+.codex/current-editor-context.json
+
+# 待回收产物（由定时任务统一清理）
+.trash/

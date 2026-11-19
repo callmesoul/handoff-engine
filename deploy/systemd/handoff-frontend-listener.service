@@ -1,0 +1,15 @@
+[Unit]
+Description=Handoff frontend completion listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/handoff-store
+Environment=HANDOFF_ROOT=%h/code/handoff-store
+ExecStart=%h/code/handoff-engine/.venv/bin/handoffctl --root %h/code/handoff-store frontend-listener
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

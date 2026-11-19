@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://handoff.local/schemas/codex-result.schema.json",
+  "title": "CodexResult",
+  "description": "codex exec --output-schema 的最终结构化结果。worker 只信任通过本 schema 校验的输出。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "changed_paths",
+    "tests",
+    "migration_required",
+    "risks",
+    "notes",
+    "commit_message"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "completed",
+        "blocked",
+        "failed"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "changed_paths": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": {
+        "type": "string",
+        "maxLength": 500
+      }
+    },
+    "tests": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status",
+          "output"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "skipped"
+            ]
+          },
+          "output": {
+            "type": "string",
+            "maxLength": 4000
+          }
+        }
+      }
+    },
+    "migration_required": {
+      "type": "boolean"
+    },
+    "risks": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "maxLength": 1000
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "commit_message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "将用作 git commit -m 的提交信息，概括本次改动做了什么、为什么。外部流程自动提交时使用。"
+    }
+  }
+}

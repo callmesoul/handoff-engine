@@ -1,0 +1,7 @@
+codex:
+  binary: codex
+  sandbox: workspace-write
+  timeout_seconds: 3600
+  model: null
+  persist_thread: true
+  keep_worktree: true

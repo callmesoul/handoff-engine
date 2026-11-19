@@ -1,0 +1,29 @@
+index:
+  database: .handoff-run/index/handoff.sqlite3
+  poll_interval_seconds: 30
+  quarantine_table: quarantined_records
+
+server:
+  host: 127.0.0.1
+  port: 8787
+  read_only: false
+
+# 仅供本地初始化。部署前替换 token，并保持交接仓私有。
+users:
+  - token: replace-viewer-token
+    id: viewer@example
+    role: viewer
+    repos: ["*"]
+  - token: replace-operator-token
+    id: operator@example
+    role: operator
+    repos: ["your-org/api"]
+  - token: replace-admin-token
+    id: admin@example
+    role: admin
+    repos: ["*"]
+
+retention:
+  events_days: null
+  codex_logs_days: 30
+  check_output_days: 30

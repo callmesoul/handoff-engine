@@ -1,0 +1,6 @@
+zcode:
+  binary: zcode
+  timeout_seconds: 3600
+  model: null
+  effort: null
+  permission_mode: acceptEdits

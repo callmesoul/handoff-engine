@@ -1,0 +1,6 @@
+# Registers the Handoff Studio host fiber. Install Handoff Engine in the Python
+# environment selected by HANDOFF_STUDIO_PYTHON and point HANDOFF_ROOT at the
+# separate private handoff store. Optional overrides are documented in README.md.
+- insert:
+    - id: handoff-studio
+      name: dsh-handoff-studio

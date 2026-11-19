@@ -1,0 +1,6 @@
+# Register the Handoff bridge so the DSH host can push a completed handoff
+# task back into the session that created it. The plugin only listens on the
+# loopback interface of the local DSH webserver and requires a shared token.
+- insert:
+    - id: dsh-handoff-bridge
+      name: dsh-handoff-bridge

@@ -1,0 +1,35 @@
+# 交接系统自身的自动更新（前端机器，systemctl --user）。
+#
+# 前端只重启 listener 和 notifier。两者都无状态：inbox/outbox 在 SQLite 里，
+# 重启后重放，幂等。所以不需要像后端那样等任务跑完。
+#
+# 安装：
+#   mkdir -p ~/.local/lib/handoff-selfupdate ~/.config/systemd/user
+#   cp deploy/autoupdate/selfupdate.py ~/.local/lib/handoff-selfupdate/
+#   cp deploy/systemd/handoff-selfupdate-user.service \
+#      deploy/systemd/handoff-selfupdate-user.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now handoff-selfupdate-user.timer
+#
+# 脚本不能留在 %h/code/handoff-app 里：它自己会 git merge。
+
+[Unit]
+Description=Handoff self-update (frontend, user session)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/handoff/selfupdate.env
+Environment=ROLE=frontend
+Environment=APP=%h/code/handoff-app
+Environment=PYTHONPATH=%h/code/handoff-app/src
+# 前端没有 store 的写权限需求；这里的 store 只用来读任务状态（可选）
+Environment=SERVICES=user:handoff-frontend-listener.service user:handoff-notifier.service
+
+ExecStart=%h/.local/lib/handoff-selfupdate/selfupdate.py
+
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

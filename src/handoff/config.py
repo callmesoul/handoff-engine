@@ -1,0 +1,702 @@
+"""配置加载。YAML 只描述确定性规则，不描述流程逻辑。"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import yaml
+
+from .errors import ConfigError
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """重复键直接报错。复制粘贴配置块时最容易踩：后一个会静默覆盖前一个。"""
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ConfigError(
+                f"重复的键 {key!r}（第 {key_node.start_mark.line + 1} 行）；同一个键只能出现一次"
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.construct_mapping = _construct_unique_mapping
+_UniqueKeyLoader.add_constructor("tag:yaml.org,2002:map", lambda loader, node: _construct_unique_mapping(loader, node, deep=True))
+
+
+def _read_yaml(path: Path) -> dict:
+    if not path.is_file():
+        raise ConfigError(f"缺少配置文件: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.load(fh, Loader=_UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{path.name} YAML 解析失败: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path.name} 顶层必须是映射")
+    return data
+
+
+def _resolve(root: Path, value: str | None) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else (root / path)
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_dsh_bridge_url(value: str) -> None:
+    """DSH 桥接只开在本机，地址也必须指向本机。"""
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        raise ConfigError(
+            "config/local.yaml: notifications.dsh_bridge_url 必须是无账号密码的 http/https URL"
+        )
+    host = parts.hostname
+    if not (host in ("localhost", "::1") or host.startswith("127.")):
+        raise ConfigError(
+            "config/local.yaml: notifications.dsh_bridge_url 必须指向本机 loopback"
+            "（DSH 桥接路由只在本机 DSH 进程里开）"
+        )
+
+
+def _validate_notification_url(value: str, expected_path: str, name: str) -> None:
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        raise ConfigError(f"config/local.yaml: notifications.{name} 必须是无账号密码的 http/https URL")
+    if parts.path != expected_path or parts.query or parts.fragment:
+        raise ConfigError(f"config/local.yaml: notifications.{name} 路径必须精确为 {expected_path}")
+
+
+@dataclass(frozen=True)
+class SecretsConfig:
+    """密钥文件所在的本机路径（值不进配置仓）。
+
+    各 agent 拿不到启动面板时的系统环境变量，框架读取这些文件后把值注入
+    codex/zcode 子进程环境。字段名与环境变量名一致：*_FILE 里放的是文件
+    路径，不是密钥本身。路径可相对交接仓根，也可用绝对路径 / ~。
+    """
+
+    HANDOFF_NOTIFY_SECRET_FILE: str | None = None
+    OPENAPI_API_KEY_FILE: str | None = None
+
+    def path(self, root: Path, env_name: str) -> Path | None:
+        """密钥文件的绝对路径；env_name 为注入变量名或 *_FILE 配置项名。
+
+        未配置返回 None。接受两种写法是为了和 secrets.py 的 env 名调用对齐。
+        """
+        file_key = env_name if env_name.endswith("_FILE") else env_name + "_FILE"
+        value = getattr(self, file_key, None)
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else (root / path)
+
+
+@dataclass(frozen=True)
+class StoreConfig:
+    branch: str = "main"
+    repo: str | None = None
+    tasks_dir: str = "tasks"
+    events_dir: str = "events"
+    contracts_dir: str = "contracts"
+    artifacts_dir: str = "artifacts"
+    remote: str = "origin"
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    id: str
+    role: str
+    host: str = "github"
+    default_branch: str = "main"
+    allowed_base_refs: tuple[str, ...] = ("dev",)
+    pr_base_ref: str | None = None
+    cache_dir: str | None = None
+    remote: str | None = None
+
+    @property
+    def remote_url(self) -> str:
+        return self.remote or f"https://github.com/{self.id}.git"
+
+    def cache_path(self, root: Path) -> Path:
+        return _resolve(root, self.cache_dir) or (root / ".handoff-run" / "repo-cache" / self.id.replace("/", "__"))
+
+
+@dataclass(frozen=True)
+class EnvConfig:
+    name: str
+    url: str | None = None
+    version_path: str = "/version"
+    shared: bool = True
+    concurrency_group: str | None = None
+    auto_deploy: bool = False
+
+    def version_url(self) -> str | None:
+        if not self.url:
+            return None
+        return self.url.rstrip("/") + "/" + self.version_path.lstrip("/")
+
+
+@dataclass(frozen=True)
+class PollConfig:
+    interval_seconds: float = 10
+    timeout_seconds: float = 900
+    request_timeout_seconds: float = 10
+    backoff_factor: float = 1.0
+    max_interval_seconds: float = 60
+
+
+@dataclass(frozen=True)
+class SuiteSpec:
+    name: str
+    repo: str
+    argv: tuple[str, ...]
+    timeout_seconds: float = 900
+    cwd: str = "."
+    serial_group: str | None = None
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    required_checks: tuple[str, ...] = ()
+    high_risk_paths: tuple[str, ...] = ()
+    # 交接范围只到 develop 分支的代码交付，不包含数据库迁移，
+    # 因此默认不因 migration.required 阻断自动合并。
+    deny_auto_merge_if_migration_required: bool = False
+    max_changed_files: int = 400
+    max_file_bytes: int = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class VerifierConfig:
+    output_limit_chars: int = 4000
+    max_parallel: int = 1
+    deny_cidrs: tuple[str, ...] = ()
+    repo_paths: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ChecksConfig:
+    test_suites: dict[str, SuiteSpec] = field(default_factory=dict)
+    repo_scripts: dict[str, SuiteSpec] = field(default_factory=dict)
+    gate: GateConfig = field(default_factory=GateConfig)
+    verifier: VerifierConfig = field(default_factory=VerifierConfig)
+
+
+@dataclass(frozen=True)
+class CodexConfig:
+    binary: str = "codex"
+    sandbox: str = "workspace-write"
+    timeout_seconds: float = 3600
+    model: str | None = None
+    persist_thread: bool = False
+    keep_worktree: bool = False
+    # 传给执行器子进程的额外环境变量。典型用途：HTTP_PROXY / HTTPS_PROXY。
+    # 放在配置里而不是依赖启动终端，否则从快捷方式/计划任务起面板就丢了代理。
+    env: dict[str, str] = field(default_factory=dict)
+    # 思考程度（codex 的 model_reasoning_effort）。None 表示跟随 codex 全局配置。
+    effort: str | None = None
+    # 面板下拉候选；留空则只显示「跟随配置」一项
+    models: tuple[str, ...] = ()
+    efforts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ZcodeConfig:
+    """zcode 执行器。会话总是落盘（无 --ephemeral 概念），resume 用 --resume。"""
+
+    binary: str = "zcode"
+    timeout_seconds: float = 3600
+    model: str | None = None
+    effort: str | None = None
+    permission_mode: str = "acceptEdits"
+    models: tuple[str, ...] = ()
+    efforts: tuple[str, ...] = ()
+    # 子进程额外环境变量。Windows 上必须给 ZCODE_GIT_BASH_PATH，
+    # 否则 zcode 的 Bash 工具直接报 "needs Git Bash on Windows"。
+    env: dict[str, str] = field(default_factory=dict)
+
+
+def _clean_dir(value) -> str | None:
+    """配置里的路径常被编辑器塞进 BOM / 零宽字符，先清干净再用。"""
+    text = str(value or "").strip().strip("\ufeff\u200b\u200c\u200d\u2060\u00a0").strip()
+    return text or None
+
+
+@dataclass(frozen=True)
+class PanelConfig:
+    """桌面面板（handoffctl panel）。只绑本机回环，不给局域网用。"""
+
+    host: str = "127.0.0.1"
+    # 8789 留给 frontend-listener（后端回推 task.completed 打的就是这个端口），面板避开
+    port: int = 8790
+    worker_id: str = "handoff-panel"
+    default_executor: str = "zcode"
+    auto_merge: bool = True
+    wait_deployment: bool = True
+    # 目录模式执行完自动提交并推送（AI 写提交信息）；默认关，勾了才生效
+    auto_commit: bool = False
+    # 自动模式的默认工作目录：填了就直接在这个目录跑，不建隔离 worktree。
+    # 留空时按任务的 target.repo 回退到 config/local.yaml 的 repo_paths。
+    default_work_dir: str | None = None
+    # 自动模式的会话策略：new 每次新会话；continue 接续该任务上次的会话
+    session_strategy: str = "new"
+    poll_interval_seconds: float = 5
+    open_browser: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.port <= 65535:
+            raise ConfigError(f"panel: port 必须在 0..65535，得到 {self.port!r}")
+
+
+@dataclass(frozen=True)
+class NotificationConfig:
+    """局域网任务唤醒配置；密钥只从环境变量读取，不进配置仓。"""
+
+    url: str | None = None
+    secret_env: str = "HANDOFF_NOTIFY_SECRET"
+    outbox_database: str = ".handoff-run/notify/outbox.sqlite3"
+    inbox_database: str = ".handoff-run/notify/inbox.sqlite3"
+    session_database: str = ".handoff-run/notify/frontend-sessions.sqlite3"
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8788
+    allowed_cidrs: tuple[str, ...] = ()
+    completion_url: str | None = None
+    queue_remote: str | None = None
+    queue_remote_auth_token_env: str | None = None
+    dsh_bridge_url: str | None = None
+    dsh_bridge_token_env: str | None = None
+    request_timeout_seconds: float = 5
+    max_skew_seconds: int = 300
+    retry_initial_seconds: float = 2
+    retry_max_seconds: float = 300
+
+    def outbox_path(self, root: Path) -> Path:
+        return _resolve(root, self.outbox_database) or (root / ".handoff-run" / "notify" / "outbox.sqlite3")
+
+    def inbox_path(self, root: Path) -> Path:
+        return _resolve(root, self.inbox_database) or (root / ".handoff-run" / "notify" / "inbox.sqlite3")
+
+    def session_path(self, root: Path) -> Path:
+        return _resolve(root, self.session_database) or (
+            root / ".handoff-run" / "notify" / "frontend-sessions.sqlite3"
+        )
+
+
+@dataclass(frozen=True)
+class UserConfig:
+    token: str
+    id: str
+    role: str
+    repos: tuple[str, ...] = ("*",)
+
+
+@dataclass(frozen=True)
+class AdminConfig:
+    database: str = ".handoff-run/index/handoff.sqlite3"
+    poll_interval_seconds: float = 30
+    host: str = "127.0.0.1"
+    port: int = 8787
+    read_only: bool = False
+    users: tuple[UserConfig, ...] = ()
+    codex_logs_days: int | None = 30
+
+    def database_path(self, root: Path) -> Path:
+        return _resolve(root, self.database) or (root / ".handoff-run" / "index" / "handoff.sqlite3")
+
+
+def _apply_local(local: dict, repositories, environments, checks, admin, codex, zcode, panel, notifications, secrets):
+    """把 config/local.yaml 合并进来。只认下面几个键，拼错就报错。"""
+    known = {
+        "repo_paths", "repositories", "environments", "codex", "zcode", "panel", "admin",
+        "gate", "notifications", "secrets",
+    }
+    unknown = set(local) - known
+    if unknown:
+        raise ConfigError(f"config/local.yaml 里有未知键: {', '.join(sorted(unknown))}")
+
+    if local.get("secrets"):
+        patch = dict(local["secrets"])
+        if set(patch) - set(SecretsConfig.__dataclass_fields__):
+            bad = sorted(set(patch) - set(SecretsConfig.__dataclass_fields__))
+            raise ConfigError(f"config/local.yaml: secrets 有未知键: {', '.join(bad)}")
+        for key, value in patch.items():
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(f"config/local.yaml: secrets.{key} 必须是文件路径字符串")
+        secrets = replace(secrets, **patch)
+
+    repos = dict(repositories)
+    for repo_id, patch in (local.get("repositories") or {}).items():
+        if repo_id not in repos:
+            raise ConfigError(f"config/local.yaml: 仓库 {repo_id!r} 未注册")
+        repos[repo_id] = replace(repos[repo_id], **patch)
+
+    envs = dict(environments)
+    for name, patch in (local.get("environments") or {}).items():
+        if name not in envs:
+            raise ConfigError(f"config/local.yaml: 环境 {name!r} 未注册")
+        envs[name] = replace(envs[name], **patch)
+
+    if "repo_paths" in local:
+        paths = dict(checks.verifier.repo_paths)
+        for repo_id, path in (local["repo_paths"] or {}).items():
+            if str(repo_id) not in repos:
+                raise ConfigError(f"config/local.yaml: repo_paths 里的 {repo_id!r} 未注册")
+            paths[str(repo_id)] = str(path)
+        checks = replace(checks, verifier=replace(checks.verifier, repo_paths=paths))
+
+    if local.get("codex"):
+        codex = replace(codex, **local["codex"])
+
+    if local.get("zcode"):
+        try:
+            zcode = replace(zcode, **local["zcode"])
+        except TypeError as exc:
+            raise ConfigError(f"config/local.yaml: zcode 配置错误: {exc}") from exc
+
+    if local.get("panel"):
+        panel_patch = dict(local["panel"])
+        if "default_work_dir" in panel_patch:
+            panel_patch["default_work_dir"] = _clean_dir(panel_patch["default_work_dir"])
+        try:
+            panel = replace(panel, **panel_patch)
+        except TypeError as exc:
+            raise ConfigError(f"config/local.yaml: panel 配置错误: {exc}") from exc
+
+    if local.get("admin"):
+        admin = replace(admin, **local["admin"])
+
+    if local.get("notifications"):
+        patch = dict(local["notifications"])
+        if "allowed_cidrs" in patch:
+            patch["allowed_cidrs"] = tuple(patch["allowed_cidrs"] or ())
+        try:
+            notifications = replace(notifications, **patch)
+        except TypeError as exc:
+            raise ConfigError(f"config/local.yaml: notifications 配置错误: {exc}") from exc
+        if not 0 <= notifications.listen_port <= 65535:
+            raise ConfigError("config/local.yaml: notifications.listen_port 必须在 0..65535")
+        if notifications.queue_remote_auth_token_env and not notifications.queue_remote:
+            raise ConfigError("config/local.yaml: queue_remote_auth_token_env 需要同时配置 queue_remote")
+        if notifications.dsh_bridge_url:
+            _validate_dsh_bridge_url(notifications.dsh_bridge_url)
+        if notifications.dsh_bridge_token_env and not _ENV_NAME_RE.fullmatch(
+            notifications.dsh_bridge_token_env
+        ):
+            raise ConfigError(
+                "config/local.yaml: notifications.dsh_bridge_token_env 必须是合法的环境变量名"
+            )
+        if notifications.url:
+            _validate_notification_url(notifications.url, "/v1/handoff/wake", "url")
+        if notifications.completion_url:
+            _validate_notification_url(
+                notifications.completion_url,
+                "/v1/handoff/completed",
+                "completion_url",
+            )
+        for name in (
+            "request_timeout_seconds",
+            "max_skew_seconds",
+            "retry_initial_seconds",
+            "retry_max_seconds",
+        ):
+            if getattr(notifications, name) <= 0:
+                raise ConfigError(f"config/local.yaml: notifications.{name} 必须大于 0")
+
+    # 面板和 frontend-listener 抢同一个端口是本机实际踩过的坑，配完就地拦下
+    if panel.port == notifications.listen_port:
+        raise ConfigError(
+            "config/local.yaml: panel.port 不能等于 notifications.listen_port"
+            f"（{notifications.listen_port} 已被 frontend-listener 占用）"
+        )
+
+    if "gate" in local:
+        gate = local["gate"]
+        if not isinstance(gate, dict) or set(gate) != {"max_file_bytes"}:
+            raise ConfigError("config/local.yaml: gate 仅允许覆盖 max_file_bytes")
+        size = gate["max_file_bytes"]
+        if type(size) is not int or size <= 0:
+            raise ConfigError("config/local.yaml: max_file_bytes 必须为正整数")
+        checks = replace(checks, gate=replace(checks.gate, max_file_bytes=size))
+
+    return repos, envs, checks, admin, codex, zcode, panel, notifications, secrets
+
+
+class Config:
+    def __init__(
+        self,
+        root: Path,
+        store: StoreConfig,
+        repositories,
+        environments,
+        deploy_poll,
+        verify_poll,
+        checks,
+        admin,
+        codex=None,
+        zcode=None,
+        panel=None,
+        notifications=None,
+        secrets=None,
+    ):
+        self.root = Path(root)
+        self.store = store
+        self.repositories: dict[str, RepoConfig] = repositories
+        self.environments: dict[str, EnvConfig] = environments
+        self.deploy_poll = deploy_poll
+        self.verify_poll = verify_poll
+        self.checks = checks
+        self.admin = admin
+        self.codex: CodexConfig = codex or CodexConfig()
+        self.zcode: ZcodeConfig = zcode or ZcodeConfig()
+        self.panel: PanelConfig = panel or PanelConfig()
+        self.notifications: NotificationConfig = notifications or NotificationConfig()
+        self.secrets: SecretsConfig = secrets or SecretsConfig()
+        # 让 notification.load_secret 能从配置文件取密钥（它通常只拿到 NotificationConfig）
+        object.__setattr__(self.notifications, "_app_config", self)
+
+    # -- 查找 --------------------------------------------------------------
+    def repo(self, repo_id: str) -> RepoConfig:
+        try:
+            return self.repositories[repo_id]
+        except KeyError as exc:
+            raise ConfigError(f"仓库未注册: {repo_id}") from exc
+
+    def env(self, name: str) -> EnvConfig:
+        try:
+            return self.environments[name]
+        except KeyError as exc:
+            raise ConfigError(f"环境未注册: {name}") from exc
+
+    def repos_by_role(self, role: str) -> list[RepoConfig]:
+        return [r for r in self.repositories.values() if r.role == role]
+
+    # -- 加载 --------------------------------------------------------------
+    @classmethod
+    def load(cls, root: str | Path) -> "Config":
+        root = Path(root).resolve()
+        conf_dir = root / "config"
+
+        raw_repos = _read_yaml(conf_dir / "repositories.yaml")
+        store = StoreConfig(**(raw_repos.get("store") or {}))
+
+        repositories: dict[str, RepoConfig] = {}
+        for item in raw_repos.get("repositories") or []:
+            if "id" not in item:
+                raise ConfigError("repositories.yaml 里每个仓库必须有 id")
+            allowed = tuple(item.get("allowed_base_refs") or ["dev"])
+            repo = RepoConfig(
+                id=item["id"],
+                role=item.get("role", "backend"),
+                host=item.get("host", "github"),
+                default_branch=item.get("default_branch", "main"),
+                allowed_base_refs=allowed,
+                pr_base_ref=item.get("pr_base_ref") or (allowed[0] if allowed else None),
+                cache_dir=item.get("cache_dir"),
+                remote=item.get("remote"),
+            )
+            if repo.role not in ("backend", "frontend"):
+                raise ConfigError(f"{repo.id}: role 必须是 backend/frontend")
+            repositories[repo.id] = repo
+        if not repositories:
+            raise ConfigError("repositories.yaml 里没有任何仓库")
+
+        raw_envs = _read_yaml(conf_dir / "environments.yaml")
+        environments: dict[str, EnvConfig] = {}
+        for item in raw_envs.get("environments") or []:
+            env = EnvConfig(
+                name=item["name"],
+                url=item.get("url"),
+                version_path=item.get("version_path", "/version"),
+                shared=bool(item.get("shared", True)),
+                concurrency_group=item.get("concurrency_group"),
+                auto_deploy=bool(item.get("auto_deploy", False)),
+            )
+            environments[env.name] = env
+        if not environments:
+            raise ConfigError("environments.yaml 里没有任何环境")
+
+        deploy_poll = PollConfig(**(raw_envs.get("deploy_poll") or {}))
+        verify_poll = PollConfig(**(raw_envs.get("verify_poll") or {}))
+
+        raw_checks = _read_yaml(conf_dir / "checks.yaml")
+        suites = {
+            name: SuiteSpec(
+                name=name,
+                repo=spec["repo"],
+                argv=tuple(spec["argv"]),
+                timeout_seconds=float(spec.get("timeout_seconds", 900)),
+                cwd=spec.get("cwd", "."),
+                serial_group=spec.get("serial_group"),
+            )
+            for name, spec in (raw_checks.get("test_suites") or {}).items()
+        }
+        scripts = {
+            name: SuiteSpec(
+                name=name,
+                repo=spec["repo"],
+                argv=(spec["path"],),
+                timeout_seconds=float(spec.get("timeout_seconds", 600)),
+                cwd=spec.get("cwd", "."),
+                serial_group=spec.get("serial_group"),
+            )
+            for name, spec in (raw_checks.get("repo_scripts") or {}).items()
+        }
+        gate_raw = raw_checks.get("gate") or {}
+        gate = GateConfig(
+            required_checks=tuple(gate_raw.get("required_checks") or ()),
+            high_risk_paths=tuple(gate_raw.get("high_risk_paths") or ()),
+            deny_auto_merge_if_migration_required=bool(gate_raw.get("deny_auto_merge_if_migration_required", False)),
+            max_changed_files=int(gate_raw.get("max_changed_files", 400)),
+            max_file_bytes=int(gate_raw.get("max_file_bytes", 2 * 1024 * 1024)),
+        )
+        ver_raw = raw_checks.get("verifier") or {}
+        verifier = VerifierConfig(
+            output_limit_chars=int(ver_raw.get("output_limit_chars", 4000)),
+            max_parallel=int(ver_raw.get("max_parallel", 1)),
+            deny_cidrs=tuple(ver_raw.get("deny_cidrs") or ()),
+            repo_paths=dict(ver_raw.get("repo_paths") or {}),
+        )
+        checks = ChecksConfig(test_suites=suites, repo_scripts=scripts, gate=gate, verifier=verifier)
+
+        admin_raw = _read_yaml(conf_dir / "admin.yaml")
+        index_raw = admin_raw.get("index") or {}
+        server_raw = admin_raw.get("server") or {}
+        retention_raw = admin_raw.get("retention") or {}
+        users = tuple(
+            UserConfig(
+                token=u["token"],
+                id=u["id"],
+                role=u.get("role", "viewer"),
+                repos=tuple(u.get("repos") or ("*",)),
+            )
+            for u in (admin_raw.get("users") or [])
+        )
+        for user in users:
+            if user.role not in ("viewer", "operator", "admin"):
+                raise ConfigError(f"admin.yaml: 未知角色 {user.role!r}")
+        admin = AdminConfig(
+            database=index_raw.get("database", ".handoff-run/index/handoff.sqlite3"),
+            poll_interval_seconds=float(index_raw.get("poll_interval_seconds", 30)),
+            host=server_raw.get("host", "127.0.0.1"),
+            port=int(server_raw.get("port", 8787)),
+            read_only=bool(server_raw.get("read_only", False)),
+            users=users,
+            codex_logs_days=retention_raw.get("codex_logs_days", 30),
+        )
+
+        codex_path = conf_dir / "codex.yaml"
+        if codex_path.is_file():
+            raw_codex = _read_yaml(codex_path).get("codex") or {}
+            codex_env = raw_codex.get("env") or {}
+            if not isinstance(codex_env, dict):
+                raise ConfigError("codex.env 必须是键值对象，例如 env: {HTTP_PROXY: http://127.0.0.1:10808}")
+            codex = CodexConfig(
+                binary=raw_codex.get("binary", "codex"),
+                sandbox=raw_codex.get("sandbox", "workspace-write"),
+                timeout_seconds=float(raw_codex.get("timeout_seconds", 3600)),
+                model=raw_codex.get("model"),
+                persist_thread=bool(raw_codex.get("persist_thread", False)),
+                keep_worktree=bool(raw_codex.get("keep_worktree", False)),
+                env={str(k): str(v) for k, v in codex_env.items() if v is not None},
+                effort=raw_codex.get("effort"),
+                models=tuple(str(m) for m in (raw_codex.get("models") or ())),
+                efforts=tuple(str(e) for e in (raw_codex.get("efforts") or ())),
+            )
+        else:
+            codex = CodexConfig()
+
+        zcode_path = conf_dir / "zcode.yaml"
+        if zcode_path.is_file():
+            raw_zcode = _read_yaml(zcode_path).get("zcode") or {}
+            zcode_env = raw_zcode.get("env") or {}
+            if not isinstance(zcode_env, dict):
+                raise ConfigError("zcode.env 必须是键值对象，例如 env: {ZCODE_GIT_BASH_PATH: C:\\Program Files\\Git\\bin\\bash.exe}")
+            zcode = ZcodeConfig(
+                binary=raw_zcode.get("binary", "zcode"),
+                timeout_seconds=float(raw_zcode.get("timeout_seconds", 3600)),
+                model=raw_zcode.get("model"),
+                effort=raw_zcode.get("effort"),
+                permission_mode=raw_zcode.get("permission_mode", "acceptEdits"),
+                models=tuple(str(m) for m in (raw_zcode.get("models") or ())),
+                efforts=tuple(str(e) for e in (raw_zcode.get("efforts") or ())),
+                env={str(k): str(v) for k, v in zcode_env.items() if v is not None},
+            )
+        else:
+            zcode = ZcodeConfig()
+
+        panel_path = conf_dir / "panel.yaml"
+        if panel_path.is_file():
+            raw_panel = _read_yaml(panel_path).get("panel") or {}
+            panel = PanelConfig(
+                host=raw_panel.get("host", "127.0.0.1"),
+                port=int(raw_panel.get("port", 8790)),
+                worker_id=raw_panel.get("worker_id", "handoff-panel"),
+                default_executor=raw_panel.get("default_executor", "zcode"),
+                auto_merge=bool(raw_panel.get("auto_merge", True)),
+                wait_deployment=bool(raw_panel.get("wait_deployment", True)),
+                auto_commit=bool(raw_panel.get("auto_commit", False)),
+                default_work_dir=_clean_dir(raw_panel.get("default_work_dir")),
+                session_strategy=raw_panel.get("session_strategy", "new"),
+                poll_interval_seconds=float(raw_panel.get("poll_interval_seconds", 5)),
+                open_browser=bool(raw_panel.get("open_browser", True)),
+            )
+            if panel.default_executor not in ("zcode", "codex"):
+                raise ConfigError(f"panel.yaml: default_executor 只能是 zcode/codex，得到 {panel.default_executor!r}")
+            if panel.session_strategy not in ("new", "continue"):
+                raise ConfigError(f"panel.yaml: session_strategy 只能是 new/continue，得到 {panel.session_strategy!r}")
+        else:
+            panel = PanelConfig()
+
+        notifications = NotificationConfig()
+        secrets = SecretsConfig()
+
+        # 本机覆盖：config/local.yaml 不进 Git，放机器专属路径（repo_paths、cache_dir、codex 路径…）
+        local_path = conf_dir / "local.yaml"
+        if local_path.is_file():
+            local = _read_yaml(local_path)
+            (
+                repositories, environments, checks, admin, codex, zcode, panel,
+                notifications, secrets,
+            ) = _apply_local(
+                local, repositories, environments, checks, admin, codex, zcode, panel,
+                notifications, secrets,
+            )
+
+        return cls(
+            root,
+            store,
+            repositories,
+            environments,
+            deploy_poll,
+            verify_poll,
+            checks,
+            admin,
+            codex,
+            zcode,
+            panel,
+            notifications,
+            secrets,
+        )
+
+
+def find_root(start: str | Path | None = None) -> Path:
+    """从当前目录向上找 config/repositories.yaml，找不到就报错，不猜。"""
+    current = Path(start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config" / "repositories.yaml").is_file():
+            return candidate
+    raise ConfigError(f"向上未找到 config/repositories.yaml（起点 {current}）")

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# handoffctl 薄包装：不安装包也能用，PYTHONPATH 指向 src/。
+# 解释器优先级：$PYTHON → 仓库内 venv → python3。
+#   Linux/macOS/WSL 用 .venv
+#   Windows(Git Bash) 用 .venv-win（仓库里的 .venv 是 Linux 解释器，不能复用）
+# 常见 bin 目录兜底加进 PATH：从 systemd / cron / WSL interop 启动时 PATH 可能是空的。
+set -euo pipefail
+
+# 允许从 ~/.local/bin 等位置用符号链接安装；始终以真实脚本所在仓库为根。
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$SOURCE_DIR/$SOURCE" ;;
+  esac
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+
+export PYTHONPATH="$HERE/../src${PYTHONPATH:+:$PYTHONPATH}"
+
+for dir in /usr/local/bin /usr/bin /bin "${HOME:-/root}/.local/bin"; do
+  case ":${PATH:-}:" in
+    *":$dir:"*) ;;
+    *) PATH="$dir:${PATH:-}" ;;
+  esac
+done
+export PATH
+
+case "$UNAME_S" in
+  MINGW*|MSYS*|CYGWIN*)
+    # 原生 Windows python 读不懂 POSIX 路径，转成 Windows 形式
+    PYTHONPATH="$(cygpath -wp "$PYTHONPATH")"
+    export PYTHONPATH
+    if [ -z "${PYTHON:-}" ] && [ -x "$HERE/../.venv-win/Scripts/python.exe" ]; then
+      PYTHON="$HERE/../.venv-win/Scripts/python.exe"
+    fi
+    ;;
+  *)
+    if [ -z "${PYTHON:-}" ] && [ -x "$HERE/../.venv/bin/python" ]; then
+      PYTHON="$HERE/../.venv/bin/python"
+    fi
+    if [ -z "${PYTHON:-}" ] && [ -x "$HERE/../.venv-win/Scripts/python.exe" ]; then
+      PYTHON="$HERE/../.venv-win/Scripts/python.exe"
+    fi
+    ;;
+esac
+
+exec "${PYTHON:-python3}" -m handoff.cli "$@"

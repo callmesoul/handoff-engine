@@ -1,0 +1,11 @@
+panel:
+  host: 127.0.0.1
+  port: 8790
+  worker_id: handoff-panel
+  default_executor: zcode
+  auto_merge: true
+  wait_deployment: true
+  auto_commit: false
+  session_strategy: new
+  poll_interval_seconds: 5
+  open_browser: true

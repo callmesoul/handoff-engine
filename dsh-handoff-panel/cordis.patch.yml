@@ -1,0 +1,7 @@
+# Insert the Handoff Panel host service into the desktop profile.
+# The service registers the /handoff-panel/* web route the browser half probes;
+# the browser half (lib/client.js) adds the sidebar entry and the main panel
+# that embeds the Python task panel over an iframe.
+- insert:
+    - id: handoff-panel
+      name: dsh-handoff-panel

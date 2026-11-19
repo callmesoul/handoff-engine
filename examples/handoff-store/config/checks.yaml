@@ -1,0 +1,26 @@
+# 任务只能引用这里审核过的命令；argv 不经过 shell。
+test_suites: {}
+repo_scripts: {}
+
+gate:
+  required_checks: []
+  high_risk_paths:
+    - ".github/**"
+    - "infra/prod/**"
+    - "**/migrations/**"
+    - "**/auth/**"
+    - "**/payment/**"
+  deny_auto_merge_if_migration_required: true
+  max_changed_files: 400
+  max_file_bytes: 2097152
+
+verifier:
+  output_limit_chars: 4000
+  max_parallel: 4
+  deny_cidrs:
+    - "127.0.0.0/8"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "169.254.0.0/16"
+    - "::1/128"

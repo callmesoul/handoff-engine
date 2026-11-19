@@ -1,0 +1,2239 @@
+/**
+ * Browser half of `dsh-handoff-studio`: the full task panel.
+ *
+ * Registers a sidebar entry (`sidebar.panellist`) and its matching `main` key — DSH
+ * requires them as a pair; a sidebar row without a main key throws on click.
+ *
+ * This is a deliberate port of the original Python panel's surface, not a subset:
+ * mode switch (manual/auto), auto configuration, new task, sync, status filter,
+ * pagination, the task drawer with all eight actions, the run modal (executor, model,
+ * effort, session resume, work-dir mode, auto-merge/deploy/commit), the session
+ * picker, log history, security mode and the deliver/advance progress readouts.
+ *
+ * All data comes from the Python studio engine through the host half's same-origin
+ * proxy (`/handoff-studio/panel/*`), so there is no CORS and no second port visible
+ * to the browser.
+ *
+ * Styling uses only `--dsw-alias-*` theme tokens so light/dark and host theming work.
+ */
+window.__ModuleLoader__.load({
+  id: "dsh-handoff-studio",
+  factory: function (require) {
+    var module = { exports: {} };
+    var exports = module.exports;
+    Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+
+    var React = require("react");
+    var h = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useCallback = React.useCallback;
+    var useMemo = React.useMemo;
+    var useRef = React.useRef;
+
+    var PANEL_ID = "handoff-studio";
+    var LABEL = "工作台";
+    var API = "/handoff-studio/panel";
+
+    var STATUSES = [
+      "open", "claimed", "in_progress", "delivered", "awaiting_merge",
+      "merged", "deployed", "verifying", "verified", "frontend_accepted",
+      "failed", "cancelled",
+    ];
+
+    // -- 样式 ----------------------------------------------------------------
+    var CSS = [
+      ".hs-root{display:flex;flex-direction:column;flex:1 1 0;min-height:0;min-width:0;",
+      "background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;}",
+      ".hs-bar{display:flex;align-items:center;gap:10px;padding:8px 14px;flex:0 0 auto;",
+      "border-bottom:1px solid var(--dsw-alias-border-l1);flex-wrap:wrap;}",
+      ".hs-title{font-weight:600;}",
+      ".hs-muted{color:var(--dsw-alias-label-secondary);}",
+      ".hs-spacer{flex:1 1 auto;}",
+      ".hs-dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;}",
+      ".hs-dot.on{background:var(--dsw-alias-state-success-primary);}",
+      ".hs-dot.off{background:var(--dsw-alias-state-idle-primary);}",
+      ".hs-btn{font:inherit;font-size:12px;line-height:1;padding:5px 10px;border-radius:6px;",
+      "border:1px solid var(--dsw-alias-border-l1);cursor:pointer;background:transparent;",
+      "color:var(--dsw-alias-label-primary);}",
+      ".hs-btn:hover:not(:disabled){border-color:var(--dsw-alias-border-l2);}",
+      ".hs-btn:disabled{opacity:.5;cursor:default;}",
+      ".hs-btn.primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:#fff;}",
+      ".hs-btn.danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary);}",
+      ".hs-btn.sm{font-size:11px;padding:3px 8px;}",
+      ".hs-select,.hs-input,.hs-textarea{font:inherit;font-size:12px;padding:4px 6px;border-radius:6px;",
+      "background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);",
+      "border:1px solid var(--dsw-alias-border-l1);}",
+      ".hs-textarea{width:100%;min-height:90px;line-height:1.5;resize:vertical;font-size:12.5px;}",
+      ".hs-mode{display:flex;border:1px solid var(--dsw-alias-border-l1);border-radius:7px;overflow:hidden;}",
+      ".hs-mode button{border:none;border-radius:0;padding:5px 12px;background:transparent;",
+      "font:inherit;font-size:12px;cursor:pointer;color:var(--dsw-alias-label-primary);}",
+      ".hs-mode button.active{background:var(--dsw-alias-brand-primary);color:#fff;}",
+      ".hs-body{flex:1 1 0;min-height:0;display:flex;flex-direction:column;overflow:hidden;}",
+      ".hs-scroll{overflow:auto;flex:1 1 0;min-height:0;}",
+      ".hs-notice{padding:8px 14px;font-size:12px;border-bottom:1px solid var(--dsw-alias-border-l1);",
+      "color:var(--dsw-alias-state-warn-primary);}",
+      ".hs-notice.err{color:var(--dsw-alias-state-error-primary);}",
+
+      ".hs-run{flex:0 0 auto;border-bottom:1px solid var(--dsw-alias-border-l1);",
+      "background:var(--dsw-alias-bg-layer-1);padding:10px 14px;}",
+      ".hs-run-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;}",
+      ".hs-log{max-height:210px;overflow:auto;white-space:pre-wrap;word-break:break-word;",
+      "font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.6;",
+      "background:var(--dsw-alias-bg-base);border-radius:6px;padding:8px 10px;",
+      "border:1px solid var(--dsw-alias-border-l1);}",
+      ".hs-log .ln-tool{color:var(--dsw-alias-brand-primary);}",
+      ".hs-log .ln-warn{color:var(--dsw-alias-state-warn-primary);}",
+      ".hs-log .ln-end{color:var(--dsw-alias-state-success-primary);}",
+      ".hs-log .ln-err{color:var(--dsw-alias-state-error-primary);}",
+      ".hs-live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;",
+      "background:var(--dsw-alias-state-success-primary);margin-right:5px;}",
+
+      ".hs-table{width:100%;border-collapse:collapse;}",
+      ".hs-table th,.hs-table td{text-align:left;padding:7px 12px;",
+      "border-bottom:1px solid var(--dsw-alias-border-l1);vertical-align:top;}",
+      ".hs-table th{color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500;}",
+      ".hs-table tbody tr{cursor:pointer;}",
+      ".hs-table tbody tr:hover{background:var(--dsw-alias-bg-layer-1);}",
+      ".hs-table tbody tr.sel{background:var(--dsw-alias-bg-layer-1);",
+      "box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary);}",
+      ".hs-id{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11.5px;",
+      "text-decoration:underline;text-underline-offset:3px;cursor:pointer;}",
+      ".hs-chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11.5px;",
+      "border:1px solid var(--dsw-alias-border-l1);white-space:nowrap;}",
+      ".hs-chip.st-open{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);}",
+      ".hs-chip.st-claimed,.hs-chip.st-in_progress{color:var(--dsw-alias-state-warn-primary);",
+      "border-color:var(--dsw-alias-state-warn-primary);}",
+      ".hs-chip.st-verified,.hs-chip.st-frontend_accepted{color:var(--dsw-alias-state-success-primary);",
+      "border-color:var(--dsw-alias-state-success-primary);}",
+      ".hs-chip.st-failed{color:var(--dsw-alias-state-error-primary);",
+      "border-color:var(--dsw-alias-state-error-primary);}",
+      ".hs-chip.ex-dsh{color:var(--dsw-alias-brand-primary);border-style:dashed;}",
+      ".hs-chip.ex-codex{color:var(--dsw-alias-label-secondary);border-style:dashed;}",
+      ".hs-chip.ex-zcode{color:var(--dsw-alias-state-success-primary);border-style:dashed;}",
+      ".hs-empty{padding:40px 16px;text-align:center;color:var(--dsw-alias-label-secondary);}",
+      ".hs-fail{color:var(--dsw-alias-state-error-primary);font-size:11.5px;}",
+      ".hs-pager{display:flex;align-items:center;gap:8px;padding:8px 14px;",
+      "border-top:1px solid var(--dsw-alias-border-l1);font-size:12px;",
+      "color:var(--dsw-alias-label-secondary);flex-wrap:wrap;}",
+      ".hs-pager button{padding:3px 9px;}",
+
+      ".hs-drawer{position:absolute;top:0;right:0;bottom:0;width:min(720px,94%);",
+      "background:var(--dsw-alias-bg-overlay);border-left:1px solid var(--dsw-alias-border-l1);",
+      "display:flex;flex-direction:column;box-shadow:-8px 0 24px rgba(0,0,0,.18);z-index:5;}",
+      ".hs-dhead{display:flex;align-items:center;gap:10px;padding:12px 16px;",
+      "border-bottom:1px solid var(--dsw-alias-border-l1);flex:0 0 auto;}",
+      ".hs-dtitle{font-weight:600;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
+      ".hs-dbody{overflow:auto;padding:14px 16px;flex:1 1 0;min-height:0;}",
+      ".hs-sec{margin-bottom:18px;}",
+      ".hs-sec h3{font-size:12px;margin:0 0 7px;font-weight:600;letter-spacing:.3px;",
+      "color:var(--dsw-alias-label-secondary);}",
+      ".hs-kv{display:grid;grid-template-columns:112px 1fr;gap:4px 10px;font-size:12.5px;}",
+      ".hs-kv .k{color:var(--dsw-alias-label-secondary);}",
+      ".hs-pre{background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);",
+      "border-radius:8px;padding:10px 12px;white-space:pre-wrap;word-break:break-word;",
+      "font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;",
+      "max-height:280px;overflow:auto;}",
+      ".hs-timeline{border-left:2px solid var(--dsw-alias-border-l1);margin-left:6px;padding-left:14px;}",
+      ".hs-timeline .ev{position:relative;padding-bottom:9px;}",
+      ".hs-timeline .ev::before{content:'';position:absolute;left:-19px;top:6px;width:7px;height:7px;",
+      "border-radius:50%;background:var(--dsw-alias-border-l2);}",
+      ".hs-timeline .meta{color:var(--dsw-alias-label-secondary);font-size:11.5px;}",
+      ".hs-wrap{position:relative;flex:1 1 0;min-height:0;display:flex;flex-direction:column;overflow:hidden;}",
+      ".hs-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}",
+      ".hs-btnrow{display:flex;gap:8px;flex-wrap:wrap;}",
+      ".hs-err{color:var(--dsw-alias-state-error-primary);font-size:12px;}",
+      ".hs-hint{color:var(--dsw-alias-label-secondary);font-size:11.5px;margin-top:5px;line-height:1.5;}",
+      ".hs-steer{display:flex;gap:8px;margin-top:8px;align-items:center;}",
+      ".hs-steer .hs-input{flex:1 1 auto;}",
+
+      ".hs-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:60;",
+      "display:flex;align-items:center;justify-content:center;padding:24px;}",
+      ".hs-modal{background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);",
+      "border-radius:12px;width:640px;max-width:96vw;max-height:88vh;display:flex;flex-direction:column;}",
+      ".hs-modal.wide{width:760px;}",
+      ".hs-mhead{padding:14px 18px;border-bottom:1px solid var(--dsw-alias-border-l1);",
+      "font-weight:600;display:flex;align-items:center;gap:8px;}",
+      ".hs-mbody{padding:16px 18px;overflow:auto;flex:1 1 0;min-height:0;}",
+      ".hs-mfoot{padding:12px 18px;border-top:1px solid var(--dsw-alias-border-l1);",
+      "display:flex;justify-content:flex-end;gap:8px;}",
+      ".hs-formrow{margin-bottom:14px;}",
+      ".hs-formrow label{display:block;color:var(--dsw-alias-label-secondary);",
+      "font-size:12px;margin-bottom:5px;}",
+      ".hs-formrow .hs-select,.hs-formrow .hs-input{width:100%;}",
+      ".hs-cards{display:flex;gap:10px;}",
+      ".hs-card{flex:1 1 0;border:1px solid var(--dsw-alias-border-l1);border-radius:9px;",
+      "padding:9px 11px;cursor:pointer;}",
+      ".hs-card.sel{border-color:var(--dsw-alias-brand-primary);",
+      "background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent);}",
+      ".hs-card .nm{font-weight:600;font-size:12.5px;}",
+      ".hs-card .note{color:var(--dsw-alias-label-secondary);font-size:11.5px;margin-top:2px;}",
+      ".hs-checks{display:flex;gap:16px;flex-wrap:wrap;}",
+      ".hs-checks label{display:flex;align-items:center;gap:6px;cursor:pointer;",
+      "color:var(--dsw-alias-label-primary);font-size:12.5px;margin:0;}",
+      ".hs-sesslist{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;",
+      "max-height:260px;overflow:auto;}",
+      ".hs-sess{padding:7px 11px;border-bottom:1px solid var(--dsw-alias-border-l1);",
+      "cursor:pointer;display:flex;gap:10px;align-items:center;font-size:12px;}",
+      ".hs-sess:hover{background:var(--dsw-alias-bg-layer-1);}",
+      ".hs-sess.sel{background:var(--dsw-alias-bg-layer-1);",
+      "box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary);}",
+      ".hs-sess .sid{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11.5px;}",
+      ".hs-sess .stt{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
+      ".hs-sess .stm{color:var(--dsw-alias-label-secondary);font-size:11px;}",
+      ".hs-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);",
+      "background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);",
+      "padding:9px 18px;border-radius:8px;z-index:100;box-shadow:0 6px 24px rgba(0,0,0,.3);",
+      "font-size:12.5px;}",
+      ".hs-toast.err{border-color:var(--dsw-alias-state-error-primary);",
+      "color:var(--dsw-alias-state-error-primary);}",
+    ].join("");
+
+    function Styles() {
+      return h("style", { "data-plugin-css": "dsh-handoff-studio" }, CSS);
+    }
+
+    // -- HTTP ----------------------------------------------------------------
+    function apiRequest(path, init) {
+      return fetch(API + path, init).then(function (response) {
+        return response.json().then(function (body) {
+          if (!response.ok) {
+            var message = (body && (body.message || body.error)) || "HTTP " + response.status;
+            var error = new Error(message);
+            error.body = body;
+            throw error;
+          }
+          return body;
+        });
+      });
+    }
+
+    function apiGet(path) {
+      return apiRequest(path, { headers: { accept: "application/json" } });
+    }
+
+    function apiPost(path, payload) {
+      return apiRequest(path, {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify(payload || {}),
+      });
+    }
+
+    function q(value) {
+      return encodeURIComponent(value);
+    }
+
+    // -- 工具 ----------------------------------------------------------------
+    function fmtTime(value) {
+      if (!value) return "";
+      var match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(String(value));
+      if (match) return match[2] + "-" + match[3] + " " + match[4] + ":" + match[5];
+      return String(value);
+    }
+
+    function statusChip(status) {
+      return h("span", { className: "hs-chip st-" + status }, status || "?");
+    }
+
+    function executorChip(name) {
+      if (!name) return null;
+      return h("span", { className: "hs-chip ex-" + name }, name);
+    }
+
+    /** 一个按钮，带「为什么不能点」的提示。 */
+    function ActionButton(props) {
+      var disabled = Boolean(props.disabled);
+      return h(
+        "button",
+        {
+          type: "button",
+          className: "hs-btn" + (props.variant ? " " + props.variant : ""),
+          disabled: disabled,
+          title: props.title || (disabled ? props.reason : ""),
+          onClick: function (event) {
+            event.stopPropagation();
+            if (disabled) {
+              // 灰掉的按钮也要有反馈：点一下说清为什么不能用
+              if (props.reason) props.onBlocked && props.onBlocked(props.reason);
+              return;
+            }
+            props.onClick();
+          },
+        },
+        props.label,
+      );
+    }
+
+    function Field(props) {
+      return h(
+        "div",
+        { className: "hs-formrow" },
+        props.label ? h("label", null, props.label) : null,
+        props.children,
+        props.hint ? h("div", { className: "hs-hint" }, props.hint) : null,
+      );
+    }
+
+    function Modal(props) {
+      var ref = useRef(null);
+      useEffect(
+        function () {
+          function onKey(event) {
+            if (event.key === "Escape") props.onClose();
+          }
+          document.addEventListener("keydown", onKey);
+          return function () {
+            document.removeEventListener("keydown", onKey);
+          };
+        },
+        [props.onClose],
+      );
+      return h(
+        "div",
+        {
+          className: "hs-overlay",
+          onMouseDown: function (event) {
+            if (event.target === ref.current) props.onClose();
+          },
+          ref: ref,
+        },
+        h(
+          "div",
+          {
+            className: "hs-modal" + (props.wide ? " wide" : ""),
+            role: "dialog",
+            "aria-modal": "true",
+            "aria-label": props.title,
+          },
+          h("div", { className: "hs-mhead" }, props.title),
+          h("div", { className: "hs-mbody" }, props.children),
+          h("div", { className: "hs-mfoot" }, props.footer),
+        ),
+      );
+    }
+
+    // -- 执行弹窗 ------------------------------------------------------------
+    function RunModal(props) {
+      var options = props.options || { executors: [] };
+      var taskId = props.taskId;
+      var execState = useState("dsh");
+      var executor = execState[0];
+      var setExecutor = execState[1];
+      var modelState = useState("");
+      var model = modelState[0];
+      var setModel = modelState[1];
+      var effortState = useState("");
+      var effort = effortState[0];
+      var setEffort = effortState[1];
+      var dirModeState = useState("worktree");
+      var dirMode = dirModeState[0];
+      var setDirMode = dirModeState[1];
+      var dirPathState = useState("");
+      var dirPath = dirPathState[0];
+      var setDirPath = dirPathState[1];
+      var automergeState = useState(true);
+      var autoMerge = automergeState[0];
+      var setAutoMerge = automergeState[1];
+      var waitDeployState = useState(true);
+      var waitDeploy = waitDeployState[0];
+      var setWaitDeploy = waitDeployState[1];
+      var autoCommitState = useState(false);
+      var autoCommit = autoCommitState[0];
+      var setAutoCommit = autoCommitState[1];
+      var sandboxState = useState("");
+      var sandbox = sandboxState[0];
+      var setSandbox = sandboxState[1];
+      var sessionsState = useState([]);
+      var sessions = sessionsState[0];
+      var setSessions = sessionsState[1];
+      var resumeState = useState("");
+      var resumeSession = resumeState[0];
+      var setResumeSession = resumeState[1];
+      var busy = useState(false);
+      var working = busy[0];
+      var setWorking = busy[1];
+      var errorState = useState("");
+      var error = errorState[0];
+      var setError = errorState[1];
+
+      var current = useMemo(
+        function () {
+          var list = options.executors || [];
+          for (var i = 0; i < list.length; i += 1) {
+            if (list[i].id === executor) return list[i];
+          }
+          return list[0] || { models: [], efforts: [] };
+        },
+        [options, executor],
+      );
+
+      // 打开时带入当前选择
+      useEffect(
+        function () {
+          if (current.selected_model) setModel(current.selected_model);
+          if (current.selected_effort) setEffort(current.selected_effort);
+          if (options.codex_sandbox_default) setSandbox(options.codex_sandbox_default);
+        },
+        // 只跑一次：之后由用户操作驱动
+        [],
+      );
+
+      // 换执行器 → 换模型/档位候选
+      useEffect(
+        function () {
+          var models = current.models || [];
+          var has = false;
+          for (var i = 0; i < models.length; i += 1) if (models[i].id === model) has = true;
+          if (!has) setModel(current.selected_model || (models[0] ? models[0].id : ""));
+          var efforts = current.efforts || [];
+          if (effort && efforts.indexOf(effort) < 0) setEffort("");
+        },
+        [executor],
+      );
+
+      // 载入会话列表（用于续跑）
+      useEffect(
+        function () {
+          if (!taskId) return;
+          apiGet("/api/tasks/" + q(taskId) + "/sessions?executor=" + q(executor))
+            .then(function (body) {
+              setSessions(body.sessions || []);
+            })
+            .catch(function () {
+              setSessions([]);
+            });
+        },
+        [taskId, executor],
+      );
+
+      var efforts = (current.efforts || []).slice();
+      var models = current.models || [];
+
+      function submit() {
+        setWorking(true);
+        setError("");
+        var payload = {
+          executor: executor,
+          model: model || null,
+          effort: effort || null,
+          resume_session_id: resumeSession || null,
+          codex_sandbox: executor === "codex" ? sandbox || null : null,
+          auto_merge: autoMerge,
+          wait_deployment: waitDeploy,
+          auto_commit: autoCommit,
+          work_dir: dirMode === "custom" ? dirPath : null,
+        };
+        apiPost("/api/tasks/" + q(taskId) + "/run", payload)
+          .then(function () {
+            props.onDone();
+          })
+          .catch(function (exc) {
+            setError(exc.message || String(exc));
+          })
+          .then(function () {
+            setWorking(false);
+          });
+      }
+
+      return h(
+        Modal,
+        {
+          title: "执行任务",
+          wide: true,
+          onClose: props.onClose,
+          footer: [
+            h(
+              "button",
+              { key: "c", type: "button", className: "hs-btn", onClick: props.onClose },
+              "取消",
+            ),
+            h(
+              "button",
+              {
+                key: "g",
+                type: "button",
+                className: "hs-btn primary",
+                disabled: working,
+                onClick: submit,
+              },
+              working ? "启动中…" : "开始执行",
+            ),
+          ],
+        },
+        h("div", { className: "hs-hint", style: { marginBottom: 10 } }, taskId),
+        h(
+          "div",
+          { className: "hs-formrow" },
+          h("label", null, "执行器"),
+          h(
+            "div",
+            { className: "hs-cards" },
+            (options.executors || []).map(function (item) {
+              return h(
+                "div",
+                {
+                  key: item.id,
+                  className: "hs-card" + (item.id === executor ? " sel" : ""),
+                  onClick: function () {
+                    setExecutor(item.id);
+                  },
+                },
+                h("div", { className: "nm" }, item.label),
+                h("div", { className: "note" }, item.note || item.id),
+              );
+            }),
+          ),
+        ),
+        h(
+          Field,
+          {
+            label: "模型",
+            hint:
+              executor === "dsh"
+                ? "来自 DSH 当前可路由的模型。选模型后档位会换成该模型声明的那组。"
+                : "留空 = 跟随该执行器的配置。",
+          },
+          h(
+            "div",
+            { className: "hs-row" },
+            models.length
+              ? h(
+                  "select",
+                  {
+                    className: "hs-select",
+                    style: { flex: "1 1 auto" },
+                    value: model,
+                    onChange: function (event) {
+                      setModel(event.target.value);
+                      if (executor === "dsh") {
+                        apiPost("/api/studio/options", { model: event.target.value }).catch(function () {});
+                      }
+                    },
+                  },
+                  h("option", { value: "" }, "跟随配置"),
+                  models.map(function (item) {
+                    return h("option", { key: item.id, value: item.id }, item.name || item.id);
+                  }),
+                )
+              : h("input", {
+                  className: "hs-input",
+                  style: { flex: "1 1 auto" },
+                  placeholder: "留空 = 跟随配置",
+                  value: model,
+                  onChange: function (event) {
+                    setModel(event.target.value);
+                  },
+                }),
+            h(
+              "select",
+              {
+                className: "hs-select",
+                style: { width: 170 },
+                value: effort,
+                onChange: function (event) {
+                  setEffort(event.target.value);
+                },
+              },
+              h("option", { value: "" }, "默认思考"),
+              efforts.map(function (id) {
+                return h("option", { key: id, value: id }, id);
+              }),
+            ),
+          ),
+        ),
+        executor === "codex"
+          ? h(
+              Field,
+              {
+                label: "Codex 安全模式（--sandbox）",
+                hint: "进程启动参数，改了从下一轮生效；执行中可在顶部横幅切换。",
+              },
+              h(
+                "select",
+                {
+                  className: "hs-select",
+                  value: sandbox,
+                  onChange: function (event) {
+                    setSandbox(event.target.value);
+                  },
+                },
+                (options.codex_sandbox_options || []).map(function (id) {
+                  return h("option", { key: id, value: id }, id);
+                }),
+              ),
+            )
+          : null,
+        h(
+          Field,
+          {
+            label: "接续会话（可选）",
+            hint: sessions.length
+              ? "置顶的是本任务历史会话；接续可以带着已读过的上下文。"
+              : "这个任务还没有可续跑的历史会话。",
+          },
+          sessions.length
+            ? h(
+                "div",
+                { className: "hs-sesslist" },
+                h(
+                  "div",
+                  {
+                    className: "hs-sess" + (resumeSession === "" ? " sel" : ""),
+                    onClick: function () {
+                      setResumeSession("");
+                    },
+                  },
+                  h("span", { className: "stt" }, "新开一个会话"),
+                ),
+                sessions.map(function (item) {
+                  return h(
+                    "div",
+                    {
+                      key: item.id,
+                      className: "hs-sess" + (resumeSession === item.id ? " sel" : ""),
+                      onClick: function () {
+                        setResumeSession(item.id);
+                      },
+                    },
+                    h("span", { className: "sid" }, item.id.slice(0, 18)),
+                    h("span", { className: "stt" }, item.title || ""),
+                    item.attempt ? h("span", { className: "stm" }, "attempt " + item.attempt) : null,
+                  );
+                }),
+              )
+            : null,
+        ),
+        h(
+          Field,
+          {
+            label: "工作目录",
+            hint:
+              dirMode === "custom"
+                ? "目录模式：不建隔离 worktree，直接在指定目录改代码。已有 PR 链路不适用。"
+                : "默认在建隔离 worktree + 分支，交付走 PR。",
+          },
+          h(
+            "select",
+            {
+              className: "hs-select",
+              value: dirMode,
+              onChange: function (event) {
+                setDirMode(event.target.value);
+              },
+            },
+            h("option", { value: "worktree" }, "隔离 worktree（推荐）"),
+            h("option", { value: "custom" }, "指定目录"),
+          ),
+          dirMode === "custom"
+            ? h(
+                "div",
+                { style: { marginTop: 6 } },
+                (options.work_dirs || []).length
+                  ? h(
+                      "select",
+                      {
+                        className: "hs-select",
+                        value: dirPath,
+                        onChange: function (event) {
+                          setDirPath(event.target.value);
+                        },
+                      },
+                      h("option", { value: "" }, "选一个已登记的仓库目录…"),
+                      (options.work_dirs || []).map(function (item) {
+                        return h("option", { key: item.repo, value: item.path }, item.path);
+                      }),
+                    )
+                  : null,
+                h("input", {
+                  className: "hs-input",
+                  style: { marginTop: 6 },
+                  placeholder: "D:\\project\\your-repo",
+                  value: dirPath,
+                  onChange: function (event) {
+                    setDirPath(event.target.value);
+                  },
+                }),
+              )
+            : null,
+        ),
+        h(
+          Field,
+          { label: "执行选项" },
+          h(
+            "div",
+            { className: "hs-checks" },
+            h(
+              "label",
+              null,
+              h("input", {
+                type: "checkbox",
+                checked: autoMerge,
+                disabled: dirMode === "custom",
+                onChange: function (event) {
+                  setAutoMerge(event.target.checked);
+                },
+              }),
+              "自动合并（过 gate 后）",
+            ),
+            h(
+              "label",
+              null,
+              h("input", {
+                type: "checkbox",
+                checked: waitDeploy,
+                onChange: function (event) {
+                  setWaitDeploy(event.target.checked);
+                },
+              }),
+              "等部署对齐",
+            ),
+            h(
+              "label",
+              null,
+              h("input", {
+                type: "checkbox",
+                checked: autoCommit,
+                disabled: dirMode !== "custom",
+                onChange: function (event) {
+                  setAutoCommit(event.target.checked);
+                },
+              }),
+              "目录模式自动提交并推送",
+            ),
+          ),
+        ),
+        error ? h("div", { className: "hs-err" }, error) : null,
+      );
+    }
+
+    // -- 新建任务弹窗 --------------------------------------------------------
+    function NewTaskModal(props) {
+      var options = props.options || {};
+      var projects = useMemo(
+        function () {
+          return (options.projects || []).filter(function (item) {
+            return item.role === "backend";
+          });
+        },
+        [options],
+      );
+      var titleState = useState("");
+      var title = titleState[0];
+      var setTitle = titleState[1];
+      var repoState = useState(projects[0] ? projects[0].id : "");
+      var repo = repoState[0];
+      var setRepo = repoState[1];
+      var requirementState = useState("");
+      var requirement = requirementState[0];
+      var setRequirement = requirementState[1];
+      var envState = useState((options.environments || [])[0] || "dev");
+      var environment = envState[0];
+      var setEnvironment = envState[1];
+      var outState = useState("");
+      var outOfScope = outState[0];
+      var setOutOfScope = outState[1];
+      var busyState = useState(false);
+      var busy = busyState[0];
+      var setBusy = busyState[1];
+      var errorState = useState("");
+      var error = errorState[0];
+      var setError = errorState[1];
+
+      function submit() {
+        setBusy(true);
+        setError("");
+        apiPost("/api/tasks/create", {
+          title: title,
+          requirement: requirement,
+          repo: repo,
+          environment: environment,
+          out_of_scope: outOfScope,
+        })
+          .then(function (body) {
+            props.onDone(body);
+          })
+          .catch(function (exc) {
+            setError(exc.message || String(exc));
+          })
+          .then(function () {
+            setBusy(false);
+          });
+      }
+
+      return h(
+        Modal,
+        {
+          title: "新建任务",
+          onClose: props.onClose,
+          footer: [
+            h("button", { key: "c", type: "button", className: "hs-btn", onClick: props.onClose }, "取消"),
+            h(
+              "button",
+              {
+                key: "g",
+                type: "button",
+                className: "hs-btn primary",
+                disabled: busy || !title.trim() || !requirement.trim() || !repo,
+                onClick: submit,
+              },
+              busy ? "创建中…" : "创建",
+            ),
+          ],
+        },
+        h(
+          Field,
+          { label: "标题（一句话，二十字以内）" },
+          h("input", {
+            className: "hs-input",
+            value: title,
+            maxLength: 200,
+            onChange: function (event) {
+              setTitle(event.target.value);
+            },
+          }),
+        ),
+        h(
+          Field,
+          { label: "目标项目" },
+          projects.length
+            ? h(
+                "select",
+                {
+                  className: "hs-select",
+                  value: repo,
+                  onChange: function (event) {
+                    setRepo(event.target.value);
+                  },
+                },
+                projects.map(function (item) {
+                  return h("option", { key: item.id, value: item.id }, item.id);
+                }),
+              )
+            : h("div", { className: "hs-err" }, "没有已登记的 backend 项目"),
+        ),
+        h(
+          Field,
+          {
+            label: "需求（字段级：接口、方法、请求、响应、边界）",
+            hint: "写清楚到后端能照着做。不要写「以某文档为准」。",
+          },
+          h("textarea", {
+            className: "hs-textarea",
+            rows: 7,
+            value: requirement,
+            onChange: function (event) {
+              setRequirement(event.target.value);
+            },
+          }),
+        ),
+        h(
+          Field,
+          { label: "验收环境" },
+          h(
+            "select",
+            {
+              className: "hs-select",
+              value: environment,
+              onChange: function (event) {
+                setEnvironment(event.target.value);
+              },
+            },
+            (options.environments || []).map(function (name) {
+              return h("option", { key: name, value: name }, name);
+            }),
+          ),
+        ),
+        h(
+          Field,
+          { label: "不在范围内（换行或逗号分隔）", hint: "明确不做的事，防止顺手改别的。" },
+          h("textarea", {
+            className: "hs-textarea",
+            rows: 3,
+            value: outOfScope,
+            onChange: function (event) {
+              setOutOfScope(event.target.value);
+            },
+          }),
+        ),
+        error ? h("div", { className: "hs-err" }, error) : null,
+      );
+    }
+
+    // -- 自动模式配置弹窗 ----------------------------------------------------
+    function AutoConfigModal(props) {
+      var options = props.options || {};
+      var auto = props.auto || {};
+      var executorState = useState(auto.executor || "dsh");
+      var executor = executorState[0];
+      var setExecutor = executorState[1];
+      var strategyState = useState(auto.session_strategy || "new");
+      var strategy = strategyState[0];
+      var setStrategy = strategyState[1];
+      var workDirState = useState(auto.work_dir || "");
+      var workDir = workDirState[0];
+      var setWorkDir = workDirState[1];
+      var autoMergeState = useState(auto.auto_merge !== false);
+      var autoMerge = autoMergeState[0];
+      var setAutoMerge = autoMergeState[1];
+      var waitDeployState = useState(auto.wait_deployment !== false);
+      var waitDeploy = waitDeployState[0];
+      var setWaitDeploy = waitDeployState[1];
+      var autoCommitState = useState(Boolean(auto.auto_commit));
+      var autoCommit = autoCommitState[0];
+      var setAutoCommit = autoCommitState[1];
+      var busyState = useState(false);
+      var busy = busyState[0];
+      var setBusy = busyState[1];
+      var errorState = useState("");
+      var error = errorState[0];
+      var setError = errorState[1];
+
+      function submit() {
+        setBusy(true);
+        setError("");
+        apiPost("/api/mode", {
+          mode: props.mode,
+          auto: {
+            executor: executor,
+            session_strategy: strategy,
+            work_dir: workDir || null,
+            auto_merge: autoMerge,
+            wait_deployment: waitDeploy,
+            auto_commit: autoCommit,
+          },
+        })
+          .then(function () {
+            props.onDone();
+          })
+          .catch(function (exc) {
+            setError(exc.message || String(exc));
+          })
+          .then(function () {
+            setBusy(false);
+          });
+      }
+
+      return h(
+        Modal,
+        {
+          title: "全自动模式配置",
+          onClose: props.onClose,
+          footer: [
+            h("button", { key: "c", type: "button", className: "hs-btn", onClick: props.onClose }, "取消"),
+            h(
+              "button",
+              { key: "g", type: "button", className: "hs-btn primary", disabled: busy, onClick: submit },
+              busy ? "保存中…" : "保存并应用",
+            ),
+          ],
+        },
+        h(
+          "div",
+          { className: "hs-hint", style: { marginBottom: 12 } },
+          "全自动模式会自动认领 open 的任务，单并发；同一时刻只跑一单。",
+        ),
+        h(
+          Field,
+          { label: "执行器" },
+          h(
+            "select",
+            {
+              className: "hs-select",
+              value: executor,
+              onChange: function (event) {
+                setExecutor(event.target.value);
+              },
+            },
+            (options.executors || []).map(function (item) {
+              return h("option", { key: item.id, value: item.id }, item.label + "（" + item.id + "）");
+            }),
+          ),
+        ),
+        h(
+          Field,
+          { label: "会话策略" },
+          h(
+            "select",
+            {
+              className: "hs-select",
+              value: strategy,
+              onChange: function (event) {
+                setStrategy(event.target.value);
+              },
+            },
+            h("option", { value: "new" }, "每次新会话"),
+            h("option", { value: "continue" }, "接续该任务上次的会话"),
+          ),
+        ),
+        h(
+          Field,
+          {
+            label: "工作目录",
+            hint: "留空 = 按任务仓库走隔离 worktree；填了就固定在这个目录跑（不建 worktree）。",
+          },
+          h("input", {
+            className: "hs-input",
+            placeholder: "例如 D:/project/api",
+            value: workDir,
+            onChange: function (event) {
+              setWorkDir(event.target.value);
+            },
+          }),
+        ),
+        h(
+          Field,
+          { label: "执行选项" },
+          h(
+            "div",
+            { className: "hs-checks" },
+            h(
+              "label",
+              null,
+              h("input", {
+                type: "checkbox",
+                checked: autoMerge,
+                onChange: function (event) {
+                  setAutoMerge(event.target.checked);
+                },
+              }),
+              "自动合并",
+            ),
+            h(
+              "label",
+              null,
+              h("input", {
+                type: "checkbox",
+                checked: waitDeploy,
+                onChange: function (event) {
+                  setWaitDeploy(event.target.checked);
+                },
+              }),
+              "等部署",
+            ),
+            h(
+              "label",
+              null,
+              h("input", {
+                type: "checkbox",
+                checked: autoCommit,
+                onChange: function (event) {
+                  setAutoCommit(event.target.checked);
+                },
+              }),
+              "目录模式自动提交",
+            ),
+          ),
+        ),
+        error ? h("div", { className: "hs-err" }, error) : null,
+      );
+    }
+
+    // -- 会话选择弹窗 --------------------------------------------------------
+    function SessionModal(props) {
+      var searchState = useState("");
+      var search = searchState[0];
+      var setSearch = searchState[1];
+      var visible = useMemo(
+        function () {
+          if (!search.trim()) return props.sessions;
+          var needle = search.trim().toLowerCase();
+          return props.sessions.filter(function (item) {
+            return (
+              String(item.id || "").toLowerCase().indexOf(needle) >= 0 ||
+              String(item.title || "").toLowerCase().indexOf(needle) >= 0 ||
+              String(item.cwd || "").toLowerCase().indexOf(needle) >= 0
+            );
+          });
+        },
+        [props.sessions, search],
+      );
+      return h(
+        Modal,
+        {
+          title: "选择会话（" + props.executor + "）",
+          onClose: props.onClose,
+          footer: [h("button", { key: "c", type: "button", className: "hs-btn", onClick: props.onClose }, "关闭")],
+        },
+        h("input", {
+          className: "hs-input",
+          style: { width: "100%", marginBottom: 10 },
+          placeholder: "搜索 id / 标题 / 目录…",
+          value: search,
+          onChange: function (event) {
+            setSearch(event.target.value);
+          },
+        }),
+        visible.length
+          ? h(
+              "div",
+              { className: "hs-sesslist", style: { maxHeight: 380 } },
+              visible.map(function (item) {
+                return h(
+                  "div",
+                  {
+                    key: item.id,
+                    className: "hs-sess" + (item.id === props.selected ? " sel" : ""),
+                    onClick: function () {
+                      props.onPick(item.id);
+                    },
+                  },
+                  h("span", { className: "sid" }, item.id.slice(0, 20)),
+                  h("span", { className: "stt" }, item.title || ""),
+                  h("span", { className: "stm" }, fmtTime(item.updated_at)),
+                );
+              }),
+            )
+          : h("div", { className: "hs-empty" }, "没有可用的会话"),
+      );
+    }
+
+    // -- 抽屉 ----------------------------------------------------------------
+    function Drawer(props) {
+      var detail = props.detail;
+      var bodyRef = useRef(null);
+      var liveRef = useRef(null);
+      if (!detail) return null;
+      var task = detail.task || {};
+      var events = detail.events || [];
+      var result = task.result || {};
+      var failure = task.failure;
+      var run = props.run;
+      var isRunning = Boolean(run && run.phase === "running" && run.task_id === task.id);
+
+      useEffect(
+        function () {
+          var node = liveRef.current;
+          if (node) node.scrollTop = node.scrollHeight;
+        },
+        [run && run.log_total, isRunning],
+      );
+
+      // 每个按钮的启用规则与原面板逐条对齐
+      var canRun = ["open", "failed", "cancelled"].indexOf(task.status) >= 0;
+      var canRetry = task.status === "failed";
+      var hasLease = ["claimed", "in_progress"].indexOf(task.status) >= 0;
+      var canDeliver = ["merged", "deployed", "verifying"].indexOf(task.status) >= 0;
+      var canResend = ["verified", "failed"].indexOf(task.status) >= 0;
+      var canAccept = task.status === "verified";
+      var canAdvance =
+        ["delivered", "awaiting_merge", "merged", "deployed", "verifying"].indexOf(task.status) >= 0;
+
+      var runWhy =
+        "当前状态 " + task.status + " 不能直接执行（只有 open / failed / cancelled 可以）。卡在 in_progress 的话先「释放租约」。";
+      var retryWhy = "只有 failed 能重新入队（当前 " + task.status + "）。";
+      var releaseWhy = "只有 claimed / in_progress 才有租约（当前 " + task.status + "）。";
+      var deliverWhy = "只有 merged / deployed / verifying 能验收（当前 " + task.status + "）。";
+      var resendWhy = "只有 verified / failed 才有完成通知可重发（当前 " + task.status + "）。";
+      var acceptWhy = "只有 verified 才能标记前端已验收（当前 " + task.status + "）。";
+      var advanceWhy =
+        "恢复推进只接手交付链路中途断掉的状态（delivered / awaiting_merge / merged / deployed / verifying；当前 " +
+        task.status +
+        "）。";
+
+      var checks = (task.acceptance && task.acceptance.checks) || [];
+
+      return h(
+        "div",
+        { className: "hs-drawer" },
+        h(
+          "div",
+          { className: "hs-dhead" },
+          h("span", { className: "hs-dtitle" }, task.title || task.id || ""),
+          statusChip(task.status),
+          h("button", { type: "button", className: "hs-btn", onClick: props.onClose }, "✕"),
+        ),
+        h(
+          "div",
+          { className: "hs-dbody", ref: bodyRef },
+          isRunning
+            ? h(
+                "div",
+                { className: "hs-sec" },
+                h("h3", null, "执行实况"),
+                h(
+                  "div",
+                  { className: "hs-log", ref: liveRef },
+                  (run.logs || []).map(function (line, index) {
+                    return h(LogLine, { key: index, text: line });
+                  }),
+                ),
+              )
+            : null,
+
+          failure
+            ? h(
+                "div",
+                { className: "hs-sec" },
+                h("h3", null, "失败原因（" + (failure.stage || "?") + "）"),
+                h("div", { className: "hs-pre hs-err" }, failure.message || ""),
+              )
+            : null,
+
+          h(
+            "div",
+            { className: "hs-sec" },
+            h("h3", null, "基本信息"),
+            h(
+              "div",
+              { className: "hs-kv" },
+              kv("任务 ID", task.id),
+              kv("状态", task.status),
+              kv("尝试次数", task.attempt),
+              kv("目标仓库", (task.target || {}).repo),
+              kv("基线分支", (task.target || {}).base_ref),
+              kv("执行器", result.executor),
+              kv("会话", result.executor_session_id),
+              kv(
+                "PR",
+                result.pr_url
+                  ? h("a", { href: result.pr_url, target: "_blank", rel: "noreferrer" }, result.pr_url)
+                  : null,
+              ),
+              kv("合并 SHA", result.merge_sha),
+              kv("部署", (task.deployment || {}).status),
+              kv("工作区", result.worktree),
+              kv("租约", task.claim ? task.claim.worker_id : null),
+              kv("创建时间", fmtTime(task.created_at)),
+              kv("更新时间", fmtTime(task.updated_at)),
+            ),
+          ),
+
+          h(
+            "div",
+            { className: "hs-sec" },
+            h("h3", null, "操作"),
+            h(
+              "div",
+              { className: "hs-btnrow" },
+              h(ActionButton, {
+                label: "▶ 执行…",
+                variant: "primary",
+                disabled: !canRun,
+                reason: runWhy,
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onOpenRun(task.id);
+                },
+              }),
+              h(ActionButton, {
+                label: "▶ 继续上次会话",
+                disabled: !canRun,
+                reason: runWhy,
+                title: "接着这个任务上一次的执行会话继续，不用从头交代上下文",
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onResumeLast(task.id);
+                },
+              }),
+              h(ActionButton, {
+                label: "重新入队",
+                disabled: !canRetry,
+                reason: retryWhy,
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction("POST", "/api/tasks/" + q(task.id) + "/retry", null, "已重新入队");
+                },
+              }),
+              h(ActionButton, {
+                label: "释放租约",
+                disabled: !hasLease,
+                reason: releaseWhy,
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction(
+                    "POST",
+                    "/api/tasks/" + q(task.id) + "/release",
+                    { reason: "studio 释放租约" },
+                    "租约已释放",
+                  );
+                },
+              }),
+              h(ActionButton, {
+                label: "验收（deliver）",
+                disabled: !canDeliver,
+                reason: deliverWhy,
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction("POST", "/api/deliver", { task_id: task.id }, "验收已启动");
+                },
+              }),
+              h(ActionButton, {
+                label: "重发完成通知",
+                disabled: !canResend,
+                reason: resendWhy,
+                title: "把完成通知再发一次到创建任务的前端监听端口",
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction(
+                    "POST",
+                    "/api/tasks/" + q(task.id) + "/resend-notify",
+                    null,
+                    "完成通知已重发",
+                  );
+                },
+              }),
+              h(ActionButton, {
+                label: "前端已验收",
+                disabled: !canAccept,
+                reason: acceptWhy,
+                title: "前端收到完成通知并自行验收成功后点这里，把任务标记为 frontend_accepted 终态",
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction(
+                    "POST",
+                    "/api/tasks/" + q(task.id) + "/accept",
+                    { reason: "studio：前端验收通过" },
+                    "已标记前端已验收",
+                  );
+                },
+              }),
+              h(ActionButton, {
+                label: "恢复推进",
+                disabled: !canAdvance,
+                reason: advanceWhy,
+                title: "把中断的后续流程接起来：自动合并 / 重新推送 / 部署对齐 / 验收",
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction(
+                    "POST",
+                    "/api/tasks/" + q(task.id) + "/advance",
+                    null,
+                    "恢复推进已启动（后台执行）",
+                  );
+                },
+              }),
+            ),
+            h(
+              "div",
+              { className: "hs-hint" },
+              "灰掉的按钮点一下会告诉你为什么不能用。「恢复推进」只接手交付后中断的任务，不会伪造 merged / verified。",
+            ),
+            props.progress ? h("div", { className: "hs-hint" }, props.progress) : null,
+          ),
+
+          h(
+            "div",
+            { className: "hs-sec" },
+            h("h3", null, "需求"),
+            h("div", { className: "hs-pre" }, task.requirement || "（空）"),
+          ),
+
+          checks.length
+            ? h(
+                "div",
+                { className: "hs-sec" },
+                h("h3", null, "验收（环境 " + ((task.acceptance || {}).environment || "—") + "）"),
+                h(
+                  "div",
+                  { className: "hs-pre" },
+                  checks
+                    .map(function (check) {
+                      if (check.type === "http") {
+                        return "http " + check.method + " " + check.url + " → " + check.expect_status;
+                      }
+                      if (check.type === "openapi_diff") {
+                        return "openapi_diff " + check.expected_path + " ↔ " + check.actual_url;
+                      }
+                      return check.type + " " + (check.repo || "") + ":" + (check.name || "");
+                    })
+                    .join("\n"),
+                ),
+              )
+            : null,
+
+          h(
+            "div",
+            { className: "hs-sec" },
+            h("h3", null, "执行日志"),
+            h(
+              "div",
+              { className: "hs-btnrow", style: { marginBottom: 6 } },
+              props.logFiles.length
+                ? props.logFiles.map(function (file) {
+                    return h(
+                      "button",
+                      {
+                        key: file.name,
+                        type: "button",
+                        className: "hs-btn sm",
+                        onClick: function () {
+                          props.onLog(file.attempt || file.name);
+                        },
+                      },
+                      file.name,
+                    );
+                  })
+                : h("span", { className: "hs-muted" }, "这个任务还没有日志文件"),
+            ),
+            props.logText ? h("div", { className: "hs-pre" }, props.logText) : null,
+          ),
+
+          h(
+            "div",
+            { className: "hs-sec" },
+            h("h3", null, "事件时间线（最近 " + Math.min(events.length, 40) + " / 共 " + events.length + "）"),
+            h(
+              "div",
+              { className: "hs-timeline" },
+              events.length
+                ? events
+                    .slice()
+                    .reverse()
+                    .slice(0, 40)
+                    .map(function (event, index) {
+                      return h(
+                        "div",
+                        { className: "ev", key: index },
+                        h(
+                          "div",
+                          null,
+                          event.type || "",
+                          " ",
+                          event.status ? statusChip(event.status) : null,
+                        ),
+                        h(
+                          "div",
+                          { className: "meta" },
+                          [event.at || event.created_at, event.summary].filter(Boolean).join(" · "),
+                        ),
+                      );
+                    })
+                : h("div", { className: "hs-muted" }, "（还没有事件）"),
+            ),
+          ),
+        ),
+      );
+    }
+
+    function kv(key, value) {
+      return [
+        h("div", { className: "k", key: "k-" + key }, key),
+        h(
+          "div",
+          { key: "v-" + key },
+          value === null || value === undefined || value === "" ? "—" : value,
+        ),
+      ];
+    }
+
+    function LogLine(props) {
+      var text = props.text || "";
+      var cls = "";
+      if (text.indexOf("⚠") === 0) cls = "ln-warn";
+      else if (text.indexOf("■") === 0) cls = "ln-end";
+      else if (text.indexOf("🔧") === 0 || text.indexOf("▶") === 0) cls = "ln-tool";
+      return h("div", { className: cls }, text);
+    }
+
+    // -- 主面板 --------------------------------------------------------------
+    function Panel() {
+      var tasksState = useState([]);
+      var tasks = tasksState[0];
+      var setTasks = tasksState[1];
+      var countState = useState(0);
+      var count = countState[0];
+      var setCount = countState[1];
+      var stateState = useState(null);
+      var state = stateState[0];
+      var setState = stateState[1];
+      var optionsState = useState(null);
+      var options = optionsState[0];
+      var setOptions = optionsState[1];
+      var selectedState = useState(null);
+      var selectedId = selectedState[0];
+      var setSelectedId = selectedState[1];
+      var detailState = useState(null);
+      var detail = detailState[0];
+      var setDetail = detailState[1];
+      var toastState = useState(null);
+      var toast = toastState[0];
+      var setToast = toastState[1];
+      var busyState = useState("");
+      var busy = busyState[0];
+      var setBusy = busyState[1];
+      var filterState = useState("");
+      var filter = filterState[0];
+      var setFilter = filterState[1];
+      var pageState = useState(1);
+      var page = pageState[0];
+      var setPage = pageState[1];
+      var pageSizeState = useState(20);
+      var pageSize = pageSizeState[0];
+      var setPageSize = pageSizeState[1];
+      var pagesState = useState(1);
+      var pages = pagesState[0];
+      var setPages = pagesState[1];
+      var logFilesState = useState([]);
+      var logFiles = logFilesState[0];
+      var setLogFiles = logFilesState[1];
+      var logTextState = useState("");
+      var logText = logTextState[0];
+      var setLogText = logTextState[1];
+      var steerState = useState("");
+      var steerText = steerState[0];
+      var setSteerText = steerState[1];
+      var bannerState = useState(true);
+      var bannerShown = bannerState[0];
+      var setBannerShown = bannerState[1];
+      var followState = useState(true);
+      var follow = followState[0];
+      var setFollow = followState[1];
+      var runModalState = useState(null);
+      var runModal = runModalState[0];
+      var setRunModal = runModalState[1];
+      var newModalState = useState(false);
+      var newModal = newModalState[0];
+      var setNewModal = newModalState[1];
+      var autoModalState = useState(false);
+      var autoModal = autoModalState[0];
+      var setAutoModal = autoModalState[1];
+      var sessionsState = useState(null);
+      var sessionModal = sessionsState[0];
+      var setSessionModal = sessionsState[1];
+      var logRef = useRef(null);
+      var aliveRef = useRef(true);
+
+      var notify = useCallback(function (text, isError) {
+        if (aliveRef.current) setToast({ text: text, err: Boolean(isError) });
+      }, []);
+
+      var fail = useCallback(
+        function (error) {
+          notify((error && error.message) || String(error), true);
+        },
+        [notify],
+      );
+
+      var loadState = useCallback(
+        function () {
+          return apiGet("/api/state")
+            .then(function (body) {
+              if (!aliveRef.current) return body;
+              setState(body);
+              return body;
+            })
+            .catch(fail);
+        },
+        [fail],
+      );
+
+      var loadOptions = useCallback(
+        function () {
+          return apiPost("/api/studio/options", {})
+            .then(function (body) {
+              if (aliveRef.current) setOptions(body);
+            })
+            .catch(fail);
+        },
+        [fail],
+      );
+
+      var loadTasks = useCallback(
+        function () {
+          var query = "?page=" + page + "&page_size=" + pageSize;
+          if (filter) query += "&status=" + q(filter);
+          return apiGet("/api/tasks" + query)
+            .then(function (body) {
+              if (!aliveRef.current) return;
+              setTasks(body.tasks || []);
+              setCount(body.total || 0);
+              setPages(body.pages || 1);
+            })
+            .catch(fail);
+        },
+        [fail, filter, page, pageSize],
+      );
+
+      // 轮询：状态和执行日志都靠它
+      useEffect(function () {
+        aliveRef.current = true;
+        loadState().then(function (body) {
+          if (!body) return;
+          return apiPost("/api/studio/options", {});
+        }).then(function (body) {
+          if (body && aliveRef.current) setOptions(body);
+        }).catch(function () {});
+        loadTasks();
+        var timer = setInterval(function () {
+          loadState();
+          loadTasks();
+        }, 3000);
+        return function () {
+          aliveRef.current = false;
+          clearInterval(timer);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [loadState, loadTasks]);
+
+      // 自动滚到最新
+      useEffect(
+        function () {
+          var node = logRef.current;
+          var run = state && state.active;
+          if (node && follow) node.scrollTop = node.scrollHeight;
+        },
+        [state && state.active && state.active.log_total, follow],
+      );
+
+      var openDetail = useCallback(
+        function (taskId) {
+          setSelectedId(taskId);
+          setLogFiles([]);
+          setLogText("");
+          apiGet("/api/tasks/" + q(taskId))
+            .then(function (body) {
+              if (!aliveRef.current) return null;
+              setDetail(body);
+              return apiGet("/api/logs?task=" + q(taskId));
+            })
+            .then(function (logs) {
+              if (logs && aliveRef.current) setLogFiles(logs.files || []);
+            })
+            .catch(fail);
+        },
+        [fail],
+      );
+
+      var refreshAll = useCallback(
+        function () {
+          return Promise.all([loadState(), loadTasks()]).then(function () {
+            if (aliveRef.current) setBusy("");
+          });
+        },
+        [loadState, loadTasks],
+      );
+
+      var postAction = useCallback(
+        function (method, path, payload, done) {
+          setBusy("action");
+          return apiPost(path, payload)
+            .then(function () {
+              notify(done, false);
+              return refreshAll();
+            })
+            .catch(fail)
+            .then(function () {
+              if (aliveRef.current) setBusy("");
+            });
+        },
+        [fail, notify, refreshAll],
+      );
+
+      var setMode = useCallback(
+        function (mode) {
+          setBusy("mode");
+          apiPost("/api/mode", { mode: mode })
+            .then(function () {
+              notify(mode === "auto" ? "已切到全自动" : "已切到手动", false);
+              return refreshAll();
+            })
+            .catch(fail)
+            .then(function () {
+              if (aliveRef.current) setBusy("");
+            });
+        },
+        [fail, notify, refreshAll],
+      );
+
+      var cancelRun = useCallback(
+        function () {
+          postAction("POST", "/api/runs/cancel", {}, "已请求中断");
+        },
+        [postAction],
+      );
+
+      var steer = useCallback(
+        function () {
+          var text = steerText.trim();
+          if (!text) return;
+          setBusy("steer");
+          apiPost("/api/runs/steer", { text: text })
+            .then(function () {
+              setSteerText("");
+              notify("已把这句话交给执行器", false);
+              return refreshAll();
+            })
+            .catch(fail)
+            .then(function () {
+              if (aliveRef.current) setBusy("");
+            });
+        },
+        [fail, notify, refreshAll, steerText],
+      );
+
+      var loadLog = useCallback(
+        function (attempt) {
+          if (!selectedId) return;
+          var query = "?task=" + q(selectedId) + "&tail=800";
+          if (attempt !== undefined && attempt !== null && String(attempt).match(/^\d+$/)) {
+            query += "&attempt=" + attempt;
+          }
+          setBusy("log");
+          apiGet("/api/logs" + query)
+            .then(function (body) {
+              if (!aliveRef.current) return;
+              setLogFiles(body.files || []);
+              var files = body.files || [];
+              setLogText(files.length ? files[0].content || "" : "");
+            })
+            .catch(fail)
+            .then(function () {
+              if (aliveRef.current) setBusy("");
+            });
+        },
+        [fail, selectedId],
+      );
+
+      var resumeLast = useCallback(
+        function (taskId) {
+          setBusy("resume");
+          apiPost("/api/tasks/" + q(taskId) + "/run", {
+            executor: state && state.default_executor ? state.default_executor : "dsh",
+            resume_session_id: "last",
+          })
+            .then(function () {
+              notify("已用上次会话继续执行", false);
+              setBannerShown(true);
+              return refreshAll();
+            })
+            .catch(fail)
+            .then(function () {
+              if (aliveRef.current) setBusy("");
+            });
+        },
+        [fail, notify, refreshAll, state],
+      );
+
+      var run = state && state.active;
+      var mode = (state && state.mode) || "manual";
+      var auto = (state && state.auto) || {};
+      var engineOk = state && state.executors && state.executors.dsh && state.executors.dsh.ok;
+      var deliverInfo = state && state.deliver;
+      var advanceInfo = state && state.advance;
+
+      var progress = "";
+      if (advanceInfo && !advanceInfo.done) {
+        progress = "恢复推进进行中：" + advanceInfo.task_id + " …";
+      } else if (advanceInfo && advanceInfo.done) {
+        progress =
+          "恢复推进：" + (advanceInfo.result || "done") + (advanceInfo.error ? " ✘ " + advanceInfo.error : "");
+      } else if (deliverInfo && !deliverInfo.done) {
+        progress = "验收进行中：" + deliverInfo.task_id + " …";
+      } else if (deliverInfo && deliverInfo.done) {
+        progress = "上次验收：" + deliverInfo.task_id + (deliverInfo.error ? " ✘ " + deliverInfo.error : " ✔");
+      }
+
+      var execInfo = state && state.executors ? state.executors : {};
+
+      return h(
+        "div",
+        { className: "hs-root" },
+        h(Styles),
+
+        // 顶栏：模式 + 健康 + 执行器状态
+        h(
+          "div",
+          { className: "hs-bar" },
+          h("span", { className: "hs-title" }, "Handoff 工作台"),
+          h("span", {
+            className: "hs-dot " + (engineOk ? "on" : "off"),
+            title: engineOk ? "DSH 执行器在线" : (state && state.executors && state.executors.dsh && state.executors.dsh.error) || "DSH 执行器不可用",
+          }),
+          h(
+            "div",
+            { className: "hs-mode" },
+            h(
+              "button",
+              {
+                type: "button",
+                className: mode === "manual" ? "active" : "",
+                disabled: Boolean(busy),
+                onClick: function () {
+                  setMode("manual");
+                },
+              },
+              "手动",
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: mode === "auto" ? "active" : "",
+                disabled: Boolean(busy),
+                onClick: function () {
+                  setMode("auto");
+                },
+              },
+              "全自动",
+            ),
+          ),
+          h(
+            "button",
+            {
+              type: "button",
+              className: "hs-btn",
+              title: "全自动模式配置",
+              onClick: function () {
+                setAutoModal(true);
+              },
+            },
+            "⚙ 自动配置",
+          ),
+          h("span", { className: "hs-spacer" }),
+          h(
+            "span",
+            { className: "hs-muted", style: { fontSize: 11.5 } },
+            Object.keys(execInfo)
+              .map(function (key) {
+                return key + (execInfo[key] && execInfo[key].ok ? "✓" : "✗");
+              })
+              .join("  "),
+          ),
+          progress ? h("span", { className: "hs-muted", style: { fontSize: 11.5 } }, progress) : null,
+        ),
+
+        toast
+          ? h(
+              "div",
+              { className: "hs-toast" + (toast.err ? " err" : "") },
+              toast.text,
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: "hs-btn sm",
+                  style: { marginLeft: 10 },
+                  onClick: function () {
+                    setToast(null);
+                  },
+                },
+                "知道了",
+              ),
+            )
+          : null,
+
+        // 执行横幅
+        run && bannerShown
+          ? h(
+              "div",
+              { className: "hs-run" },
+              h(
+                "div",
+                { className: "hs-run-head" },
+                h("span", {
+                  className: "hs-dot " + (run.phase === "running" ? "on" : "off"),
+                }),
+                h("strong", null, run.phase === "running" ? "执行中" : "本轮已结束"),
+                h("span", { className: "hs-muted" }, run.task_id),
+                executorChip(run.executor),
+                run.error ? h("span", { className: "hs-err" }, run.error) : null,
+                h("span", { className: "hs-spacer" }),
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    className: "hs-btn",
+                    title: "关闭后手动滚动查看历史，不会被自动拉到底",
+                    onClick: function () {
+                      setFollow(!follow);
+                    },
+                  },
+                  follow ? "跟随最新" : "已暂停跟随",
+                ),
+                run.phase === "running"
+                  ? h(
+                      "button",
+                      {
+                        type: "button",
+                        className: "hs-btn danger",
+                        disabled: Boolean(busy),
+                        onClick: cancelRun,
+                      },
+                      "停止",
+                    )
+                  : null,
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    className: "hs-btn",
+                    onClick: function () {
+                      setBannerShown(false);
+                    },
+                  },
+                  "收起",
+                ),
+              ),
+              h(
+                "div",
+                { className: "hs-log", ref: logRef },
+                (run.logs || []).map(function (line, index) {
+                  return h(LogLine, { key: index, text: line });
+                }),
+              ),
+              h(
+                "div",
+                { className: "hs-steer" },
+                h("input", {
+                  className: "hs-input",
+                  placeholder:
+                    "要纠偏就写一句——会打断当前执行，然后带着这句话续跑同一会话（上下文不丢）",
+                  value: steerText,
+                  onChange: function (event) {
+                    setSteerText(event.target.value);
+                  },
+                  onKeyDown: function (event) {
+                    if (event.key === "Enter" && steerText.trim() && !busy) steer();
+                  },
+                }),
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    className: "hs-btn primary",
+                    disabled: Boolean(busy) || !steerText.trim(),
+                    onClick: steer,
+                  },
+                  "⏸ 打断并补一句",
+                ),
+              ),
+            )
+          : null,
+
+        // 工具栏
+        h(
+          "div",
+          { className: "hs-bar", style: { borderBottom: "none" } },
+          h(
+            "select",
+            {
+              className: "hs-select",
+              value: filter,
+              onChange: function (event) {
+                setFilter(event.target.value);
+                setPage(1);
+              },
+            },
+            h("option", { value: "" }, "全部状态"),
+            STATUSES.map(function (name) {
+              return h("option", { key: name, value: name }, name);
+            }),
+          ),
+          h("span", { className: "hs-muted" }, "共 " + count + " 单"),
+          h("span", { className: "hs-spacer" }),
+          h(
+            "button",
+            {
+              type: "button",
+              className: "hs-btn",
+              title: "从交接仓远端拉最新任务单（本地轮询只读快照，不会自动发现新单）",
+              disabled: Boolean(busy),
+              onClick: function () {
+                setBusy("sync");
+                apiPost("/api/sync", {})
+                  .then(function (body) {
+                    notify("已拉取最新：新增 " + (body.added || 0) + " 单", false);
+                    return refreshAll();
+                  })
+                  .catch(fail)
+                  .then(function () {
+                    if (aliveRef.current) setBusy("");
+                  });
+              },
+            },
+            busy === "sync" ? "拉取中…" : "⟳ 拉取最新",
+          ),
+          h(
+            "button",
+            {
+              type: "button",
+              className: "hs-btn primary",
+              disabled: Boolean(busy),
+              onClick: function () {
+                setNewModal(true);
+              },
+            },
+            "+ 新建任务",
+          ),
+        ),
+
+        // 表格 + 抽屉
+        h(
+          "div",
+          { className: "hs-wrap" },
+          h(
+            "div",
+            { className: "hs-scroll" },
+            tasks.length
+              ? h(
+                  "table",
+                  { className: "hs-table" },
+                  h(
+                    "thead",
+                    null,
+                    h(
+                      "tr",
+                      null,
+                      h("th", { style: { width: 90 } }, "状态"),
+                      h("th", null, "标题"),
+                      h("th", { style: { width: 80 } }, "执行器"),
+                      h("th", { style: { width: 64 } }, "尝试"),
+                      h("th", { style: { width: 110 } }, "部署"),
+                      h("th", { style: { width: 110 } }, "更新时间"),
+                    ),
+                  ),
+                  h(
+                    "tbody",
+                    null,
+                    tasks.map(function (task) {
+                      return h(
+                        "tr",
+                        {
+                          key: task.id,
+                          className: selectedId === task.id ? "sel" : "",
+                          onClick: function () {
+                            openDetail(task.id);
+                          },
+                        },
+                        h("td", null, statusChip(task.status)),
+                        h(
+                          "td",
+                          null,
+                          h("div", null, task.title || "（无标题）"),
+                          h("div", { className: "hs-id hs-muted" }, task.id),
+                          task.failure
+                            ? h("div", { className: "hs-fail" }, task.failure.message || task.failure.stage || "")
+                            : null,
+                        ),
+                        h(
+                          "td",
+                          null,
+                          executorChip(task.executor),
+                          task.frontend_executor ? executorChip("fe-" + task.frontend_executor) : null,
+                        ),
+                        h(
+                          "td",
+                          null,
+                          task.attempt === null || task.attempt === undefined ? "—" : task.attempt,
+                        ),
+                        h("td", { className: "hs-muted" }, task.deployment || "—"),
+                        h("td", { className: "hs-muted" }, fmtTime(task.updated_at)),
+                      );
+                    }),
+                  ),
+                )
+              : h("div", { className: "hs-empty" }, "没有任务"),
+          ),
+
+          // 分页
+          h(
+            "div",
+            { className: "hs-pager" },
+            h(
+              "button",
+              {
+                type: "button",
+                className: "hs-btn sm",
+                disabled: page <= 1 || Boolean(busy),
+                onClick: function () {
+                  setPage(Math.max(1, page - 1));
+                },
+              },
+              "‹ 上一页",
+            ),
+            h("span", null, "第 " + page + " / " + pages + " 页"),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "hs-btn sm",
+                disabled: page >= pages || Boolean(busy),
+                onClick: function () {
+                  setPage(Math.min(pages, page + 1));
+                },
+              },
+              "下一页 ›",
+            ),
+            h("span", { className: "hs-spacer" }),
+            h(
+              "select",
+              {
+                className: "hs-select",
+                value: String(pageSize),
+                onChange: function (event) {
+                  setPageSize(Number(event.target.value));
+                  setPage(1);
+                },
+              },
+              [10, 20, 50, 100].map(function (size) {
+                return h("option", { key: size, value: String(size) }, size + " 条/页");
+              }),
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "hs-btn sm",
+                disabled: Boolean(busy),
+                onClick: function () {
+                  setBusy("reload");
+                  refreshAll();
+                },
+              },
+              busy === "reload" ? "刷新中…" : "刷新",
+            ),
+          ),
+
+          detail
+            ? h(Drawer, {
+                detail: detail,
+                run: run,
+                logFiles: logFiles,
+                logText: logText,
+                progress: progress,
+                onBlocked: function (reason) {
+                  notify(reason, true);
+                },
+                onLog: loadLog,
+                onOpenRun: function (taskId) {
+                  loadOptions();
+                  setRunModal(taskId);
+                },
+                onResumeLast: resumeLast,
+                onAction: function (method, path, payload, done) {
+                  postAction(method, path, payload, done).then(function () {
+                    openDetail(detail.task.id);
+                  });
+                },
+                onClose: function () {
+                  setDetail(null);
+                  setSelectedId(null);
+                },
+              })
+            : null,
+        ),
+
+        runModal
+          ? h(RunModal, {
+              taskId: runModal,
+              options: options || (state && state.executor_options) || { executors: [] },
+              onClose: function () {
+                setRunModal(null);
+              },
+              onDone: function () {
+                setRunModal(null);
+                notify("已开始执行", false);
+                setBannerShown(true);
+                refreshAll();
+              },
+            })
+          : null,
+
+        newModal
+          ? h(NewTaskModal, {
+              options: options || {},
+              onClose: function () {
+                setNewModal(false);
+              },
+              onDone: function (body) {
+                setNewModal(false);
+                notify("已创建：" + (body.id || "任务"), false);
+                refreshAll().then(function () {
+                  if (body.id) openDetail(body.id);
+                });
+              },
+            })
+          : null,
+
+        autoModal
+          ? h(AutoConfigModal, {
+              options: options || {},
+              auto: auto,
+              mode: mode,
+              onClose: function () {
+                setAutoModal(false);
+              },
+              onDone: function () {
+                setAutoModal(false);
+                notify("自动配置已保存", false);
+                refreshAll();
+              },
+            })
+          : null,
+
+        sessionModal
+          ? h(SessionModal, {
+              executor: sessionModal.executor,
+              sessions: sessionModal.sessions,
+              selected: sessionModal.selected,
+              onPick: function (id) {
+                var callback = sessionModal.onPick;
+                setSessionModal(null);
+                if (callback) callback(id);
+              },
+              onClose: function () {
+                setSessionModal(null);
+              },
+            })
+          : null,
+      );
+    }
+
+    // -- 侧边栏图标 ----------------------------------------------------------
+    function StudioIcon(props) {
+      var size = (props && props.size) || 16;
+      return h(
+        "svg",
+        {
+          width: size,
+          height: size,
+          viewBox: "0 0 24 24",
+          fill: "none",
+          stroke: "currentColor",
+          strokeWidth: 1.8,
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+          "aria-hidden": "true",
+          focusable: "false",
+        },
+        h("rect", { x: 2.75, y: 4, width: 18.5, height: 16, rx: 2.75 }),
+        h("path", { d: "M6.4 9.2h5.1" }),
+        h("path", { d: "M9.6 6.6l2.7 2.6-2.7 2.6" }),
+        h("path", { d: "M6.4 15.4h8.2" }),
+      );
+    }
+
+    // -- 注册 ----------------------------------------------------------------
+    function step(label, run) {
+      try {
+        return run();
+      } catch (error) {
+        console.error("[handoff-studio] " + label + " failed", error);
+        return undefined;
+      }
+    }
+
+    function apply(ctx) {
+      step("sidebar entry", function () {
+        return ctx.slots.inject("sidebar.panellist", function () {
+          return ctx.slots.register(
+            { name: "sidebar.panellist", id: PANEL_ID, order: 26, label: LABEL },
+            StudioIcon,
+          );
+        });
+      });
+      step("main panel", function () {
+        return ctx.slots.inject("main", function () {
+          return ctx.slots.register({ name: "main", key: PANEL_ID }, Panel);
+        });
+      });
+    }
+
+    exports.apply = apply;
+    exports.inject = ["slots"];
+    exports.name = "dsh-handoff-studio-client";
+
+    return module.exports;
+  },
+});

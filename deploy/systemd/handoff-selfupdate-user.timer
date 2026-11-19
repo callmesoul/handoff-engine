@@ -1,0 +1,15 @@
+# 前端机器上重启 listener 不丢消息（inbox 是 SQLite，重启后重放），
+# 所以间隔可以比后端短一些，让前端更快用上新代码。
+
+[Unit]
+Description=Check for core code changes every 5 minutes (frontend)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=handoff-selfupdate-user.service
+
+[Install]
+WantedBy=timers.target

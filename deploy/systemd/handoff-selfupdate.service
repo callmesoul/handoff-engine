@@ -1,0 +1,46 @@
+# 交接系统自身的自动更新（后端机器）。
+#
+# 更新对象是 handoffctl 的代码，不是任务数据。tasks/ events/ 的变化不触发任何动作。
+#
+# 安装：
+#   sudo mkdir -p /opt/handoff/selfupdate /etc/handoff
+#   sudo cp deploy/autoupdate/selfupdate.py /opt/handoff/selfupdate/
+#   sudo cp deploy/systemd/handoff-selfupdate.service deploy/systemd/handoff-selfupdate.timer /etc/systemd/system/
+#   sudo cp deploy/selfupdate.env.example /etc/handoff/selfupdate.env   # 按机器改
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now handoff-selfupdate.timer
+#
+# 关键：脚本必须放在 /opt/handoff/selfupdate/，不能留在 APP 里。
+# 它自己会 git merge，留在里面等于自己覆盖自己。
+
+[Unit]
+Description=Handoff self-update (core code only)
+Documentation=file:/opt/handoff/app/doc/AUTO-UPDATE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=handoff
+Group=handoff
+EnvironmentFile=/etc/handoff/selfupdate.env
+
+# 部署机上的固定值，不要在 env 文件里重复
+Environment=ROLE=backend
+Environment=APP=/opt/handoff/app
+Environment=STORE=/srv/handoff/store
+Environment=PYTHONPATH=/opt/handoff/app/src
+Environment=HOME=/home/handoff
+
+ExecStart=/opt/handoff/selfupdate/selfupdate.py
+
+# 要能重启 worker、写 release，所以不能 ProtectSystem=strict
+PrivateTmp=true
+# 需要 systemctl restart 权限：给一个只允许重启这几个单元的 sudoers 片段，
+# 或者让本单元以 root 跑并显式 drop 到 handoff（见文档）。
+NoNewPrivileges=false
+
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

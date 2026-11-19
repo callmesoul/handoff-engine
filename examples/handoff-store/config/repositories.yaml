@@ -1,0 +1,26 @@
+# 交接仓和业务仓注册表。提交前替换所有 your-org 示例值。
+store:
+  repo: your-org/handoff-store
+  branch: main
+  remote: origin
+  tasks_dir: tasks
+  events_dir: events
+  contracts_dir: contracts
+  artifacts_dir: artifacts
+
+repositories:
+  - id: your-org/api
+    role: backend
+    host: github
+    default_branch: main
+    allowed_base_refs: [develop]
+    pr_base_ref: develop
+    remote: git@github.com:your-org/api.git
+    cache_dir: .handoff-run/repo-cache/your-org__api
+
+  - id: your-org/web
+    role: frontend
+    host: github
+    default_branch: main
+    allowed_base_refs: [develop]
+    remote: git@github.com:your-org/web.git

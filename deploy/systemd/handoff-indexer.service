@@ -1,0 +1,18 @@
+# 后台索引。可选：只在装了 admin serve 的机器上跑。
+# 索引库是可重建的派生数据，删了不影响主链路。
+
+[Unit]
+Description=Handoff admin indexer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=handoff
+Group=handoff
+WorkingDirectory=/srv/handoff/store
+EnvironmentFile=/etc/handoff/worker.env
+Environment=PYTHONPATH=/opt/handoff/app/src
+Environment=HOME=/home/handoff
+ExecStart=/opt/handoff/app/.venv/bin/python -m handoff.cli --root /srv/handoff/store admin index
+Nice=10

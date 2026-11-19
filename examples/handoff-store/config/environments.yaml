@@ -1,0 +1,25 @@
+environments:
+  - name: dev
+    url: https://api.dev.example.com
+    version_path: /version
+    shared: true
+    concurrency_group: deploy-dev
+    auto_deploy: true
+
+  - name: preview
+    url: null
+    version_path: /version
+    shared: false
+    concurrency_group: deploy-preview
+    auto_deploy: false
+
+deploy_poll:
+  interval_seconds: 10
+  timeout_seconds: 900
+  request_timeout_seconds: 10
+  backoff_factor: 1.5
+  max_interval_seconds: 60
+
+verify_poll:
+  interval_seconds: 10
+  timeout_seconds: 900

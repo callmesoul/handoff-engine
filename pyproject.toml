@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handoff-engine"
+version = "0.1.0"
+description = "Git-native task handoff, isolated agent execution, controlled merge, deployment alignment, and verification"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "jsonschema>=4.18",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+handoffctl = "handoff.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+handoff = ["schemas/*.json", "panel/web/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

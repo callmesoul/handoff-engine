@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handoff 任务分发面板</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1d212b; --line: #2a2f3c;
+    --text: #e6e9f0; --muted: #8b93a7; --accent: #4f8cff; --accent2: #7aa2ff;
+    --green: #34c98e; --red: #ff6b6b; --amber: #f5b455; --purple: #b48cff; --cyan: #4fd8e0;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.55 "Segoe UI", "Microsoft YaHei", sans-serif; }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--panel2); color: var(--text); border-radius: 6px; padding: 5px 12px; }
+  button:hover { border-color: var(--accent); }
+  button:disabled, button.is-disabled { opacity: .45; cursor: not-allowed; }
+  button.is-disabled:hover { border-color: var(--line); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { border-color: var(--red); color: var(--red); }
+  input, select, textarea { font: inherit; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  textarea { width: 100%; resize: vertical; min-height: 90px; line-height: 1.55; }
+  .warn { color: var(--amber); font-size: 12.5px; margin-top: 6px; line-height: 1.5; }
+  a { color: var(--accent2); text-decoration: none; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+
+  header { display: flex; align-items: center; gap: 14px; padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header h1 .sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .spacer { flex: 1; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .dot.ok { background: var(--green); } .dot.bad { background: var(--red); }
+  .health { font-size: 12px; color: var(--muted); }
+
+  .mode-switch { display: flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .mode-switch button { border: none; border-radius: 0; padding: 6px 14px; background: transparent; }
+  .mode-switch button.active { background: var(--accent); color: #fff; }
+
+  /* 面板在 DSH 主区用 iframe 嵌入：宽度吃满可用空间，不再居中留白 */
+  main { width: 100%; max-width: none; margin: 0; padding: 16px 18px 60px; }
+
+  #run-banner { display: none; background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+  #run-banner.show { display: block; }
+  #run-banner .head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  #run-banner .head .t { font-weight: 600; }
+  #run-log { max-height: 300px; min-height: 90px; overflow: auto; background: var(--bg); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
+  #run-log .ln-tool { color: var(--cyan); }
+  #run-log .ln-warn { color: var(--amber); }
+  #run-log .ln-sys { color: var(--muted); }
+  #run-log .ln-fail { color: var(--red, #e5484d); }
+  #run-log .ln-file { color: var(--green, #30a46c); }
+  #run-log .ln-msg { color: var(--fg); }
+  #run-log .ln-think { color: var(--muted); font-style: italic; }
+  #run-log .ln-detail { color: var(--muted); padding-left: 1.4em; }
+  .steer { display: flex; gap: 8px; margin-top: 9px; }
+  .steer input { flex: 1; }
+  .security { flex-wrap: wrap; align-items: center; }
+  .security label { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .security select { min-width: 210px; }
+  .security .hint { font-size: 12px; color: var(--muted); }
+  .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 6px; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .toolbar h2 { font-size: 14px; color: var(--muted); font-weight: 500; }
+  #status-filter { min-width: 130px; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-size: 12px; font-weight: 500; background: var(--panel2); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--panel2); }
+  tbody tr.selected { background: var(--panel2); box-shadow: inset 3px 0 0 var(--accent); }
+  /* 任务 ID：下划线提示可点，点击复制 */
+  .task-id-copy { text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+  .task-id-copy:hover { color: var(--accent2); }
+
+  .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .pager button { padding: 3px 10px; }
+  .pager button:disabled { opacity: .4; cursor: default; }
+  .pager .page-no { color: var(--text, #e6e6e6); }
+  .pager .spacer { flex: 1; }
+
+  .chip { display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: 12px; white-space: nowrap; }
+  .st-open { background: #4f8cff22; color: var(--accent2); }
+  .st-claimed, .st-in_progress { background: #f5b45522; color: var(--amber); }
+  .st-delivered, .st-awaiting_merge { background: #b48cff22; color: var(--purple); }
+  .st-merged, .st-deployed, .st-verifying { background: #4fd8e022; color: var(--cyan); }
+  .st-verified { background: #34c98e22; color: var(--green); }
+  .st-frontend_accepted { background: #34c98e33; color: var(--green); font-weight: 600; }
+  .st-failed { background: #ff6b6b22; color: var(--red); }
+  .st-cancelled { background: #8b93a722; color: var(--muted); }
+  .exeq { font-size: 11.5px; padding: 1px 7px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); }
+  .exeq.zcode { color: var(--green); border-color: #34c98e55; }
+  .exeq.codex { color: var(--purple); border-color: #b48cff55; }
+  /* 前端 Agent（提单那侧的会话）用虚线边框，和后端执行器区分开 */
+  .exeq.fe-dsh { color: var(--cyan); border-style: dashed; border-color: #4fd8e055; }
+  .exeq.fe-codex { color: var(--amber); border-style: dashed; border-color: #f5b45555; }
+
+  /* 抽屉 */
+  #drawer-overlay { display: none; position: fixed; inset: 0; background: #000a; z-index: 40; }
+  #drawer-overlay.show { display: block; }
+  #drawer { position: fixed; top: 0; right: -720px; width: 700px; max-width: 94vw; height: 100vh; background: var(--panel); border-left: 1px solid var(--line); z-index: 50; transition: right .18s ease; display: flex; flex-direction: column; }
+  #drawer.show { right: 0; }
+  #drawer .dhead { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+  #drawer .dhead .title { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #drawer .dbody { overflow-y: auto; padding: 16px 18px; flex: 1; }
+  .sec { margin-bottom: 18px; }
+  .sec h3 { font-size: 13px; color: var(--muted); font-weight: 600; margin-bottom: 8px; letter-spacing: .3px; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  .pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; max-height: 260px; overflow: auto; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .timeline { border-left: 2px solid var(--line); margin-left: 6px; padding-left: 14px; }
+  .timeline .ev { position: relative; padding-bottom: 10px; }
+  .timeline .ev::before { content: ""; position: absolute; left: -19px; top: 6px; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+  .timeline .ev .meta { color: var(--muted); font-size: 12px; }
+  .failbox { background: #ff6b6b14; border: 1px solid #ff6b6b44; border-radius: 8px; padding: 10px 12px; }
+
+  /* 弹窗 */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: #000a; z-index: 60; align-items: center; justify-content: center; }
+  .modal-overlay.show { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; width: 620px; max-width: 94vw; max-height: 88vh; display: flex; flex-direction: column; }
+  .modal .mhead { padding: 14px 18px; border-bottom: 1px solid var(--line); font-weight: 600; display: flex; align-items: center; }
+  .modal .mbody { padding: 16px 18px; overflow-y: auto; }
+  .modal .mfoot { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
+  .form-row { margin-bottom: 14px; }
+  .form-row label { display: block; color: var(--muted); font-size: 12.5px; margin-bottom: 5px; }
+  .form-row select, .form-row input[type=text] { width: 100%; }
+  .radio-cards { display: flex; gap: 10px; }
+  .radio-card { flex: 1; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; cursor: pointer; }
+  .radio-card.sel { border-color: var(--accent); background: #4f8cff14; }
+  .radio-card .nm { font-weight: 600; }
+  .radio-card .ver { color: var(--muted); font-size: 11.5px; }
+  .checks { display: flex; gap: 18px; }
+  .checks label { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; cursor: pointer; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .sesslist { border: 1px solid var(--line); border-radius: 8px; max-height: 320px; overflow-y: auto; }
+  .sesslist .sess { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: 10px; align-items: center; }
+  .sesslist .sess:hover { background: var(--panel2); }
+  .sesslist .sess.sel { background: #4f8cff1c; box-shadow: inset 3px 0 0 var(--accent); }
+  .sesslist .sess .id { font-family: var(--mono); font-size: 12px; flex-shrink: 0; }
+  .sesslist .sess .tt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+  .sesslist .sess .tm { color: var(--muted); font-size: 11.5px; flex-shrink: 0; }
+  .tag { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted); flex-shrink: 0; }
+  .tag.task { color: var(--amber); border-color: #f5b45555; }
+
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--line); padding: 9px 18px; border-radius: 8px; z-index: 100; display: none; box-shadow: 0 6px 24px #0008; }
+  #toast.err { border-color: var(--red); color: var(--red); }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Handoff 面板<span class="sub" id="store-root"></span></h1>
+  <div class="health" id="health"></div>
+  <div class="spacer"></div>
+  <div class="health" id="wake-status"></div>
+  <div class="mode-switch" id="mode-switch">
+    <button data-mode="manual">手动</button>
+    <button data-mode="auto">全自动</button>
+  </div>
+  <button id="btn-auto-cfg" title="全自动模式配置">⚙ 自动配置</button>
+</header>
+
+<main>
+  <div id="run-banner">
+    <div class="head">
+      <span class="t" id="run-title"></span>
+      <span class="mono" id="run-elapsed"></span>
+      <span class="health" id="run-count"></span>
+      <div class="spacer"></div>
+      <button id="btn-live-scroll" title="关闭后手动滚动查看历史，不会被自动拉到底">跟随最新</button>
+      <button class="danger" id="btn-cancel">停止</button>
+    </div>
+    <div class="mono" id="run-log"></div>
+    <div class="steer">
+      <input id="steer-text" placeholder="要纠偏就写一句——会打断当前执行，然后带着这句话续跑同一会话（上下文不丢）">
+      <button class="primary" id="btn-steer">⏸ 打断并补一句</button>
+    </div>
+    <div class="steer security" id="live-security">
+      <label for="live-sandbox">Codex 安全模式</label>
+      <select id="live-sandbox"></select>
+      <button class="primary" id="btn-sandbox-save">应用（下轮生效）</button>
+      <button id="btn-sandbox-now">⚡ 立即生效（打断续跑）</button>
+      <span class="hint" id="live-sandbox-status"></span>
+    </div>
+    <div class="hint" id="live-sandbox-tip">--sandbox 是 codex 进程启动参数：已在跑的进程改不了。「应用」把档位存为默认，下一轮/干预续跑生效；「立即生效」会打断本轮并按新档位接同一会话续跑。</div>
+  </div>
+
+  <div class="toolbar">
+    <h2>任务</h2>
+    <select id="status-filter">
+      <option value="">全部状态</option>
+      <option>open</option><option>claimed</option><option>in_progress</option>
+      <option>delivered</option><option>awaiting_merge</option><option>merged</option>
+      <option>deployed</option><option>verifying</option><option>verified</option>
+      <option>frontend_accepted</option>
+      <option>failed</option><option>cancelled</option>
+    </select>
+    <div class="spacer"></div>
+    <span class="health" id="deliver-status"></span>
+    <button id="btn-sync" title="从交接仓远端拉最新任务单（本地轮询只读快照，不会自动发现新单）">⟳ 拉取最新</button>
+    <button class="primary" id="btn-new-task">+ 新建任务</button>
+  </div>
+  <table>
+    <thead><tr>
+      <th style="width:70px">状态</th><th>标题</th><th style="width:170px">任务</th>
+      <th style="width:150px">项目</th><th style="width:84px">前端Agent</th>
+      <th style="width:76px">执行器</th><th style="width:186px">仓库</th>
+      <th style="width:56px">次数</th><th style="width:64px">PR</th><th style="width:78px">更新</th>
+    </tr></thead>
+    <tbody id="task-rows"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody>
+  </table>
+  <div class="pager" id="task-pager">
+    <button id="page-prev" title="上一页">‹ 上一页</button>
+    <span class="page-no" id="page-info">—</span>
+    <button id="page-next" title="下一页">下一页 ›</button>
+    <span class="spacer"></span>
+    <span id="page-total"></span>
+    <select id="page-size" title="每页条数">
+      <option value="10">10 / 页</option>
+      <option value="20" selected>20 / 页</option>
+      <option value="50">50 / 页</option>
+      <option value="100">100 / 页</option>
+    </select>
+  </div>
+</main>
+
+<!-- 任务抽屉 -->
+<div id="drawer-overlay"></div>
+<div id="drawer">
+  <div class="dhead">
+    <span class="title" id="d-title"></span>
+    <span class="chip" id="d-status"></span>
+    <button id="d-close">✕</button>
+  </div>
+  <div class="dbody" id="d-body"></div>
+</div>
+
+<!-- 执行对话框 -->
+<div class="modal-overlay" id="run-modal">
+  <div class="modal">
+    <div class="mhead">执行任务 <span class="mono" id="rm-task" style="margin-left:8px;color:var(--muted)"></span></div>
+    <div class="mbody">
+      <div class="form-row">
+        <label>执行器</label>
+        <div class="radio-cards" id="rm-executors"></div>
+      </div>
+      <div class="form-row">
+        <label>模型 / 思考程度</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="rm-model" list="rm-model-list" placeholder="留空 = 跟随配置" style="flex:1">
+          <datalist id="rm-model-list"></datalist>
+          <select id="rm-effort" style="width:190px"></select>
+        </div>
+        <div class="hint" id="rm-model-hint"></div>
+      </div>
+      <div class="form-row">
+        <label>会话（不选 = 新会话）</label>
+        <div class="sesslist" id="rm-sessions"><div class="empty" style="padding:14px">加载中…</div></div>
+        <div class="hint">置顶的是本任务历史会话；继续上次会话可以带着已读过的上下文重试。zcode 新会话 id 是按 (任务, 次数) 预生成的。</div>
+      </div>
+      <div class="form-row">
+        <label>项目目录</label>
+        <select id="rm-workdir-mode">
+          <option value="">隔离 worktree（默认）—— 在副本里跑，交付走分支 + PR</option>
+          <option value="local">用已注册的项目目录</option>
+          <option value="custom">自定义路径…</option>
+        </select>
+        <select id="rm-workdir-path" style="margin-top:6px;display:none"></select>
+        <input type="text" id="rm-workdir-custom" placeholder="D:\project\your-repo" style="margin-top:6px;width:100%;display:none">
+        <div class="hint" id="rm-workdir-hint"></div>
+        <div class="warn" id="rm-workdir-warn" style="display:none"></div>
+      </div>
+      <div class="form-row" id="rm-sandbox-row">
+        <label>Codex 安全模式（--sandbox）</label>
+        <select id="rm-sandbox"></select>
+        <div class="hint" id="rm-sandbox-hint"></div>
+      </div>
+      <div class="form-row" id="rm-perm-row">
+        <label>zcode 权限档</label>
+        <select id="rm-perm">
+          <option value="">默认（config: acceptEdits）</option>
+          <option value="acceptEdits">acceptEdits — 自动接受文件编辑（推荐）</option>
+          <option value="yolo">yolo — 全放行（只靠 worker gate 兜底）</option>
+          <option value="bypassPermissions">bypassPermissions — 跳过权限询问</option>
+          <option value="auto">auto — 自动</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>执行后</label>
+        <div class="checks">
+          <label><input type="checkbox" id="rm-automerge" checked> 自动合并（过 gate 后）</label>
+          <label><input type="checkbox" id="rm-waitdeploy" checked> 等部署对齐</label>
+          <label id="rm-autocommit-label" style="display:none"><input type="checkbox" id="rm-autocommit"> 目录模式自动提交并推送（AI 写提交信息）</label>
+        </div>
+        <div class="hint">取消勾选则停在 awaiting_merge / merged，由你手动确认后续。自动提交选项只在项目目录模式下生效：只提交任务改动的文件，推送到当前分支。</div>
+      </div>
+    </div>
+    <div class="mfoot">
+      <button id="rm-cancel">取消</button>
+      <button class="primary" id="rm-go">开始执行</button>
+    </div>
+  </div>
+</div>
+
+<!-- 全局会话选择器 -->
+<div class="modal-overlay" id="sess-modal">
+  <div class="modal">
+    <div class="mhead">选择会话（<span id="sm-executor"></span>）</div>
+    <div class="mbody">
+      <div class="form-row"><input type="text" id="sm-search" placeholder="搜索 id / 标题 / 目录…" style="width:100%"></div>
+      <div class="sesslist" id="sm-list"></div>
+    </div>
+    <div class="mfoot"><button id="sm-close">关闭</button></div>
+  </div>
+</div>
+
+<!-- 自动模式配置 -->
+<div class="modal-overlay" id="auto-modal">
+  <div class="modal" style="width:520px">
+    <div class="mhead">全自动模式配置</div>
+    <div class="mbody">
+      <div class="form-row">
+        <label>默认执行器（新任务自动用它跑）</label>
+        <select id="am-executor" style="width:100%">
+          <option value="zcode">zcode</option><option value="codex">codex</option>
+        </select>
+      </div>
+      <div class="form-row" id="am-model-row">
+        <label>模型 / 思考程度（留空 = 跟随执行器配置）</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="am-model" list="am-model-list" placeholder="跟随配置" style="flex:1">
+          <datalist id="am-model-list"></datalist>
+          <select id="am-effort" style="width:190px"></select>
+        </div>
+        <div class="hint" id="am-model-hint"></div>
+      </div>
+      <div class="form-row">
+        <label>会话策略</label>
+        <select id="am-strategy" style="width:100%">
+          <option value="new">每次新会话</option>
+          <option value="continue">自动接续该任务上次会话（同执行器时）</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>zcode 权限档（留空用 config 默认）</label>
+        <select id="am-perm" style="width:100%">
+          <option value="">默认（acceptEdits）</option>
+          <option value="acceptEdits">acceptEdits</option>
+          <option value="yolo">yolo</option>
+          <option value="bypassPermissions">bypassPermissions</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Codex 安全模式（留空跟随 config/codex.yaml）</label>
+        <select id="am-sandbox" style="width:100%"></select>
+        <div class="hint">全自动认领的任务与「执行…」对话框都用它当默认值；执行过程中仍可在顶部横幅随时改。</div>
+      </div>
+      <div class="form-row">
+        <label>默认工作目录（填了就不建 worktree，直接在这个目录跑）</label>
+        <input id="am-workdir" type="text" style="width:100%" placeholder="例如 D:/project/api">
+        <div class="hint">留空时按任务的 target.repo 从 config/local.yaml 的 repo_paths 自动取；都找不到才回退到隔离 worktree。所有任务共用这个目录，因此自动模式强制串行：上一单跑完才认领下一单。</div>
+      </div>
+      <div class="form-row">
+        <label>端到端</label>
+        <div class="checks">
+          <label><input type="checkbox" id="am-automerge" checked> 自动合并</label>
+          <label><input type="checkbox" id="am-waitdeploy" checked> 等部署</label>
+          <label><input type="checkbox" id="am-autocommit"> 目录模式执行完自动提交并推送</label>
+        </div>
+        <div class="hint">填了默认工作目录时，自动合并/等部署自动失效；建议勾上自动提交，否则上一单的改动会留在目录里带进下一单。全自动模式严格串行，且不会和仍在处理中的任务抢单。</div>
+      </div>
+    </div>
+    <div class="mfoot"><button id="am-close">关闭</button><button class="primary" id="am-save">保存</button></div>
+  </div>
+</div>
+
+<!-- 新建任务 -->
+<div class="modal-overlay" id="new-modal">
+  <div class="modal" style="width:640px">
+    <div class="mhead">新建任务</div>
+    <div class="mbody">
+      <div class="form-row">
+        <label>目标项目</label>
+        <select id="nt-repo" style="width:100%"></select>
+        <div class="hint">只列 backend 项目（面板只给后端发单）。</div>
+      </div>
+      <div class="form-row">
+        <label>基线分支</label>
+        <select id="nt-base-ref" style="width:100%"></select>
+      </div>
+      <div class="form-row">
+        <label>标题</label>
+        <input type="text" id="nt-title" placeholder="例：补齐 /healthz 健康检查接口" style="width:100%">
+      </div>
+      <div class="form-row">
+        <label>需求正文</label>
+        <textarea id="nt-requirement" rows="6" placeholder="要做什么、验收标准、不要碰什么…"></textarea>
+      </div>
+      <div class="form-row">
+        <label>允许改动的路径（每行一个 glob）</label>
+        <textarea id="nt-allowed" rows="3">**</textarea>
+      </div>
+      <div class="form-row">
+        <label>禁止改动的路径（每行一个，可留空）</label>
+        <textarea id="nt-forbidden" rows="2">.github/**</textarea>
+      </div>
+      <div class="form-row">
+        <label>验收环境</label>
+        <select id="nt-env" style="width:100%"></select>
+      </div>
+      <details style="margin-top:6px">
+        <summary style="cursor:pointer;color:var(--muted);font-size:12.5px">来源项目 / 提交（可选，仅用于追溯）</summary>
+        <div class="form-row" style="margin-top:10px">
+          <select id="nt-source-repo" style="width:100%"><option value="">不指定</option></select>
+        </div>
+        <div class="form-row">
+          <input type="text" id="nt-source-sha" placeholder="40 位十六进制 sha，可留空" style="width:100%">
+        </div>
+      </details>
+    </div>
+    <div class="mfoot">
+      <button id="nt-cancel">取消</button>
+      <button class="primary" id="nt-go">创建</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const timeAgo = (iso) => {
+  if (!iso) return "—";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return Math.floor(s) + "秒前";
+  if (s < 3600) return Math.floor(s/60) + "分前";
+  if (s < 86400) return Math.floor(s/3600) + "时前";
+  return Math.floor(s/86400) + "天前";
+};
+
+let panelState = null;
+let tasks = [];
+let taskPage = 1;          // 任务列表当前页（自动刷新时保留，不把人拽回第一页）
+let taskPages = 1;
+let taskTotal = 0;
+let taskPageSize = 20;
+let selectedTask = null;   // {id, task, events}
+let runModalTask = null;   // task id in run dialog
+let runModal = { executor: "zcode", session: null, sessions: [] };
+let followLog = true;
+let _runLogSig = "";
+
+// -- Codex 安全模式（执行前选、执行中随时改） ----------------------------------
+const SANDBOX_LABELS = {
+  "read-only": "read-only — 只读（不能改文件，适合审查；业务任务多半会因无改动被 gate 拦下）",
+  "workspace-write": "workspace-write — 工作区可写（默认推荐）",
+  "danger-full-access": "danger-full-access — 全放行（不受沙箱限制，仅用于受信任任务）",
+};
+
+function sandboxOptionsHtml() {
+  const opts = (panelState && panelState.codex_sandbox_options) || Object.keys(SANDBOX_LABELS);
+  const fallback = (panelState && panelState.codex_sandbox_default) || "workspace-write";
+  return `<option value="">跟随配置（${esc(fallback)}）</option>` +
+    opts.map(v => `<option value="${esc(v)}">${esc(SANDBOX_LABELS[v] || v)}</option>`).join("");
+}
+
+function fillSandboxSelects() {
+  ["rm-sandbox", "am-sandbox", "live-sandbox"].forEach(id => {
+    const el = $(id);
+    if (!el) return;
+    const cur = el.value;
+    el.innerHTML = sandboxOptionsHtml();
+    if (cur && [...el.options].some(o => o.value === cur)) el.value = cur;
+  });
+}
+
+function renderLiveSecurity(active) {
+  const box = $("live-security"), tip = $("live-sandbox-tip");
+  const running = !!(active && active.phase === "running");
+  box.style.display = running ? "" : "none";
+  if (tip) tip.style.display = running ? "" : "none";
+  if (!running) return;
+  const isCodex = active.executor === "codex";
+  const sel = $("live-sandbox");
+  // 轮询别把用户正在挑、还没点的档位冲掉
+  if (document.activeElement !== sel && sel.dataset.pending !== "1") {
+    sel.value = active.codex_sandbox || "";
+  }
+  sel.disabled = !isCodex;
+  $("btn-sandbox-save").disabled = !isCodex;
+  $("btn-sandbox-now").disabled = !isCodex;
+  const effective = active.codex_sandbox_effective
+    || (panelState && panelState.codex_sandbox_default) || "workspace-write";
+  $("live-sandbox-status").textContent = isCodex
+    ? `当前 ${effective}${active.sandbox_restart_pending ? " · 切换中…" : ""}${sel.dataset.pending === "1" ? " · 未应用" : ""}`
+    : "当前是 zcode，安全模式只对 codex 有效";
+}
+
+async function applySandbox(applyNow) {
+  const sel = $("live-sandbox");
+  const running = panelState && panelState.active && panelState.active.phase === "running";
+  if (!running) { toast("没有正在执行的任务", true); return; }
+  if (applyNow && panelState.active.executor !== "codex") {
+    toast("当前执行器是 zcode，安全模式只对 codex 有效", true); return;
+  }
+  const btn = $(applyNow ? "btn-sandbox-now" : "btn-sandbox-save");
+  if (btn) btn.disabled = true;
+  try {
+    const d = await api("/api/runs/security", {
+      body: { codex_sandbox: sel.value || null, apply_now: !!applyNow },
+    });
+    delete sel.dataset.pending;
+    panelState = d;
+    renderState();
+    toast((d.security && d.security.notice) || "安全模式已更新");
+    refreshTasks();
+  } catch (e) { toast(e.message, true); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+// -- 实时执行输出 ------------------------------------------------------------
+function renderRunLog(lines) {
+  const box = $("run-log");
+  if (!box) return;
+  const tail = lines.slice(-400);
+  const sig = tail.length + "|" + (tail[tail.length - 1] || "");
+  if (sig === _runLogSig) return;
+  _runLogSig = sig;
+  const stick = followLog || box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.innerHTML = tail.map(raw => {
+    const line = String(raw ?? "");
+    let cls = "";
+    if (/^\s*✗/.test(line)) cls = "ln-fail";
+    else if (/^\s+↳|^\s{3}/.test(line)) cls = "ln-detail";
+    else if (line.includes("🔧") || line.includes("⏸")) cls = "ln-tool";
+    else if (line.includes("✎")) cls = "ln-file";
+    else if (line.includes("🤖")) cls = "ln-msg";
+    else if (line.includes("💭")) cls = "ln-think";
+    else if (line.includes("⚠") || line.includes("[错误]") || line.includes("✘")) cls = "ln-warn";
+    else if (/[▶■]/.test(line)) cls = "ln-sys";
+    return `<div class="${cls}">${esc(line) || "&nbsp;"}</div>`;
+  }).join("");
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = isErr ? "err" : "";
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.style.display = "none"; }, isErr ? 5000 : 2500);
+}
+
+// 复制文本到剪贴板：优先 Clipboard API，非安全上下文回退到 execCommand。
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* 落到下面的回退 */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) { return false; }
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts && opts.body ? {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(opts.body)
+  } : undefined);
+  const data = await res.json().catch(() => ({ok: false, error: `HTTP ${res.status}`}));
+  if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
+  return data;
+}
+
+// -- 状态轮询 ---------------------------------------------------------------
+async function refreshState() {
+  try { panelState = await api("/api/state"); renderState(); } catch (e) { console.warn(e); }
+}
+
+function renderState() {
+  const s = panelState;
+  // 选项只构建一次：轮询里重建 select 会把用户正在挑的档位冲掉
+  if (!window._sandboxFilled) { fillSandboxSelects(); window._sandboxFilled = true; }
+  $("store-root").textContent = s.store_root || "";
+  document.querySelectorAll("#mode-switch button").forEach(b =>
+    b.classList.toggle("active", b.dataset.mode === s.mode));
+  const h = Object.entries(s.executors || {}).map(([name, info]) =>
+    `<span><span class="dot ${info.ok ? "ok" : "bad"}"></span>${esc(name)}${info.version ? " · " + esc(info.version.split(" ")[0] || info.version) : ""}</span>`).join(" &nbsp; ");
+  $("health").innerHTML = h || "—";
+  const wake = s.wake_listener || {};
+  $("wake-status").innerHTML = s.mode === "auto"
+    ? (wake.ok ? `<span class="dot ok"></span>唤醒监听已接管` : `<span class="dot bad"></span>${esc(wake.reason || "唤醒监听未启动，退回轮询")}`)
+    : "";
+  const active = s.active;
+  renderLiveSecurity(active);
+  renderSteerBox(active);
+  const banner = $("run-banner");
+  if (active && active.phase === "running") {
+    banner.classList.add("show");
+    $("run-title").innerHTML = `<span class="live-dot"></span>执行中：<span class="mono">${esc(active.task_id)}</span> · <span class="exeq ${esc(active.executor)}">${esc(active.executor)}</span>${active.trigger === "auto" ? " · 自动" : active.trigger === "steer" ? " · 干预续跑" : active.trigger === "continue" ? " · 续话续跑" : ""}${active.resume_session_id ? " · 接续会话" : ""}`;
+    $("run-elapsed").textContent = timeAgo(active.started_at).replace("前", "") + " …";
+    if (active.steer_pending) $("run-count").textContent = "干预等待中…";
+    else $("run-count").textContent = `${(active.logs || []).length} 行${active.session_id ? " · " + active.session_id.slice(0, 16) : ""}`;
+    renderRunLog(active.logs || []);
+    $("run-banner").dataset.task = active.task_id;
+  } else if (active && active.phase === "finished") {
+    banner.classList.add("show");
+    const ok = !active.error;
+    $("run-title").innerHTML = `${ok ? "✔ 上一单结束" : "✘ 上一单出错"}：<span class="mono">${esc(active.task_id)}</span> · <span class="exeq ${esc(active.executor)}">${esc(active.executor)}</span>${active.steer_text ? " · 带干预续跑过" : ""}`;
+    $("run-elapsed").textContent = active.finished_at ? timeAgo(active.finished_at) : "";
+    $("run-count").textContent = `${(active.logs || []).length} 行`;
+    renderRunLog((active.logs || []).concat(active.error ? [`[错误] ${active.error}`] : []), true);
+    $("run-banner").dataset.task = active.task_id;
+  } else {
+    banner.classList.remove("show");
+    delete $("run-banner").dataset.task;
+  }
+  const dv = s.deliver, av = s.advance;
+  if (av && !av.done) $("deliver-status").textContent = `恢复推进进行中：${av.task_id} …`;
+  else if (av && av.done) {
+    $("deliver-status").textContent = `恢复推进：${av.result || "done"}${av.error ? " ✘ " + av.error : ""}`;
+    const key = av.started_at || av.task_id;
+    if (window._advanceShown !== key) {
+      window._advanceShown = key;
+      toast(av.error || av.message || "恢复推进已完成", !!av.error);
+      refreshTasks(); refreshDrawer(true);
+    }
+  }
+  else if (dv && !dv.done) $("deliver-status").textContent = `验收进行中：${dv.task_id} …`;
+  else if (dv && dv.done) $("deliver-status").textContent = `上次验收：${dv.task_id} ${dv.error ? "✘ " + dv.error : "✔"}`;
+  else $("deliver-status").textContent = "";
+  if (s.reclaimed && s.reclaimed.length && !window._reclaimShown) {
+    window._reclaimShown = true;
+    toast(`已回收 ${s.reclaimed.length} 个上次残留的租约，任务已回到 open`);
+    refreshTasks();
+  }
+  updateDrawerLive();
+}
+
+// -- 任务列表 ---------------------------------------------------------------
+async function refreshTasks(resetPage = false) {
+  if (resetPage) taskPage = 1;
+  const status = $("status-filter").value;
+  const qs = [];
+  if (status) qs.push("status=" + encodeURIComponent(status));
+  qs.push("page=" + taskPage, "page_size=" + taskPageSize);
+  try {
+    const data = await api("/api/tasks?" + qs.join("&"));
+    tasks = data.tasks || data.items || [];
+    taskTotal = data.total ?? data.count ?? tasks.length;
+    taskPages = data.pages || 1;
+    taskPage = data.page || taskPage;
+    renderTasks();
+    renderPager();
+    if (selectedTask) refreshDrawer(false);
+  } catch (e) { console.warn(e); }
+}
+
+function renderPager() {
+  $("page-info").textContent = `第 ${taskPage} / ${taskPages} 页`;
+  $("page-total").textContent = `共 ${taskTotal} 个任务`;
+  $("page-prev").disabled = taskPage <= 1;
+  $("page-next").disabled = taskPage >= taskPages;
+}
+
+function gotoPage(delta) {
+  const next = Math.max(1, Math.min(taskPages, taskPage + delta));
+  if (next === taskPage) return;
+  taskPage = next;
+  refreshTasks();
+}
+
+function shortRepo(name) {
+  // 前端项目存的是 org/repo，表格列窄，只留 repo 名，全名放 title
+  return String(name || "").split("/").pop();
+}
+
+function renderTasks() {
+  const body = $("task-rows");
+  if (!tasks.length) { body.innerHTML = `<tr><td colspan="10" class="empty">暂无任务。前端发单后会出现在这里。</td></tr>`; return; }
+  body.innerHTML = tasks.map(t => `
+    <tr data-id="${esc(t.id)}" class="${selectedTask && selectedTask.id === t.id ? "selected" : ""}">
+      <td><span class="chip st-${esc(t.status)}">${esc(t.status)}</span></td>
+      <td>${esc(t.title)}${t.failure ? ` <span title="${esc(t.failure.stage)}" style="color:var(--red)">✘</span>` : ""}</td>
+      <td class="mono"><span class="task-id-copy" data-copy="${esc(t.id)}" title="点击复制任务 ID">${esc(t.id)}</span></td>
+      <td class="mono" style="font-size:12px" title="${esc(t.frontend_repo || "")}">${esc(shortRepo(t.frontend_repo) || "—")}</td>
+      <td>${t.frontend_executor ? `<span class="exeq fe-${esc(t.frontend_executor)}">${esc(t.frontend_executor)}</span>` : "—"}</td>
+      <td>${t.executor ? `<span class="exeq ${esc(t.executor)}">${esc(t.executor)}</span>` : "—"}</td>
+      <td class="mono" style="font-size:12px">${esc(t.repo || "")}</td>
+      <td>#${esc(t.attempt ?? 0)}</td>
+      <td>${t.pr_url ? `<a href="${esc(t.pr_url)}" target="_blank" onclick="event.stopPropagation()">PR</a>` : "—"}</td>
+      <td style="color:var(--muted);font-size:12px">${timeAgo(t.updated_at)}</td>
+    </tr>`).join("");
+  body.querySelectorAll("tr[data-id]").forEach(tr =>
+    tr.addEventListener("click", () => openDrawer(tr.dataset.id)));
+  // 任务列点击复制：阻止冒泡，避免同时打开抽屉
+  body.querySelectorAll(".task-id-copy").forEach(el =>
+    el.addEventListener("click", async ev => {
+      ev.stopPropagation();
+      const ok = await copyText(el.dataset.copy || el.textContent.trim());
+      toast(ok ? `已复制任务 ID：${el.textContent.trim()}` : "复制失败，请手动选择", !ok);
+    }));
+}
+
+// -- 抽屉 -------------------------------------------------------------------
+async function openDrawer(taskId) {
+  if (!taskId) return;
+  selectedTask = { id: taskId, task: null, events: [] };
+  resumeArm = null;   // 换任务时清掉「继续上次会话」的确认态
+  $("drawer").classList.add("show");
+  $("drawer-overlay").classList.add("show");
+  $("d-title").textContent = taskId;
+  $("d-status").textContent = "加载中";
+  $("d-status").className = "chip";
+  $("d-body").innerHTML = `<div class="empty">读取任务 ${esc(taskId)} …</div>`;
+  await refreshDrawer(true);
+}
+
+async function refreshDrawer(explicit) {
+  if (!selectedTask || !selectedTask.id) return;
+  const id = selectedTask.id;
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(id)}`);
+    selectedTask = { id, task: data.task, events: data.events || [], frontend: data.frontend || null };
+    renderDrawer();
+  } catch (e) {
+    if (explicit) toast(`加载任务失败：${e.message}`, true);
+    if (!selectedTask.task) {
+      $("d-body").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    }
+  }
+}
+
+function renderDrawer() {
+  if (!selectedTask || !selectedTask.task) return;
+  const t = selectedTask.task;
+  const events = selectedTask.events || [];
+  $("d-title").textContent = t.title || t.id;
+  const st = $("d-status");
+  st.textContent = t.status;
+  st.className = `chip st-${t.status}`;
+  const r = t.result || {};
+  const canRun = ["open", "failed", "cancelled"].includes(t.status);
+  const canRetry = t.status === "failed";
+  const canDeliver = ["merged", "deployed", "verifying"].includes(t.status);
+  const canResend = ["verified", "failed"].includes(t.status);
+  const canAccept = t.status === "verified";
+  const canAdvance = ["delivered", "awaiting_merge", "merged", "deployed", "verifying"].includes(t.status);
+  const hasLease = ["claimed", "in_progress"].includes(t.status);
+  const scope = t.scope || {};
+  const acc = t.acceptance || {};
+  const fe = selectedTask.frontend;
+  const rows = [];
+  rows.push(`<div class="sec"><h3>概况</h3><div class="kv">
+    <span class="k">任务</span><span class="mono">${esc(t.id)}</span>
+    <span class="k">项目</span><span class="mono">${esc((t.source||{}).repo || "—")}${(t.source||{}).commit_sha ? ` @ ${esc(t.source.commit_sha.slice(0,12))}` : ""}</span>
+    <span class="k">前端Agent</span><span>${fe ? `<span class="exeq fe-${esc(fe.executor)}">${esc(fe.executor)}</span> <span class="mono" style="color:var(--muted);font-size:12px">${esc(String(fe.thread_id||"").slice(0,28))}</span>` : "—"}</span>
+    <span class="k">仓库</span><span class="mono">${esc((t.target||{}).repo||"")} @ ${(t.target||{}).base_ref||""}</span>
+    <span class="k">次数</span><span>#${esc(t.attempt ?? 0)}（revision ${esc(t.revision)}）</span>
+    <span class="k">执行器</span><span>${r.executor ? `<span class="exeq ${esc(r.executor)}">${esc(r.executor)}</span> ${esc(r.executor_session_id||"").slice(0,20)}` : "—"}</span>
+    <span class="k">分支</span><span class="mono">${esc(r.branch || "—")}</span>
+    <span class="k">PR</span><span>${r.pr_url ? `<a href="${esc(r.pr_url)}" target="_blank">${esc(r.pr_url)}</a>` : "—"}</span>
+    <span class="k">合并 SHA</span><span class="mono">${esc((r.merge_sha||"").slice(0,12) || "—")}</span>
+    <span class="k">部署</span><span>${esc((t.deployment||{}).status || "—")}${(t.deployment||{}).observed_sha ? " · " + esc(t.deployment.observed_sha.slice(0,12)) : ""}</span>
+    <span class="k">创建 / 更新</span><span>${esc(t.created_at||"")} / ${esc(t.updated_at||"")}</span>
+  </div></div>`);
+  if (t.failure) rows.push(`<div class="sec"><h3>失败（${esc(t.failure.stage)}）</h3><div class="failbox pre">${esc(t.failure.message||"")}</div></div>`);
+  rows.push(`<div class="sec"><h3>需求</h3><div class="pre">${esc(t.requirement || "（空）")}</div></div>`);
+  const checks = (acc.checks || []).map(c => {
+    if (c.type === "http") return `http ${c.method} ${c.url} → ${c.expect_status}`;
+    if (c.type === "openapi_diff") return `openapi_diff ${c.expected_path} ≡ ${c.actual_url}`;
+    return `${c.type} ${c.repo || ""}:${c.name || ""}`;
+  }).join("\n");
+  rows.push(`<div class="sec"><h3>验收（环境 ${esc(acc.environment || "—")}）</h3><div class="pre">${esc(checks || "（无）")}</div></div>`);
+  rows.push(`<div class="sec"><h3>范围</h3><div class="pre">允许：\n${esc((scope.allowed_paths||[]).join("\n"))}\n\n禁止：\n${esc((scope.forbidden_paths||[]).join("\n") || "（无额外）")}</div></div>`);
+  const activeRun = (panelState && panelState.active && panelState.active.phase === "running") ? panelState.active : null;
+  const isRunning = !!activeRun && activeRun.task_id === t.id;
+  if (isRunning) {
+    rows.push(`<div class="sec"><h3>执行实况 <span class="live-dot"></span></h3>
+      <div class="pre" id="d-live" style="max-height:320px"></div>
+      <div class="steer" style="margin-top:8px"><input id="d-steer-text" placeholder="要纠偏就写一句…">
+      <button class="primary" id="d-steer">⏸ 打断并补一句</button></div>
+      <div class="hint">执行中写一句=打断并带话续跑；已结束写一句=直接续跑同一会话接着干，上下文不丢。Codex 安全模式在顶部执行横幅里改，执行过程中随时可切换。</div></div>`);
+  }
+  const why = (ok, msg) => ok ? { cls: "", attr: "" } : {
+    cls: " is-disabled",
+    attr: `aria-disabled="true" data-why="${esc(msg)}"`,
+  };
+  const runWhy = `当前状态 ${t.status} 不能直接执行（只有 open / failed / cancelled 可以）。若它卡在 in_progress，先点「释放租约」。`;
+  const retryWhy = `只有 failed 能重新入队（当前 ${t.status}）。卡在 in_progress 的话先「释放租约」；正在执行的话去顶部打断。`;
+  const releaseWhy = `只有 claimed / in_progress 才有租约（当前 ${t.status}）。`;
+  const deliverWhy = `只有 merged / deployed / verifying 能验收（当前 ${t.status}）。`;
+  const resendWhy = `只有 verified / failed 才有完成通知可重发（当前 ${t.status}）。`;
+  const acceptWhy = `只有后端验收通过（verified）才能标记前端已验收（当前 ${t.status}）。`;
+  const advanceWhy = `恢复推进只接手交付链路中途断掉的状态（delivered / awaiting_merge / merged / deployed / verifying；当前 ${t.status}）。`;
+  const gRun = why(canRun, runWhy), gRetry = why(canRetry, retryWhy);
+  const gRelease = why(hasLease, releaseWhy), gDeliver = why(canDeliver, deliverWhy);
+  const gResend = why(canResend, resendWhy);
+  const gAccept = why(canAccept, acceptWhy);
+  const gAdvance = why(canAdvance, advanceWhy);
+  rows.push(`<div class="sec"><h3>操作</h3><div class="btnrow">
+    <button class="primary${gRun.cls}" id="d-run" ${gRun.attr}>▶ 执行…</button>
+    <button${gRun.cls} id="d-resume" ${gRun.attr} title="接着这个任务上一次的执行会话继续，不用从头交代上下文">▶ 继续上次会话</button>
+    <button${gRetry.cls ? ` class="${gRetry.cls.trim()}"` : ""} id="d-retry" ${gRetry.attr}>重新入队</button>
+    <button${gRelease.cls ? ` class="${gRelease.cls.trim()}"` : ""} id="d-release" ${gRelease.attr}>释放租约</button>
+    <button${gDeliver.cls ? ` class="${gDeliver.cls.trim()}"` : ""} id="d-deliver" ${gDeliver.attr}>验收（deliver）</button>
+    <button${gResend.cls ? ` class="${gResend.cls.trim()}"` : ""} id="d-resend-notify" ${gResend.attr} title="把完成通知再发一次到创建任务的前端监听端口，让原会话再收到一次续接消息">重发完成通知</button>
+    <button${gAccept.cls ? ` class="${gAccept.cls.trim()}"` : ""} id="d-accept" ${gAccept.attr} title="前端收到完成通知并自行验收成功后点这里，把任务标记为 frontend_accepted（前端已验收）终态">前端已验收</button>
+    <button${gAdvance.cls ? ` class="${gAdvance.cls.trim()}"` : ""} id="d-advance" ${gAdvance.attr} title="把中断的后续流程接起来：自动合并 / 重新推送 / 部署对齐 / 验收">恢复推进</button>
+    <button id="d-logs">执行日志</button>
+  </div>
+  <div class="hint">${canRun ? "执行会真的认领任务、起执行器子进程改代码。「继续上次会话」沿用上一轮的执行器和会话，跳过重新读仓库。" : "灰掉的按钮点一下会告诉你为什么不能用。"}「恢复推进」只接手交付后中断的任务：有 PR 继续自动合并→部署→验收，目录模式先补推送再进人工合并确认，不会伪造 merged / verified。</div></div>`);
+  const evs = (events || []).slice(-40).map(e => `
+    <div class="ev">
+      <div>${esc(e.type)} ${e.status ? `<span class="chip st-${esc(e.status)}">${esc(e.status)}</span>` : ""}</div>
+      <div class="meta">${esc(e.at || e.created_at || "")} · ${esc(e.summary || "")}</div>
+    </div>`).join("");
+  rows.push(`<div class="sec"><h3>事件时间线（最近 40 条）</h3><div class="timeline">${evs || '<span class="empty">无</span>'}</div></div>`);
+  const body = $("d-body");
+  body.innerHTML = rows.join("");
+  const bind = (id, fn) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("click", () => {
+      // 灰掉的按钮也要有反馈：点一下说清为什么不能用，别让人以为面板死了
+      const why = el.dataset.why;
+      if (why) { toast(why, true); return; }
+      fn();
+    });
+  };
+  bind("d-run", () => openRunModal(t.id));
+  bind("d-resume", () => resumeLastSession(t.id));
+  bind("d-retry", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/retry`, null, "已重新入队"));
+  bind("d-release", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/release`, {reason: "面板释放租约"}, "租约已释放"));
+  bind("d-deliver", () => postAction("/api/deliver", {task_id: t.id}, "验收已启动"));
+  bind("d-resend-notify", async () => {
+    try {
+      const r = await api(`/api/tasks/${encodeURIComponent(t.id)}/resend-notify`, {body: {}});
+      if (r.status === "sent") toast(`已重发到 ${r.target}（revision ${r.revision}，event ${r.event_id.slice(0, 12)}）`);
+      else toast(`重发未送达：${JSON.stringify(r.delivery || r.error || r)}`, true);
+    } catch (e) { toast(e.message, true); }
+    refreshTasks(); refreshDrawer(true);
+  });
+  bind("d-accept", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/accept`, {reason: "面板：前端验收通过"}, "已标记前端已验收"));
+  bind("d-advance", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/advance`, null, "恢复推进已启动（后台执行）"));
+  bind("d-logs", () => showLogs(t.id));
+  bind("d-steer", () => steer($("d-steer-text") ? $("d-steer-text").value : ""));
+  updateDrawerLive();
+}
+
+function updateDrawerLive() {
+  const box = $("d-live");
+  if (!box || !panelState || !panelState.active) return;
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.textContent = (panelState.active.logs || []).slice(-200).join("\n");
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+function renderSteerBox(active) {
+  // 输入框跟着阶段换身份：执行中=打断纠偏；已结束=续话接着派活
+  const running = !!(active && active.phase === "running");
+  const finished = !!(active && active.phase === "finished");
+  const tip = running
+    ? "要纠偏就写一句——会打断当前执行，然后带着这句话续跑同一会话（上下文不丢）"
+    : finished
+      ? "任务已结束——写一句让它接着干，会续跑同一会话接着执行（上下文不丢）"
+      : "先跑一单，之后可以在这里持续对话驱动执行";
+  const label = running ? "⏸ 打断并补一句" : "▶ 继续说一句";
+  [["steer-text", "btn-steer"], ["d-steer-text", "d-steer"]].forEach(([inputId, btnId]) => {
+    const input = $(inputId), btn = $(btnId);
+    if (input) { input.placeholder = tip; input.disabled = !active; }
+    if (btn) { btn.textContent = label; btn.disabled = !active; }
+  });
+}
+
+async function steer(text) {
+  const t = (text || "").trim();
+  if (!t) { toast("先写一句要它怎么改", true); return; }
+  // 同样不用 window.confirm：内嵌浏览器里它会静默返回 false，点了像没反应
+  try {
+    const r = await api("/api/runs/steer", {body: {text: t}});
+    toast(r.continuing ? "已发送，正在续跑同一会话接着执行…" : "已发送干预，正在中断并准备续跑…");
+    ["steer-text", "d-steer-text"].forEach(id => { const el = $(id); if (el) el.value = ""; });
+    refreshState();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function postAction(path, body, okMsg) {
+  try { await api(path, {body: body || {}}); toast(okMsg); refreshTasks(); refreshDrawer(true); }
+  catch (e) { toast(e.message, true); }
+}
+
+async function showLogs(taskId) {
+  try {
+    const data = await api(`/api/logs?task=${encodeURIComponent(taskId)}`);
+    const files = data.files || [];
+    if (!files.length) { toast("暂无执行日志", true); return; }
+    const text = files.map(f => `===== ${f.attempt}/${f.name} =====\n${f.content}`).join("\n\n");
+    const w = window.open("", "_blank");
+    if (w) { w.document.title = `日志 ${taskId}`; w.document.body.innerHTML = `<pre style="white-space:pre-wrap;word-break:break-all;font:12.5px/1.6 ui-monospace,Consolas,monospace;padding:16px">${esc(text)}</pre>`; }
+    else toast("弹窗被拦截，日志请用 API 查看", true);
+  } catch (e) { toast(e.message, true); }
+}
+
+// -- 新建任务 ---------------------------------------------------------------
+function currentProject(repoId) {
+  const list = (panelState && panelState.projects) || [];
+  return list.find(p => p.id === repoId) || null;
+}
+
+function openNewTaskModal() {
+  const projects = (panelState && panelState.projects) || [];
+  const backends = projects.filter(p => p.role === "backend");
+  if (!backends.length) { toast("没有已注册的 backend 项目", true); return; }
+  $("nt-repo").innerHTML = backends.map(p =>
+    `<option value="${esc(p.id)}">${esc(p.id)}${p.local_path ? "  ·  " + esc(p.local_path) : ""}</option>`).join("");
+  $("nt-source-repo").innerHTML = '<option value="">不指定</option>' + projects.map(p =>
+    `<option value="${esc(p.id)}">${esc(p.id)} [${esc(p.role)}]</option>`).join("");
+  const envs = (panelState && panelState.environments) || [];
+  $("nt-env").innerHTML = (envs.length ? envs : ["dev"]).map(e => `<option>${esc(e)}</option>`).join("");
+  $("nt-title").value = "";
+  $("nt-requirement").value = "";
+  $("nt-allowed").value = "**";
+  $("nt-forbidden").value = ".github/**";
+  $("nt-source-sha").value = "";
+  renderBaseRefs();
+  $("new-modal").classList.add("show");
+  $("nt-title").focus();
+}
+
+function renderBaseRefs() {
+  const proj = currentProject($("nt-repo").value);
+  const refs = (proj && proj.base_refs && proj.base_refs.length) ? proj.base_refs
+    : [proj && proj.default_branch ? proj.default_branch : "dev"];
+  $("nt-base-ref").innerHTML = refs.map(r => `<option>${esc(r)}</option>`).join("");
+}
+
+async function submitNewTask() {
+  const body = {
+    title: $("nt-title").value.trim(),
+    repo: $("nt-repo").value,
+    base_ref: $("nt-base-ref").value,
+    requirement: $("nt-requirement").value.trim(),
+    allowed_paths: $("nt-allowed").value,
+    forbidden_paths: $("nt-forbidden").value,
+    environment: $("nt-env").value,
+    source_repo: $("nt-source-repo").value,
+    source_sha: $("nt-source-sha").value.trim(),
+  };
+  if (!body.title) { toast("先写标题", true); return; }
+  if (!body.requirement) { toast("先写需求正文", true); return; }
+  const btn = $("nt-go");
+  btn.disabled = true;
+  btn.textContent = "创建中…";
+  try {
+    const data = await api("/api/tasks", { body });
+    toast(`已创建 ${data.id}`);
+    $("new-modal").classList.remove("show");
+    await refreshTasks(true);   // 新建后回第一页，最新任务就在最上面
+    openDrawer(data.id);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "创建";
+  }
+}
+
+// -- 执行对话框 ---------------------------------------------------------------
+async function openRunModal(taskId) {
+  runModalTask = taskId;
+  runModal = { executor: ((panelState && panelState.auto) || {}).executor || "zcode", session: null, sessions: [] };
+  $("rm-task").textContent = taskId;
+  renderExecutorCards();
+  const autoCfg = (panelState && panelState.auto) || {};
+  $("rm-automerge").checked = autoCfg.auto_merge !== false;
+  $("rm-waitdeploy").checked = autoCfg.wait_deployment !== false;
+  $("rm-perm").value = "";
+  $("rm-sandbox").value = autoCfg.codex_sandbox || "";
+  $("rm-sandbox-hint").textContent =
+    "read-only 不能改文件（审查用）；danger-full-access 完全放开沙箱，只在受信任任务上用。执行过程中可在顶部横幅随时改。";
+  // 项目目录：默认隔离 worktree
+  $("rm-workdir-mode").value = "";
+  $("rm-workdir-path").style.display = "none";
+  $("rm-workdir-custom").style.display = "none";
+  $("rm-workdir-custom").value = "";
+  $("rm-workdir-hint").textContent = "";
+  $("rm-autocommit").checked = false;
+  $("rm-autocommit-label").style.display = "none";
+  resetRunConfirm();
+  const brief = tasks.find(x => x.id === taskId) || {};
+  const detailRepo = (selectedTask && selectedTask.task && selectedTask.task.target || {}).repo;
+  fillWorkdirOptions(brief.repo || detailRepo);
+  // 先弹窗再加载会话：本地会话列表要扫磁盘，慢的时候别让人以为按钮没反应
+  $("run-modal").classList.add("show");
+  await loadSessions();
+}
+
+function fillWorkdirOptions(repoId) {
+  const proj = currentProject(repoId);
+  const sel = $("rm-workdir-path");
+  if (proj && proj.local_path) {
+    sel.innerHTML = `<option value="${esc(proj.local_path)}">${esc(proj.id)} — ${esc(proj.local_path)}</option>`;
+  } else {
+    sel.innerHTML = `<option value="">（该项目未配置本地目录，用自定义路径）</option>`;
+  }
+}
+
+function syncWorkdirUi() {
+  const mode = $("rm-workdir-mode").value;
+  $("rm-workdir-path").style.display = mode === "local" ? "" : "none";
+  $("rm-workdir-custom").style.display = mode === "custom" ? "" : "none";
+  $("rm-autocommit-label").style.display = mode ? "" : "none";
+  const autoCommit = !!mode && $("rm-autocommit").checked;
+  $("rm-workdir-hint").textContent = mode
+    ? (autoCommit
+        ? "agent 会直接在这个目录改代码：不建分支；执行完自动 commit（提交信息由 AI 写）并 push 到当前分支。改动真的落在你的工作区并推到远端。"
+        : "agent 会直接在这个目录改代码：不建分支、不提交、不推送、不建 PR。改动真的落在你的工作区。")
+    : "";
+  resetRunConfirm();
+}
+
+function pickedWorkdir() {
+  const mode = $("rm-workdir-mode").value;
+  if (mode === "local") return $("rm-workdir-path").value || "";
+  if (mode === "custom") return $("rm-workdir-custom").value.trim();
+  return "";
+}
+
+function fillExecutorOptions() {
+  const all = (panelState && panelState.executor_options) || {};
+  const opts = all[runModal.executor] || {};
+  const models = opts.models || [];
+  const efforts = opts.efforts || [];
+  $("rm-model-list").innerHTML = models.map(m => `<option value="${esc(m)}"></option>`).join("");
+  $("rm-model").value = "";
+  $("rm-model").placeholder = opts.default_model
+    ? `跟随配置（${opts.default_model}）`
+    : "留空 = 跟随配置";
+  $("rm-effort").innerHTML =
+    `<option value="">跟随配置${opts.default_effort ? "（" + esc(opts.default_effort) + "）" : ""}</option>` +
+    efforts.map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join("");
+  const base = runModal.executor === "codex"
+    ? "codex 的思考程度走 -c model_reasoning_effort；留空则用 ~/.codex/config.toml 的设置。"
+    : "zcode 用 --model / --effort 透传；留空则用 config/zcode.yaml 的设置。";
+  $("rm-model-hint").textContent = base + (runModal.executor === "zcode"
+    ? " ⚠ 这台机器上 zcode 的 Bash 工具对任何有输出的命令都返回 Exit code 1（命令其实执行了，输出被吞），需要跑命令验证的任务请用 Codex。"
+    : "");
+}
+
+function renderExecutorCards() {
+  const ex = (panelState && panelState.executors) || {};
+  $("rm-executors").innerHTML = ["zcode", "codex"].map(name => {
+    const info = ex[name] || {};
+    return `<div class="radio-card ${runModal.executor === name ? "sel" : ""}" data-ex="${name}">
+      <div class="nm">${name === "zcode" ? "ZCode" : "Codex"}</div>
+      <div class="ver">${info.ok ? esc(info.version || "可用") : "⚠ 不可用"}</div>
+    </div>`;
+  }).join("");
+  $("rm-executors").querySelectorAll(".radio-card").forEach(card =>
+    card.addEventListener("click", async () => {
+      runModal.executor = card.dataset.ex;
+      runModal.session = null;
+      renderExecutorCards();
+      await loadSessions();
+    }));
+  $("rm-perm-row").style.display = runModal.executor === "zcode" ? "" : "none";
+  $("rm-sandbox-row").style.display = runModal.executor === "codex" ? "" : "none";
+  fillExecutorOptions();
+}
+
+async function loadSessions() {
+  const box = $("rm-sessions");
+  box.innerHTML = `<div class="empty" style="padding:14px">加载中…</div>`;
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(runModalTask)}/sessions?executor=${runModal.executor}`);
+    runModal.sessions = data.sessions || [];
+    const items = [];
+    items.push(`<div class="sess ${runModal.session === null ? "sel" : ""}" data-sid="">
+      <span class="tt">🆕 新会话（${runModal.executor === "zcode" ? "预生成确定性 session id" : "codex exec"}）</span></div>`);
+    for (const s of runModal.sessions.slice(0, 8)) {
+      items.push(`<div class="sess ${runModal.session === s.id ? "sel" : ""}" data-sid="${esc(s.id)}" title="${esc(s.cwd || "")}">
+        <span class="id">${esc(s.id.slice(0, 18))}</span>
+        <span class="tt">${esc(s.title || "(无标题)")}</span>
+        ${s.source === "task" ? '<span class="tag task">本任务</span>' : ""}
+        <span class="tm">${esc((s.updated_at || "").replace("T", " ").slice(0, 16) || "")}</span>
+      </div>`);
+    }
+    items.push(`<div class="sess" id="rm-more"><span class="tt" style="color:var(--accent2)">更多会话…（全局 ${runModal.executor} 会话列表）</span></div>`);
+    box.innerHTML = items.join("");
+    box.querySelectorAll(".sess[data-sid]").forEach(el => el.addEventListener("click", () => {
+      runModal.session = el.dataset.sid || null;
+      box.querySelectorAll(".sess").forEach(x => x.classList.remove("sel"));
+      el.classList.add("sel");
+    }));
+    const more = $("rm-more");
+    if (more) more.addEventListener("click", () => openSessionPicker());
+  } catch (e) { box.innerHTML = `<div class="empty" style="padding:14px">加载失败：${esc(e.message)}</div>`; }
+}
+
+function openSessionPicker() {
+  $("sess-modal").classList.add("show");
+  $("sm-executor").textContent = runModal.executor;
+  $("sm-search").value = "";
+  renderSessionPicker("");
+  $("sm-search").oninput = () => renderSessionPicker($("sm-search").value);
+}
+
+async function renderSessionPicker(q) {
+  const list = $("sm-list");
+  list.innerHTML = `<div class="empty" style="padding:14px">加载中…</div>`;
+  try {
+    const data = await api(`/api/sessions/${runModal.executor}?limit=100`);
+    const all = data.sessions || [];
+    const qs = (q || "").toLowerCase();
+    const filtered = all.filter(s => !qs || (s.id + " " + s.title + " " + (s.cwd || "")).toLowerCase().includes(qs));
+    if (!filtered.length) { list.innerHTML = `<div class="empty" style="padding:14px">没有匹配的会话</div>`; return; }
+    list.innerHTML = filtered.map(s => `
+      <div class="sess ${runModal.session === s.id ? "sel" : ""}" data-sid="${esc(s.id)}">
+        <span class="id">${esc(s.id.slice(0, 22))}</span>
+        <span class="tt" title="${esc(s.cwd || "")}">${esc(s.title || "(无标题)")} <span style="color:var(--muted)">${esc((s.cwd || "").split(/[\\/]/).slice(-3).join("/"))}</span></span>
+        ${s.source === "task" ? '<span class="tag task">本任务</span>' : ""}
+        <span class="tm">${esc((s.updated_at || "").replace("T", " ").slice(5, 16))}</span>
+      </div>`).join("");
+    list.querySelectorAll(".sess").forEach(el => el.addEventListener("click", () => {
+      runModal.session = el.dataset.sid;
+      $("sess-modal").classList.remove("show");
+      // 同步回执行对话框的列表选中态
+      const box = $("rm-sessions");
+      if (!runModal.sessions.some(s => s.id === runModal.session)) {
+        runModal.sessions.unshift({id: runModal.session, title: "（从全局列表选择）", updated_at: "", source: "global"});
+      }
+      loadSessions();
+    }));
+  } catch (e) { list.innerHTML = `<div class="empty" style="padding:14px">加载失败：${esc(e.message)}</div>`; }
+}
+
+let confirmWorkdir = null;   // 直接目录的二次点击确认
+
+function resetRunConfirm() {
+  confirmWorkdir = null;
+  const warn = $("rm-workdir-warn");
+  if (warn) { warn.style.display = "none"; warn.textContent = ""; }
+  const btn = $("rm-go");
+  if (btn) btn.textContent = "开始执行";
+}
+
+async function submitRun() {
+  const workDir = pickedWorkdir();
+  const autoCommit = workDir ? $("rm-autocommit").checked : false;
+  // 不用 window.confirm：内嵌浏览器里它可能静默返回 false，表现就是"点了没反应"
+  if (workDir && confirmWorkdir !== workDir) {
+    confirmWorkdir = workDir;
+    const warn = $("rm-workdir-warn");
+    warn.textContent = autoCommit
+      ? `⚠ 再点一次「确认执行」：agent 会直接改 ${workDir}，执行完自动 commit 并 push 到当前分支（提交信息由 AI 写），改动真的落在你的工作区并推到远端。`
+      : `⚠ 再点一次「确认执行」：agent 会直接改 ${workDir}，不建分支、不提交、不推送，改动真的落在你的工作区。`;
+    warn.style.display = "";
+    $("rm-go").textContent = "⚠ 确认执行";
+    return;
+  }
+  const sandbox = runModal.executor === "codex" ? ($("rm-sandbox").value || null) : null;
+  const body = {
+    executor: runModal.executor,
+    resume_session_id: runModal.session || null,
+    permission_mode: $("rm-perm").value || null,
+    codex_sandbox: sandbox,
+    auto_merge: $("rm-automerge").checked,
+    wait_deployment: $("rm-waitdeploy").checked,
+    auto_commit: autoCommit,
+    work_dir: workDir || null,
+    model: $("rm-model").value.trim() || null,
+    effort: $("rm-effort").value || null,
+  };
+  $("rm-go").disabled = true;
+  $("rm-go").textContent = "启动中…";
+  try {
+    await api(`/api/tasks/${encodeURIComponent(runModalTask)}/run`, {body});
+    toast(`已开始执行（${body.executor}${body.model ? " · " + body.model : ""}${body.effort ? " · " + body.effort : ""}${sandbox ? " · " + sandbox : ""}${body.resume_session_id ? " · 接续会话" : ""}${workDir ? " · 项目目录" : ""}）`);
+    $("run-modal").classList.remove("show");
+    resetRunConfirm();
+    refreshState(); refreshTasks();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    $("rm-go").disabled = false;
+    if (confirmWorkdir) $("rm-go").textContent = "⚠ 确认执行";
+    else $("rm-go").textContent = "开始执行";
+  }
+}
+
+// -- 模式与配置 ---------------------------------------------------------------
+async function setMode(mode) {
+  try { panelState = await api("/api/mode", {body: {mode}}); renderState(); toast(mode === "auto" ? "已切到全自动模式" : "已切到手动模式"); }
+  catch (e) { toast(e.message, true); }
+}
+
+function fillAutoModelOptions() {
+  const all = (panelState && panelState.executor_options) || {};
+  const opts = all[$("am-executor").value] || {};
+  const models = opts.models || [];
+  const efforts = opts.efforts || [];
+  $("am-model-list").innerHTML = models.map(m => `<option value="${esc(m)}"></option>`).join("");
+  $("am-model").placeholder = opts.default_model
+    ? `跟随配置（${opts.default_model}）`
+    : "留空 = 跟随配置";
+  $("am-effort").innerHTML =
+    `<option value="">跟随配置${opts.default_effort ? "（" + esc(opts.default_effort) + "）" : ""}</option>` +
+    efforts.map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join("");
+  $("am-model-hint").textContent = $("am-executor").value === "codex"
+    ? "codex 的思考程度走 -c model_reasoning_effort；留空用 ~/.codex/config.toml 的设置。"
+    : "zcode 用 --model / --effort 透传；留空用 config/zcode.yaml 的设置。";
+}
+
+function openAutoModal() {
+  const a = (panelState && panelState.auto) || {};
+  $("am-executor").value = a.executor || "zcode";
+  fillAutoModelOptions();
+  $("am-model").value = a.model || "";
+  $("am-effort").value = a.effort || "";
+  $("am-strategy").value = a.session_strategy || "new";
+  $("am-perm").value = a.permission_mode || "";
+  $("am-sandbox").value = a.codex_sandbox || "";
+  $("am-automerge").checked = a.auto_merge !== false;
+  $("am-waitdeploy").checked = a.wait_deployment !== false;
+  $("am-workdir").value = a.work_dir || "";
+  $("am-autocommit").checked = a.auto_commit === true;
+  $("auto-modal").classList.add("show");
+}
+
+async function saveAutoCfg() {
+  try {
+    panelState = await api("/api/mode", {body: {mode: (panelState && panelState.mode) || "manual", auto: {
+      executor: $("am-executor").value,
+      model: $("am-model").value.trim() || null,
+      effort: $("am-effort").value || null,
+      session_strategy: $("am-strategy").value,
+      permission_mode: $("am-perm").value || null,
+      codex_sandbox: $("am-sandbox").value || null,
+      auto_merge: $("am-automerge").checked,
+      wait_deployment: $("am-waitdeploy").checked,
+      work_dir: $("am-workdir").value.trim() || null,
+      auto_commit: $("am-autocommit").checked,
+    }}});
+    renderState();
+    $("auto-modal").classList.remove("show");
+    toast("自动配置已保存");
+  } catch (e) { toast(e.message, true); }
+}
+
+// -- 事件绑定 ---------------------------------------------------------------
+$("mode-switch").querySelectorAll("button").forEach(b =>
+  b.addEventListener("click", () => setMode(b.dataset.mode)));
+$("btn-auto-cfg").addEventListener("click", openAutoModal);
+$("am-save").addEventListener("click", saveAutoCfg);
+$("am-close").addEventListener("click", () => $("auto-modal").classList.remove("show"));
+$("btn-cancel").addEventListener("click", async () => {
+  try { await api("/api/runs/cancel", {body: {}}); toast("已请求取消"); } catch (e) { toast(e.message, true); }
+});
+$("btn-steer").addEventListener("click", () => steer($("steer-text").value));
+$("steer-text").addEventListener("keydown", e => { if (e.key === "Enter") steer($("steer-text").value); });
+$("btn-sandbox-save").addEventListener("click", () => applySandbox(false));
+$("btn-sandbox-now").addEventListener("click", () => applySandbox(true));
+$("live-sandbox").addEventListener("change", () => {
+  $("live-sandbox").dataset.pending = "1";
+  renderLiveSecurity((panelState && panelState.active) || null);
+});
+$("btn-live-scroll").addEventListener("click", () => {
+  followLog = !followLog;
+  $("btn-live-scroll").classList.toggle("primary", followLog);
+  $("btn-live-scroll").textContent = followLog ? "跟随最新" : "已暂停跟随";
+  if (followLog) { const box = $("run-log"); if (box) box.scrollTop = box.scrollHeight; }
+});
+$("rm-cancel").addEventListener("click", () => $("run-modal").classList.remove("show"));
+$("rm-go").addEventListener("click", submitRun);
+$("sm-close").addEventListener("click", () => $("sess-modal").classList.remove("show"));
+$("d-close").addEventListener("click", closeDrawer);
+$("drawer-overlay").addEventListener("click", closeDrawer);
+let resumeArm = null;   // 「继续上次会话」的二次确认态
+
+async function resumeLastSession(taskId) {
+  if (resumeArm && resumeArm.taskId === taskId) {
+    const arm = resumeArm;
+    resumeArm = null;
+    const btn = $("d-resume");
+    if (btn) { btn.disabled = true; btn.textContent = "启动中…"; }
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}/run`, {
+        body: { executor: arm.executor, resume_session_id: arm.sid },
+      });
+      toast(`接着 ${arm.label}（${arm.executor}）继续执行`);
+      closeDrawer();
+      refreshState(); refreshTasks();
+    } catch (e) {
+      toast(e.message, true);
+      if (btn) { btn.disabled = false; btn.textContent = "▶ 继续上次会话"; }
+    }
+    return;
+  }
+  try {
+    const ex = ((panelState && panelState.auto) || {}).executor || "codex";
+    const d = await api(`/api/sessions/${ex}?task=${encodeURIComponent(taskId)}`);
+    const first = (d.sessions || []).find(s => s.task_id === taskId) || (d.sessions || [])[0];
+    if (!first) {
+      toast("这个任务还没有可续跑的历史会话，用「执行…」开一个", true);
+      return;
+    }
+    resumeArm = { taskId, sid: first.id, executor: first.executor, label: first.title || first.id };
+    const btn = $("d-resume");
+    if (btn) btn.textContent = `⚠ 确认继续 ${resumeArm.label}`;
+    toast(`再点一次确认：接着 ${resumeArm.label}（${first.executor}）继续跑，会沿用上轮上下文`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function syncTasks() {
+  const btn = $("btn-sync");
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "拉取中…";
+  try {
+    const d = await api("/api/sync", { body: {} });
+    toast(d.added ? `拉到 ${d.added} 个新任务（共 ${d.total} 个）` : `已是最新（共 ${d.total} 个任务）`);
+    await refreshTasks();
+    if (selectedTask && selectedTask.id) refreshDrawer(false);
+  } catch (e) {
+    toast(`拉取失败：${e.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+$("am-executor").addEventListener("change", () => {
+  fillAutoModelOptions();
+  $("am-model").value = "";
+  $("am-effort").value = "";
+});
+$("status-filter").addEventListener("change", () => refreshTasks(true));
+$("page-prev").addEventListener("click", () => gotoPage(-1));
+$("page-next").addEventListener("click", () => gotoPage(1));
+$("page-size").addEventListener("change", e => {
+  taskPageSize = parseInt(e.target.value, 10) || 20;
+  refreshTasks(true);
+});
+$("btn-sync").addEventListener("click", syncTasks);
+$("btn-new-task").addEventListener("click", openNewTaskModal);
+$("nt-cancel").addEventListener("click", () => $("new-modal").classList.remove("show"));
+$("nt-go").addEventListener("click", submitNewTask);
+$("nt-repo").addEventListener("change", renderBaseRefs);
+$("rm-workdir-mode").addEventListener("change", syncWorkdirUi);
+$("rm-autocommit").addEventListener("change", syncWorkdirUi);
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+function closeDrawer() {
+  selectedTask = null;
+  $("drawer").classList.remove("show");
+  $("drawer-overlay").classList.remove("show");
+}
+
+// -- 启动 -------------------------------------------------------------------
+$("btn-live-scroll").classList.add("primary");
+refreshState(); refreshTasks();
+// 执行中看得更勤；空闲时降频，减少无意义的轮询
+setInterval(() => {
+  const busy = panelState && panelState.active && panelState.active.phase === "running";
+  refreshState();
+  if (busy) refreshTasks();
+}, 1500);
+setInterval(refreshTasks, 4000);
+</script>
+</body>
+</html>

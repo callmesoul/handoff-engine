@@ -1,0 +1,18 @@
+# 为什么是 10 分钟而不是 60 秒：这里等的是人写代码，不是等任务事件。
+# 核心代码一天改几次，高频轮询只会徒增 fetch。
+#
+# 为什么不用 cron：cron 不关心上次跑完没有。合并 + pip install + 重启可能超过
+# 10 分钟，叠起来会两个进程抢同一把锁（脚本会用 O_EXCL 挡住，但白跑一趟）。
+
+[Unit]
+Description=Check for core code changes every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+Unit=handoff-selfupdate.service
+
+[Install]
+WantedBy=timers.target

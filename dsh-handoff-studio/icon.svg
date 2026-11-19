@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Handoff Studio">
+  <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <!-- a work surface: the task board -->
+    <rect x="2.6" y="3.6" width="18.8" height="16.8" rx="2.6" />
+    <!-- pass-forward arrow: a task moving from one worker to the next -->
+    <path d="M6.4 9.2h5.1" />
+    <path d="M9.6 6.6l2.7 2.6-2.7 2.6" />
+    <!-- the receiving worker's output line -->
+    <path d="M6.4 15.4h8.2" />
+    <path d="M17.2 13.2v6.2" />
+  </g>
+</svg>

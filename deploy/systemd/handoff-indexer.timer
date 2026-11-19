@@ -1,0 +1,11 @@
+[Unit]
+Description=Run handoff admin indexer every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=handoff-indexer.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,91 @@
+# 部署模板（GitHub Actions）。按 SHA 部署，按环境加锁，部署后自证版本。
+#
+# 三条硬要求，缺一条这套验收就不成立：
+#   1. 部署输入是完整 commit SHA，不是分支名
+#   2. 同一环境只跑一个部署，且不取消正在运行的部署
+#   3. /version 返回当前运行的完整 SHA
+#
+# 把 TODO 换成你实际的构建/部署命令即可。
+
+name: deploy-dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "要部署的完整 SHA（留空用当前提交）"
+        required: false
+        type: string
+
+# 环境级互斥：多人五分钟内先后合并，第二个排队而不是并发覆盖
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Resolve full SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build (tag by SHA, never by branch)
+        run: |
+          # TODO: 换成真实构建，产物必须带上 ${{ steps.sha.outputs.value }}
+          docker build -t "$REGISTRY/$IMAGE:${{ steps.sha.outputs.value }}" .
+        env:
+          REGISTRY: ghcr.io
+          IMAGE: ${{ github.repository }}
+
+      - name: Migrate (before deploy, optional)
+        if: ${{ false }} # 需要迁移时改成 true，并在 environment 上配人工批准
+        run: |
+          # TODO: 只跑任务单里声明过、已审核的迁移脚本
+          echo "migrate for ${{ steps.sha.outputs.value }}"
+
+      - name: Push image
+        run: |
+          # TODO: docker push "$REGISTRY/$IMAGE:${{ steps.sha.outputs.value }}"
+          echo "push"
+
+      - name: Deploy exact SHA
+        run: |
+          # TODO: 用固定 tag 部署，禁止部署时再从分支取代码
+          echo "deploy ${{ steps.sha.outputs.value }}"
+
+      - name: Wait for /version to match
+        env:
+          DEV_URL: https://dev-api.example.com
+        run: |
+          target="${{ steps.sha.outputs.value }}"
+          for i in $(seq 1 90); do
+            got=$(curl -fsS "$DEV_URL/version" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])' || true)
+            if [ "$got" = "$target" ]; then
+              echo "deployed $target"
+              exit 0
+            fi
+            echo "waiting: want $target got ${got:-none}"
+            sleep 10
+          done
+          echo "deployment did not reach $target in time" >&2
+          exit 1
+
+# /version 的最小实现（任何语言）：
+#   GET /version -> 200
+#   {"sha": "<构建时注入的完整 SHA>", "build_id": "...", "built_at": "...", "environment": "dev"}
+#
+# 不要在请求时执行 `git rev-parse`：容器里通常没有 .git，而且那样拿到的是
+# 「构建时的分支」而不是「这次部署的产物」。

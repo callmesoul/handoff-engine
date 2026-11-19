@@ -1,0 +1,72 @@
+{
+  "title": "订单接口返回增加 status 字段",
+  "source": {
+    "role": "frontend",
+    "repo": "org/web",
+    "commit_sha": "0000000000000000000000000000000000000000"
+  },
+  "target": {
+    "role": "backend",
+    "repo": "org/api",
+    "base_ref": "dev"
+  },
+  "requirement": "GET /api/orders 的响应 body 增加 status 字段。\n\n- 类型：string\n- 取值：OPEN | PAID | CANCELLED\n- 历史订单按 created_at 与 paid_at 推导，不回填数据库\n- 分页接口与单条接口必须一致\n- 未支付且已取消的订单返回 CANCELLED\n\n边界：status 缺失时前端按 OPEN 处理，但后端不得返回 null。",
+  "scope": {
+    "out_of_scope": [
+      "不改鉴权与租户隔离",
+      "不改订单金额与优惠计算",
+      "不新增数据库列（先按现有字段推导）"
+    ],
+    "allowed_paths": [
+      "src/orders/**",
+      "tests/orders/**"
+    ],
+    "forbidden_paths": [
+      ".github/**",
+      "infra/prod/**",
+      "**/migrations/**",
+      "**/auth/**"
+    ]
+  },
+  "acceptance": {
+    "environment": "dev",
+    "checks": [
+      {
+        "id": "version",
+        "type": "http",
+        "method": "GET",
+        "url": "{base_url}/version",
+        "expect_status": 200,
+        "expect_jsonpath": [
+          { "path": "$.sha", "matches": "^[0-9a-f]{40}$" }
+        ]
+      },
+      {
+        "id": "orders-status",
+        "type": "http",
+        "method": "GET",
+        "url": "{base_url}/api/orders?page=1",
+        "headers": { "Accept": "application/json" },
+        "expect_status": 200,
+        "expect_jsonpath": [
+          { "path": "$.items[0].status", "matches": "^(OPEN|PAID|CANCELLED)$" }
+        ]
+      },
+      {
+        "id": "contract",
+        "type": "openapi_diff",
+        "expected_path": "contracts/<id>/openapi.yaml",
+        "actual_url": "{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}",
+        "allow_additions": true
+      }
+    ]
+  },
+  "migration": {
+    "required": false,
+    "backward_compatible": true,
+    "plan": "",
+    "rollback": "",
+    "manual_approval_required": false,
+    "order": "manual"
+  }
+}
