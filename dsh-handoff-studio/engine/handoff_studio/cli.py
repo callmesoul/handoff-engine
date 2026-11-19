@@ -3,7 +3,7 @@
 用法（Windows）：
 
     D:\\handoff\\app\\.venv-win\\Scripts\\python.exe -m handoff_studio ^
-        --root D:\\handoff\\store-github --port 8791
+        --root ~/code/handoff-store --port 8791
 
 插件会以这个命令拉起它；手工调试也用它。端口默认 8791：8790 是原面板、
 8789 是 frontend-listener、8788 是唤醒监听，都不占。

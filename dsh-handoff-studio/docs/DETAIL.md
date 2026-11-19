@@ -62,8 +62,8 @@ Handoff Studio 把执行器接到 DSH 的模型目录上：你在面板顶部选
 - id: handoff-studio
   config:
     enginePort: 8791
-    pythonPath: 'D:\handoff\app\.venv-win\Scripts\python.exe'
-    engineRoot: 'D:\handoff\store-github'
+    pythonPath: 'C:\Users\you\code\handoff-engine\.venv-win\Scripts\python.exe'
+    engineRoot: 'C:\Users\you\code\handoff-store'
     runTimeoutMs: 3600000
 ```
 

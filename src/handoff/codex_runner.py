@@ -731,7 +731,7 @@ def _short_path(text: str) -> str:
     """把 worktree 绝对路径压成相对路径。
 
     面板上关心的是"改了哪个文件"，不是
-    `D:\\handoff\\store-github\\.handoff-run\\worktrees\\ho-xxx\\attempt-5\\` 这串前缀。
+    `C:\\handoff-store\\.handoff-run\\worktrees\\ho-xxx\\attempt-5\\` 这串前缀。
     """
     out = _WORKTREE_PREFIX.sub("", str(text or ""))
     out = out.replace("\\", "/")

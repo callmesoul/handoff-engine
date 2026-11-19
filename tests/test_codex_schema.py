@@ -1,10 +1,11 @@
 """检查实际发送给 Codex 的结构化 schema 满足严格模式。"""
 import json
-from pathlib import Path
+
+from handoff.schema import default_schema_dir
 
 
 def test_all_object_properties_are_required():
-    schema = json.loads((Path(__file__).resolve().parents[1] / "schemas/codex-result.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((default_schema_dir() / "codex-result.schema.json").read_text(encoding="utf-8"))
 
     def visit(node):
         if isinstance(node, dict):

@@ -94,27 +94,3 @@ def test_codex_update_dir_falls_back_to_newest_bin(tmp_path, monkeypatch):
 
     # 写死的路径真实存在时优先用它，不去猜
     assert executil.resolve(str(old / "codex.exe")) == str(old / "codex.exe")
-
-def test_codex_update_dir_falls_back_to_newest_bin(tmp_path, monkeypatch):
-    """codex 自更新会换 bin/<hash>/ 目录：写死的老路径必须能自动落到最新版。"""
-    import os
-
-    base = tmp_path / "OpenAI" / "Codex" / "bin"
-    old = base / "aaaaaaaaaaaaaaaa"
-    new = base / "bbbbbbbbbbbbbbbb"
-    old.mkdir(parents=True)
-    new.mkdir(parents=True)
-    (old / "codex.exe").write_text("old", encoding="utf-8")
-    (new / "codex.exe").write_text("new", encoding="utf-8")
-    os.utime(old / "codex.exe", (1_700_000_000, 1_700_000_000))
-    os.utime(new / "codex.exe", (1_800_000_000, 1_800_000_000))
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    monkeypatch.delenv("HANDOFF_CODEX", raising=False)
-    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None)
-
-    # 配置里写死的旧目录已被升级换掉 → 自动落到 bin/* 里最新的那个
-    resolved = executil.resolve(str(base / "gone" / "codex.exe"), env_var="HANDOFF_CODEX")
-    assert Path(resolved) == new / "codex.exe"
-
-    # 写死的路径真实存在时优先用它，不去猜
-    assert executil.resolve(str(old / "codex.exe")) == str(old / "codex.exe")

@@ -82,9 +82,9 @@ PR、验收依旧是 `handoff` 原来那条链路，所以 studio 跑出来的�
     # 引擎端口；默认 8791（8790 = 原面板，8789 = frontend-listener）
     enginePort: 8791
     # 拉引擎用的 Python；默认 HANDOFF_STUDIO_PYTHON 或 "python"
-    pythonPath: 'D:\handoff\app\.venv-win\Scripts\python.exe'
-    # 交接仓根目录；默认 HANDOFF_ROOT
-    engineRoot: 'D:\handoff\store-github'
+    pythonPath: 'C:\Users\you\code\handoff-engine\.venv-win\Scripts\python.exe'
+    # 私有交接仓根目录；默认 HANDOFF_ROOT
+    engineRoot: 'C:\Users\you\code\handoff-store'
     # 执行型 Agent 绑定的 preset；默认 standard（有 shell / 写文件能力）
     agentPreset: standard
     # 引擎包所在目录；默认本插件包内的 engine/
@@ -115,7 +115,7 @@ shell 与文件写入能力。
 ## 安装
 
 ```powershell
-dsh plugin --profile desktop add D:\handoff\store-github\dsh-handoff-studio
+dsh plugin --profile desktop add C:\Users\you\code\handoff-engine\dsh-handoff-studio
 ```
 
 装完重启 DSH：`dsh.client` 清单在入口 boot 时才读。
@@ -124,15 +124,14 @@ dsh plugin --profile desktop add D:\handoff\store-github\dsh-handoff-studio
 
 ```powershell
 # 宿主半（假 Cordis 上下文，不起 DSH）
-cd D:\handoff\store-github\dsh-handoff-studio
+Set-Location C:\Users\you\code\handoff-engine\dsh-handoff-studio
 node --test test/host.test.js
 
-# 引擎侧
-$env:PYTHONPATH = 'D:\handoff\app\src'
-python -m pytest dsh-handoff-studio/test -q
+# 引擎侧（handoff-engine 已安装进当前 Python）
+python -m pytest test -q
 
 # 手工起引擎
-$env:PYTHONPATH = 'D:\handoff\app\src;D:\handoff\store-github\dsh-handoff-studio\engine'
-python -m handoff_studio --root D:\handoff\store-github --once   # 自检
-python -m handoff_studio --root D:\handoff\store-github          # 起服务
+$env:PYTHONPATH = 'C:\Users\you\code\handoff-engine\dsh-handoff-studio\engine'
+python -m handoff_studio --root C:\Users\you\code\handoff-store --once
+python -m handoff_studio --root C:\Users\you\code\handoff-store
 ```

@@ -883,7 +883,10 @@ class _Heartbeat:
         self.worker = worker
         self.task_id = task_id
         self.attempt = attempt
-        self.cancel = threading.Event()
+        # Reuse the caller's event when present so a panel cancel reaches the
+        # executor immediately; a polling bridge can otherwise lose a race with
+        # a process that finishes between the request and the next poll.
+        self.cancel = worker.external_cancel if worker.external_cancel is not None else threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_renew = 0.0

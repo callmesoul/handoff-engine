@@ -54,6 +54,27 @@ def _versioned_candidates(name: str) -> list[Path]:
     return found
 
 
+def _nearby_versioned_candidates(path: Path) -> list[Path]:
+    """Find replacements next to a stale ``bin/<version>/<name>`` path."""
+    bin_root = path.parent.parent
+    if bin_root.name.lower() != "bin":
+        return []
+    found: list[Path] = []
+    try:
+        children = list(bin_root.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        candidate = child / path.name
+        try:
+            if candidate.is_file():
+                found.append(candidate)
+        except OSError:
+            continue
+    found.sort(key=lambda candidate: candidate.stat().st_mtime, reverse=True)
+    return found
+
+
 def _candidates(name: str) -> list[Path]:
     out: list[Path] = []
     for directory in _EXTRA_DIRS:
@@ -85,6 +106,11 @@ def resolve(name: str, *, env_var: str | None = None) -> str | None:
         path = Path(name)
         if path.is_file():
             return str(path)
+        # Self-updating CLIs commonly replace the version/hash directory. Prefer
+        # the newest sibling before falling back to an unrelated global binary.
+        nearby = _nearby_versioned_candidates(path)
+        if nearby:
+            return str(nearby[0])
         name = path.stem
     found = shutil.which(name)
     if found:

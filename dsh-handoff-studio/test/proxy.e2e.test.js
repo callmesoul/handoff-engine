@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -22,13 +22,14 @@ import { apply, ROUTE } from "../lib/index.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENGINE_DIR = join(HERE, "..", "engine");
-const PYTHON = process.env.HANDOFF_STUDIO_TEST_PYTHON || "D:\\handoff\\app\\.venv-win\\Scripts\\python.exe";
-const PYTHONPATH = process.env.HANDOFF_STUDIO_TEST_PYTHONPATH || "D:\\handoff\\app\\src";
-const STORE_ROOT = process.env.HANDOFF_STUDIO_TEST_ROOT || "D:\\handoff\\store-github";
+const PYTHON = process.env.HANDOFF_STUDIO_TEST_PYTHON || "python";
+const PYTHONPATH = process.env.HANDOFF_STUDIO_TEST_PYTHONPATH || "";
+const STORE_ROOT =
+  process.env.HANDOFF_STUDIO_TEST_ROOT || process.env.HANDOFF_ROOT || join(homedir(), "code", "handoff-store");
 
 /** True when the chosen interpreter can import the handoff package. */
 function pythonReady() {
-  if (!existsSync(PYTHON)) return false;
+  if ((PYTHON.includes("/") || PYTHON.includes("\\")) && !existsSync(PYTHON)) return false;
   const probe = spawnSync(PYTHON, ["-c", "import handoff, jsonschema"], {
     env: { ...process.env, PYTHONPATH },
     encoding: "utf8",

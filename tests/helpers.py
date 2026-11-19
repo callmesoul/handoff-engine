@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -86,7 +85,6 @@ def write_config(
 ) -> None:
     config_dir = root / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(REPO_ROOT / "schemas", root / "schemas", dirs_exist_ok=True)
 
     (config_dir / "repositories.yaml").write_text(
         yaml.safe_dump(
