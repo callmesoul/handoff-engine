@@ -257,3 +257,219 @@ test("the sidebar icon renders as svg", () => {
   assert.ok(html.startsWith("<svg"));
   assert.ok(html.includes('width="16"'));
 });
+
+/**
+ * 把 client.js 里的 CSS 数组还原成一整段 CSS 文本。
+ *
+ * 样式是以「字符串数组 + join」的形式写的，一条规则会横跨好几个数组元素，
+ * 所以按行匹配会漏。这里取出 `var CSS = [...] .join("")` 区间，去掉字符串定界符
+ * 和换行，拼回可用正则匹配的单段文本。
+ */
+function cssText() {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  const start = source.indexOf("var CSS = [");
+  assert.ok(start >= 0, "CSS array must exist");
+  const end = source.indexOf("].join(", start);
+  assert.ok(end > start, "CSS array must be joined");
+  const body = source.slice(start + "var CSS = [".length, end);
+  return body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('"'))
+    .map((line) => line.replace(/^"/, "").replace(/",?$/, ""))
+    .join("")
+    .replace(/\s+/g, " ");
+}
+
+/** 取出匹配 selector 的那条完整规则（含声明块）。 */
+function cssRule(css, selector) {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`(?:^|[},])\\s*${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+  assert.ok(match, `rule ${selector} must exist`);
+  return match[1];
+}
+
+/**
+ * 主题无关性回归。
+ *
+ * 深色主题下 `--dsw-alias-brand-primary` 是近白色、浅色主题下是近黑色。任何把
+ * 文字色写死成 #fff 的「品牌色底」按钮，都会在深色主题里变成一块白底白字的空白。
+ * 这几条断言把踩过的坑钉住：品牌底必须配主题反色，弹窗正文不能被压成 0 高，
+ * 弹窗宽度必须随视口收缩。
+ */
+test("brand-filled surfaces use theme contrast colors, never a hardcoded white", () => {
+  const css = cssText();
+
+  const brandRules = css
+    .split(/(?<=})\s*/)
+    .filter((rule) => rule.includes("background:var(--dsw-alias-brand-primary)"));
+
+  assert.ok(brandRules.length >= 2, `expected brand-filled rules, found ${brandRules.length}`);
+  for (const rule of brandRules) {
+    assert.ok(
+      !/#fff\b|#ffffff\b|:\s*white\b/.test(rule),
+      `brand-filled rule must not hardcode white text (breaks dark theme): ${rule.trim()}`,
+    );
+    assert.ok(
+      rule.includes("--dsw-alias-label-primary-inverted"),
+      `brand-filled rule must use the theme contrast label color: ${rule.trim()}`,
+    );
+  }
+});
+
+test("the modal body sizes to its content instead of collapsing", () => {
+  const body = cssRule(cssText(), ".hs-mbody");
+  // flex:1 1 0 会让正文在自适应高度的弹窗里被压成 0 高，字段全被裁掉。
+  assert.ok(!body.includes("flex:1 1 0"), `.hs-mbody must not use a zero flex-basis: ${body.trim()}`);
+  assert.ok(body.includes("flex:0 1 auto"), `.hs-mbody must size to content: ${body.trim()}`);
+});
+
+test("the modal width shrinks with the viewport", () => {
+  const body = cssRule(cssText(), ".hs-modal");
+  assert.ok(/width:min\(\d+px,9\dvw\)/.test(body), `modal width must be viewport-capped: ${body.trim()}`);
+  assert.ok(!/max-width:96vw/.test(body), "modal should cap via width:min(), not a separate max-width");
+});
+
+/** 渲染一个来自模块 __test 出口的组件。 */
+function renderTestComponent(name, props) {
+  const mod = loadModule();
+  const Component = mod.__test?.[name];
+  assert.equal(typeof Component, "function", `${name} must be exported for tests`);
+  return renderToStaticMarkup(React.createElement(Component, props));
+}
+
+/**
+ * 全自动配置必须能选模型 / 思考档位 / 隔离模式。
+ *
+ * 这三项都是引擎已有的字段（auto.model / auto.effort / work_dir），之前界面没暴露，
+ * 等于自动模式下只能「跟随配置」。这里钉住三件事：控件真的渲染出来了、
+ * 模型候选来自当前执行器、隔离模式翻译成 work_dir 的规则没跑偏。
+ */
+test("the auto-config modal exposes model, thinking depth and isolation mode", () => {
+  const html = renderTestComponent("AutoConfigModal", {
+    options: OPTIONS,
+    auto: { executor: "dsh" },
+    mode: "auto",
+    onClose() {},
+    onDone() {},
+  });
+
+  assert.ok(html.includes("模型"), "auto config must offer a model picker");
+  assert.ok(html.includes("思考档位"), "auto config must offer a thinking-depth picker");
+  assert.ok(html.includes("隔离模式"), "auto config must offer an isolation mode picker");
+
+  // 候选来自当前执行器（dsh）：模型名与档位都得出现在下拉里。
+  assert.ok(html.includes("DeepSeek-V4.1-Flash"), "model options must come from the selected executor");
+  for (const effort of ["low", "high"]) {
+    assert.ok(html.includes(`>${effort}<`), `effort option ${effort} must be rendered`);
+  }
+
+  // 两种隔离模式都在，且默认选中隔离 worktree。
+  assert.ok(html.includes("隔离 worktree"), "isolation picker must offer worktree mode");
+  assert.ok(html.includes("指定目录"), "isolation picker must offer direct-directory mode");
+});
+
+test("the auto-config modal keeps a saved model selected instead of falling back to config", () => {
+  const html = renderTestComponent("AutoConfigModal", {
+    options: OPTIONS,
+    // 已保存过 model/effort：打开弹窗时应带回这两个值，而不是重置成「跟随配置」。
+    auto: { executor: "dsh", model: "deepseek-v4.1-flash", effort: "high" },
+    mode: "auto",
+    onClose() {},
+    onDone() {},
+  });
+
+  assert.ok(
+    html.includes('value="deepseek-v4.1-flash"'),
+    "saved model must be preselected in the picker",
+  );
+  assert.ok(html.includes('value="high"'), "saved effort must be preselected in the picker");
+});
+
+test("a saved work_dir opens the isolation picker in direct-directory mode", () => {
+  const html = renderTestComponent("AutoConfigModal", {
+    options: OPTIONS,
+    auto: { executor: "dsh", work_dir: "D:/project/api" },
+    mode: "auto",
+    onClose() {},
+    onDone() {},
+  });
+
+  // work_dir 有值 = 指定目录，界面上必须体现出来，否则用户会以为仍在隔离 worktree。
+  assert.ok(
+    html.includes("D:/project/api"),
+    "the saved work_dir must be shown when reopening the config",
+  );
+});
+
+test("the run modal offers the same isolation picker", () => {
+  const html = renderTestComponent("RunModal", {
+    taskId: TASK.id,
+    options: OPTIONS,
+    onClose() {},
+    onDone() {},
+  });
+
+  assert.ok(html.includes("模型"), "run modal must offer a model picker");
+  assert.ok(html.includes("隔离模式"), "run modal must offer the isolation picker");
+  // 执行弹窗默认走隔离 worktree，此时不应该渲染目录输入框。
+  assert.ok(html.includes("隔离 worktree"), "run modal must default to the isolated worktree");
+});
+
+test("thinking-depth options follow the selected model, not the executor", () => {
+  // 同名模型在不同 provider 下档位不同：选 workbuddy 的必须看到 max 而不是 xhigh
+  const options = {
+    executors: [
+      {
+        id: "dsh",
+        label: "DSH Agent",
+        efforts: ["low", "medium", "high"],
+        models: [
+          { id: "deepseek-v4.1-flash", name: "Flash", provider: "trae", provider_name: "Trae", reasoning: { efforts: [{ id: "low" }, { id: "high" }, { id: "xhigh" }] } },
+          { id: "deepseek-v4.1-flash", name: "Flash", provider: "workbuddy", provider_name: "WorkBuddy", reasoning: { efforts: [{ id: "low" }, { id: "high" }, { id: "max" }] } },
+          { id: "gpt-6.1-sol", name: "Sol", provider: "codex", provider_name: "Codex", reasoning: { efforts: [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "max" }, { id: "ultra" }] } },
+        ],
+      },
+    ],
+  };
+  const html = renderTestComponent("RunModal", {
+    options,
+    taskId: "ho-1",
+    onClose: () => {},
+    onDone: () => {},
+  });
+  // 同名模型必须带上 provider 才分得清（这是「对不上」的一半原因）
+  assert.match(html, /Flash · Trae/);
+  assert.match(html, /Flash · WorkBuddy/);
+  // 还没选模型时档位退回执行器全集，而不是伪造某个模型的档位
+  assert.match(html, /<option value="medium">/);
+  // dsh 分支要给出访问权限隔离
+  assert.match(html, /访问权限隔离/);
+});
+
+test("SandboxPicker offers the three real sandbox modes", () => {
+  const html = renderTestComponent("SandboxPicker", {
+    value: "",
+    setValue: () => {},
+    modes: ["read-only", "workspace-write", "danger-full-access"],
+  });
+  assert.match(html, /访问权限隔离/);
+  assert.match(html, /只读/);
+  assert.match(html, /工作区可写/);
+  assert.match(html, /完全放开/);
+});
+
+test("effortsFor keys on provider so duplicate model ids resolve correctly", () => {
+  const { effortsFor } = loadModule().__test;
+  const dsh = {
+    efforts: ["low", "medium", "high"],
+    models: [
+      { id: "deepseek-v4.1-flash", provider: "trae", reasoning: { efforts: [{ id: "low" }, { id: "high" }, { id: "xhigh" }] } },
+      { id: "deepseek-v4.1-flash", provider: "workbuddy", reasoning: { efforts: [{ id: "low" }, { id: "high" }, { id: "max" }] } },
+    ],
+  };
+  assert.deepEqual(effortsFor(dsh, "workbuddy", "deepseek-v4.1-flash"), ["low", "high", "max"]);
+  assert.deepEqual(effortsFor(dsh, "trae", "deepseek-v4.1-flash"), ["low", "high", "xhigh"]);
+  // 不存在的模型退回执行器全集，不伪造
+  assert.deepEqual(effortsFor(dsh, null, "no-such-model"), ["low", "medium", "high"]);
+});

@@ -138,6 +138,8 @@ class ActiveRun:
     auto_commit: bool | None = None
     model: str | None = None
     effort: str | None = None
+    # 访问权限隔离（dsh 专用，走 session 的 sandbox/mode）；None = 跟随部署默认
+    sandbox: str | None = None
     # 干预续跑要沿用同一个工作目录，否则会默默跑回隔离 worktree
     work_dir: str | None = None
 
@@ -214,6 +216,8 @@ class PanelService:
                 # 自动模式用的模型/思考程度；None = 跟随执行器配置（config 或 ~/.codex）
                 "model": None,
                 "effort": None,
+                # 访问权限隔离（dsh 专用）：三档沙箱；None = 跟随部署默认
+                "sandbox": None,
                 "auto_merge": panel.auto_merge,
                 "wait_deployment": panel.wait_deployment,
                 "session_strategy": panel.session_strategy,
@@ -242,6 +246,16 @@ class PanelService:
                 # 旧状态文件没有这两个键时由 _default_state 补齐；有值时统一清洗
                 merged["auto"]["work_dir"] = _clean_path(merged["auto"].get("work_dir")) or None
                 merged["auto"]["auto_commit"] = bool(merged["auto"].get("auto_commit"))
+                # 与 set_mode 一致：model/effort 只保留非空字符串，手改坏的值退回「跟随配置」
+                for key in ("model", "effort"):
+                    raw = merged["auto"].get(key)
+                    merged["auto"][key] = raw.strip() if isinstance(raw, str) and raw.strip() else None
+                # 访问权限隔离只认已知的三档；其它值一律当作「跟随默认」，免得把
+                # 一个不存在的档位一路发到执行器才开始报错
+                sandbox = merged["auto"].get("sandbox")
+                merged["auto"]["sandbox"] = (
+                    sandbox.strip() if isinstance(sandbox, str) and sandbox.strip() in CODEX_SANDBOX_MODES else None
+                )
                 return merged
         except (OSError, json.JSONDecodeError, ValueError):
             pass
@@ -382,6 +396,7 @@ class PanelService:
         on_event=None,
         model: str | None = None,
         effort: str | None = None,
+        sandbox: str | None = None,
     ):
         """测试可注入执行器实例或工厂；工厂能拿到 resume/权限档/安全模式参数。"""
         override = self._runner_overrides.get(executor)
@@ -410,6 +425,7 @@ class PanelService:
             on_event=on_event,
             model=model,
             effort=effort,
+            sandbox=sandbox,
         )
 
     def list_tasks(self, *, status: str | list[str] | None = None) -> list[dict]:
@@ -552,6 +568,7 @@ class PanelService:
         on_event=None,
         model: str | None = None,
         effort: str | None = None,
+        sandbox: str | None = None,
     ):
         log_dir = self.root / ".handoff-run" / "logs"
         # 密钥值从配置的文件读入，注入子进程 env；agent 拿不到面板的系统环境。
@@ -610,6 +627,7 @@ class PanelService:
         work_dir: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        sandbox: str | None = None,
         carry_logs: list[str] | None = None,
         reuse_worktree: str | None = None,
     ) -> dict:
@@ -657,6 +675,7 @@ class PanelService:
                 resume_session_id=resume_session_id,
                 model=model,
                 effort=effort,
+                sandbox=sandbox,
                 work_dir=work_dir,
             )
             # 干预续跑时把上一轮的尾巴带过来，否则界面突然只剩一行，像被清空了
@@ -701,6 +720,7 @@ class PanelService:
                 on_event=log_fn,
                 model=model,
                 effort=effort,
+                sandbox=sandbox,
             )
             options = WorkerOptions(
                 worker_id=self.config.panel.worker_id,
@@ -1143,6 +1163,17 @@ class PanelService:
                         raise SchemaError(f"auto.{key} 只能是字符串或 null")
                     value = str(value).strip() if isinstance(value, str) else ""
                     merged[key] = value or None
+            if "sandbox" in auto_patch:
+                value = auto_patch["sandbox"]
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    merged["sandbox"] = None
+                elif not isinstance(value, str) or value.strip() not in CODEX_SANDBOX_MODES:
+                    # 只允许宿主真正认识的档位，拼错就明确报错而不是静默变成「默认」
+                    raise SchemaError(
+                        f"auto.sandbox 只能是 {'/'.join(CODEX_SANDBOX_MODES)} 或 null"
+                    )
+                else:
+                    merged["sandbox"] = value.strip()
         with self._lock:
             self._panel_state["mode"] = mode
             if isinstance(auto_patch, dict):
@@ -1241,6 +1272,7 @@ class PanelService:
                             work_dir=self._auto_work_dir(task_id, auto_cfg),
                             model=auto_cfg.get("model"),
                             effort=auto_cfg.get("effort"),
+                            sandbox=auto_cfg.get("sandbox"),
                             trigger="auto",
                         )
                         # 单并发：等这一单彻底跑完再取下一单

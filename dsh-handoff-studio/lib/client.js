@@ -58,7 +58,10 @@ window.__ModuleLoader__.load({
       "color:var(--dsw-alias-label-primary);}",
       ".hs-btn:hover:not(:disabled){border-color:var(--dsw-alias-border-l2);}",
       ".hs-btn:disabled{opacity:.5;cursor:default;}",
-      ".hs-btn.primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:#fff;}",
+      // 品牌色在深色主题下是近白色、浅色主题下是近黑色，所以文字必须用主题提供的
+      // 反色标签色，不能写死 #fff——写死会在深色主题里变成「白底白字」的一块空白。
+      ".hs-btn.primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);",
+      "color:var(--dsw-alias-label-primary-inverted);}",
       ".hs-btn.danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary);}",
       ".hs-btn.sm{font-size:11px;padding:3px 8px;}",
       ".hs-select,.hs-input,.hs-textarea{font:inherit;font-size:12px;padding:4px 6px;border-radius:6px;",
@@ -68,7 +71,8 @@ window.__ModuleLoader__.load({
       ".hs-mode{display:flex;border:1px solid var(--dsw-alias-border-l1);border-radius:7px;overflow:hidden;}",
       ".hs-mode button{border:none;border-radius:0;padding:5px 12px;background:transparent;",
       "font:inherit;font-size:12px;cursor:pointer;color:var(--dsw-alias-label-primary);}",
-      ".hs-mode button.active{background:var(--dsw-alias-brand-primary);color:#fff;}",
+      ".hs-mode button.active{background:var(--dsw-alias-brand-primary);",
+      "color:var(--dsw-alias-label-primary-inverted);}",
       ".hs-body{flex:1 1 0;min-height:0;display:flex;flex-direction:column;overflow:hidden;}",
       ".hs-scroll{overflow:auto;flex:1 1 0;min-height:0;}",
       ".hs-notice{padding:8px 14px;font-size:12px;border-bottom:1px solid var(--dsw-alias-border-l1);",
@@ -150,17 +154,23 @@ window.__ModuleLoader__.load({
       ".hs-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:60;",
       "display:flex;align-items:center;justify-content:center;padding:24px;}",
       ".hs-modal{background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);",
-      "border-radius:12px;width:640px;max-width:96vw;max-height:88vh;display:flex;flex-direction:column;}",
-      ".hs-modal.wide{width:760px;}",
+      "border-radius:12px;width:min(680px,94vw);max-height:88vh;display:flex;flex-direction:column;}",
+      ".hs-modal.wide{width:min(880px,94vw);}",
       ".hs-mhead{padding:14px 18px;border-bottom:1px solid var(--dsw-alias-border-l1);",
       "font-weight:600;display:flex;align-items:center;gap:8px;}",
-      ".hs-mbody{padding:16px 18px;overflow:auto;flex:1 1 0;min-height:0;}",
+      // 弹窗高度是「按内容自适应、超过 88vh 才收缩」。所以正文不能用 flex:1 1 0：
+      // 基准为 0 的弹性项在自适应高度的列容器里会被压成 0 高，字段全部被裁掉、
+      // 只剩一行提示。用 0 1 auto 让它先按内容取高，仅在触顶时收缩。
+      ".hs-mbody{padding:16px 18px;overflow:auto;flex:0 1 auto;min-height:0;}",
       ".hs-mfoot{padding:12px 18px;border-top:1px solid var(--dsw-alias-border-l1);",
       "display:flex;justify-content:flex-end;gap:8px;}",
       ".hs-formrow{margin-bottom:14px;}",
       ".hs-formrow label{display:block;color:var(--dsw-alias-label-secondary);",
       "font-size:12px;margin-bottom:5px;}",
       ".hs-formrow .hs-select,.hs-formrow .hs-input{width:100%;}",
+      // 宽版弹窗里成对的短字段并排，避免单个输入框被拉满整行。
+      ".hs-cols2{display:grid;grid-template-columns:1fr 1fr;gap:0 18px;}",
+      "@media (max-width:640px){.hs-cols2{grid-template-columns:1fr;}}",
       ".hs-cards{display:flex;gap:10px;}",
       ".hs-card{flex:1 1 0;border:1px solid var(--dsw-alias-border-l1);border-radius:9px;",
       "padding:9px 11px;cursor:pointer;}",
@@ -272,6 +282,195 @@ window.__ModuleLoader__.load({
         props.label ? h("label", null, props.label) : null,
         props.children,
         props.hint ? h("div", { className: "hs-hint" }, props.hint) : null,
+      );
+    }
+
+    /**
+     * 某个模型真正支持的思考档位。
+     *
+     * 为什么不能直接用 executor.efforts：那是执行器的**静态全集**（dsh 的
+     * ["low","medium","high"]），和模型无关。真实档位来自模型目录里每个模型自己的
+     * reasoning.efforts，而且同 id 的模型在不同 provider 下档位并不相同——
+     * 例如 deepseek-v4.1-flash 在 trae 是 low/high/xhigh、在 workbuddy 是
+     * low/high/max。宿主侧 `_efforts_for()` 只按 id 取第一条匹配，结果就是
+     * 面板显示 max、实际校验用的是 xhigh。
+     *
+     * 所以这里按 (provider, model) 精确匹配；匹配不到再退回执行器全集，
+     * 绝不在拿不到目录时伪造一个档位列表。
+     */
+    function effortsFor(executor, provider, modelId) {
+      var models = (executor && executor.models) || [];
+      var mine = null;
+      for (var i = 0; i < models.length; i += 1) {
+        if (models[i].id !== modelId) continue;
+        // 有 provider 就要求一起对上，避免拿到同名但不同路由的档位
+        if (provider && models[i].provider && models[i].provider !== provider) continue;
+        mine = models[i];
+        break;
+      }
+      var reasoning = mine && mine.reasoning;
+      var efforts = (reasoning && reasoning.efforts) || [];
+      var ids = [];
+      for (var j = 0; j < efforts.length; j += 1) {
+        var id = efforts[j] && efforts[j].id;
+        if (id) ids.push(String(id));
+      }
+      if (ids.length) return ids;
+      // 模型没有声明档位（或不支持思考）：返回空，别拿执行器全集冒充
+      if (mine) return [];
+      return ((executor && executor.efforts) || []).slice();
+    }
+
+    /**
+     * 隔离模式选择器。
+     *
+     * 引擎里没有独立的「隔离」字段：隔离与否完全由 work_dir 是否为空决定
+     * （workspace.py 的 Workspace：direct 非空就跳过隔离 worktree）。
+     * 所以这里把它做成一个显式的二选一，只负责把选择翻译成 work_dir：
+     *   worktree → null（建隔离 worktree + 分支，交付走 PR；续跑时引擎会
+     *              自动复用该任务上一轮的 worktree，不需要额外选项）
+     *   custom   → 用户填的路径（直接在该目录改，不建 worktree）
+     * 不要在这里新造一个引擎不认的 isolation 参数——那会让界面显示的
+     * 和引擎实际做的对不上。
+     */
+    function IsolationPicker(props) {
+      var mode = props.mode;
+      var setMode = props.setMode;
+      var path = props.path;
+      var setPath = props.setPath;
+      var workDirs = props.workDirs || [];
+
+      var hints = {
+        worktree: "建隔离 worktree + 分支，agent 的改动不回落到你的工作区，交付走 PR。",
+        custom: "直接用这个目录跑，不建 worktree：改动直接落在该目录，已有 PR 链路不适用。",
+      };
+      if (props.strategy === "continue") {
+        hints.worktree = "续跑会复用该任务上一轮的 worktree，上下文和文件都对得上。";
+      }
+
+      return h(
+        Field,
+        { label: "隔离模式", hint: hints[mode] || "" },
+        h(
+          "div",
+          { className: "hs-cards" },
+          h(
+            "div",
+            {
+              className: "hs-card" + (mode === "worktree" ? " sel" : ""),
+              onClick: function () {
+                setMode("worktree");
+              },
+            },
+            h("div", { className: "nm" }, "隔离 worktree"),
+            h("div", { className: "note" }, "推荐 · 不污染你的目录"),
+          ),
+          h(
+            "div",
+            {
+              className: "hs-card" + (mode === "custom" ? " sel" : ""),
+              onClick: function () {
+                setMode("custom");
+              },
+            },
+            h("div", { className: "nm" }, "指定目录"),
+            h("div", { className: "note" }, "原地改 · 不走 PR"),
+          ),
+        ),
+        mode === "custom"
+          ? h(
+              "div",
+              { style: { marginTop: 8 } },
+              workDirs.length
+                ? h(
+                    "select",
+                    {
+                      className: "hs-select",
+                      value: workDirs.some(function (item) {
+                        return item.path === path;
+                      })
+                        ? path
+                        : "",
+                      onChange: function (event) {
+                        setPath(event.target.value);
+                      },
+                    },
+                    h("option", { value: "" }, "选一个已登记的仓库目录…"),
+                    workDirs.map(function (item) {
+                      return h("option", { key: item.repo, value: item.path }, item.path);
+                    }),
+                  )
+                : null,
+              h("input", {
+                className: "hs-input",
+                style: workDirs.length ? { marginTop: 6 } : null,
+                placeholder: "D:\\project\\your-repo",
+                value: path,
+                onChange: function (event) {
+                  setPath(event.target.value);
+                },
+              }),
+            )
+          : null,
+      );
+    }
+
+    /**
+     * 访问权限隔离选择器（三档沙箱）。
+     *
+     * 这些取值不是我们编的：宿主 @deepseek-ai/dsh-sandbox 的 SandboxMode 就是
+     * read-only / workspace-write / danger-full-access 三个。它和上面的
+     * 「隔离模式」是两件不同的事：
+     *   隔离模式   → 改动落在哪个目录（worktree 还是指定目录），是**位置**问题
+     *   访问权限   → agent 在该目录里能读能写多少，是**权限**问题
+     *
+     * dsh 的通路是往 Agent 所属 session 追加 sandbox/mode 事件；codex 走
+     * --sandbox 参数。所以这里只负责选值，落盘由各执行器自己实现。
+     */
+    function SandboxPicker(props) {
+      var value = props.value;
+      var setValue = props.setValue;
+      var options = props.modes || ["read-only", "workspace-write", "danger-full-access"];
+
+      var LABELS = {
+        "read-only": { name: "只读", note: "能读不能写，最安全" },
+        "workspace-write": { name: "工作区可写", note: "推荐 · 只能改工作目录" },
+        "danger-full-access": { name: "完全放开", note: "不隔离 · 谨慎使用" },
+      };
+
+      return h(
+        Field,
+        {
+          label: "访问权限隔离",
+          hint:
+            value === "read-only"
+              ? "agent 只能读，任何写入都会被沙箱拒绝——适合只让它分析的任务。"
+              : value === "danger-full-access"
+                ? "不限制文件访问范围，agent 能改到工作目录之外。只在完全信任的任务上用。"
+                : value === "workspace-write"
+                  ? "写入被限制在工作目录内，越界会被拒绝。需要越权时可以临时提权。"
+                  : // 没选任何一档：不要在这里暗示已隔离，否则等于骗人
+                    "没选就是跟随 DSH 部署的默认档位；想确保隔离请显式选一档。",
+        },
+        h(
+          "div",
+          { className: "hs-cards" },
+          options.map(function (mode) {
+            var meta = LABELS[mode] || { name: mode, note: "" };
+            return h(
+              "div",
+              {
+                key: mode,
+                className: "hs-card" + (value === mode ? " sel" : ""),
+                onClick: function () {
+                  setValue(mode);
+                },
+              },
+              h("div", { className: "nm" }, meta.name),
+              h("div", { className: "note" }, meta.note),
+            );
+          }),
+        ),
       );
     }
 
@@ -407,8 +606,12 @@ window.__ModuleLoader__.load({
         [taskId, executor],
       );
 
-      var efforts = (current.efforts || []).slice();
       var models = current.models || [];
+      // 档位跟着「选中的模型」走，而不是执行器的静态全集。
+      // 未选模型时（跟随配置）才退回执行器全集。
+      var efforts = model
+        ? effortsFor(current, null, model)
+        : (current.efforts || []).slice();
 
       function submit() {
         setWorking(true);
@@ -418,7 +621,10 @@ window.__ModuleLoader__.load({
           model: model || null,
           effort: effort || null,
           resume_session_id: resumeSession || null,
+          // codex 的 sandbox 走 --sandbox；dsh 的 sandbox 走 session 的
+          // sandbox/mode 事件。同一个取值，两条通路，所以都从 sandbox 发。
           codex_sandbox: executor === "codex" ? sandbox || null : null,
+          sandbox: executor !== "codex" ? sandbox || null : null,
           auto_merge: autoMerge,
           wait_deployment: waitDeploy,
           auto_commit: autoCommit,
@@ -513,7 +719,12 @@ window.__ModuleLoader__.load({
                   },
                   h("option", { value: "" }, "跟随配置"),
                   models.map(function (item) {
-                    return h("option", { key: item.id, value: item.id }, item.name || item.id);
+                    // 同一个 model id 可能挂在多个 provider 下（档位还不一样），
+                    // 只写名字会出现两个一模一样、选不出差别的选项——带上 provider。
+                    var key = (item.provider ? item.provider + "/" : "") + item.id;
+                    var label = item.name || item.id;
+                    if (item.provider_name) label += " · " + item.provider_name;
+                    return h("option", { key: key, value: item.id }, label);
                   }),
                 )
               : h("input", {
@@ -563,7 +774,13 @@ window.__ModuleLoader__.load({
                 }),
               ),
             )
-          : null,
+          : executor === "dsh"
+            ? h(SandboxPicker, {
+                value: sandbox,
+                setValue: setSandbox,
+                modes: options.sandbox_modes,
+              })
+            : null,
         h(
           Field,
           {
@@ -604,59 +821,13 @@ window.__ModuleLoader__.load({
               )
             : null,
         ),
-        h(
-          Field,
-          {
-            label: "工作目录",
-            hint:
-              dirMode === "custom"
-                ? "目录模式：不建隔离 worktree，直接在指定目录改代码。已有 PR 链路不适用。"
-                : "默认在建隔离 worktree + 分支，交付走 PR。",
-          },
-          h(
-            "select",
-            {
-              className: "hs-select",
-              value: dirMode,
-              onChange: function (event) {
-                setDirMode(event.target.value);
-              },
-            },
-            h("option", { value: "worktree" }, "隔离 worktree（推荐）"),
-            h("option", { value: "custom" }, "指定目录"),
-          ),
-          dirMode === "custom"
-            ? h(
-                "div",
-                { style: { marginTop: 6 } },
-                (options.work_dirs || []).length
-                  ? h(
-                      "select",
-                      {
-                        className: "hs-select",
-                        value: dirPath,
-                        onChange: function (event) {
-                          setDirPath(event.target.value);
-                        },
-                      },
-                      h("option", { value: "" }, "选一个已登记的仓库目录…"),
-                      (options.work_dirs || []).map(function (item) {
-                        return h("option", { key: item.repo, value: item.path }, item.path);
-                      }),
-                    )
-                  : null,
-                h("input", {
-                  className: "hs-input",
-                  style: { marginTop: 6 },
-                  placeholder: "D:\\project\\your-repo",
-                  value: dirPath,
-                  onChange: function (event) {
-                    setDirPath(event.target.value);
-                  },
-                }),
-              )
-            : null,
-        ),
+        h(IsolationPicker, {
+          mode: dirMode,
+          setMode: setDirMode,
+          path: dirPath,
+          setPath: setDirPath,
+          workDirs: options.work_dirs || [],
+        }),
         h(
           Field,
           { label: "执行选项" },
@@ -873,6 +1044,90 @@ window.__ModuleLoader__.load({
       var workDirState = useState(auto.work_dir || "");
       var workDir = workDirState[0];
       var setWorkDir = workDirState[1];
+      // 隔离模式不是独立字段：work_dir 有值就是「指定目录」，没有就是「隔离 worktree」。
+      // 初始值由已保存的配置反推，用户改了再翻译回 work_dir。
+      var isolationState = useState(auto.work_dir ? "custom" : "worktree");
+      var isolation = isolationState[0];
+      var setIsolation = isolationState[1];
+      var modelState = useState(auto.model || "");
+      var model = modelState[0];
+      var setModel = modelState[1];
+      var effortState = useState(auto.effort || "");
+      var effort = effortState[0];
+      var setEffort = effortState[1];
+      // 访问权限隔离：已保存的档位，空 = 跟随部署默认
+      var sandboxState = useState(auto.sandbox || "");
+      var sandbox = sandboxState[0];
+      var setSandbox = sandboxState[1];
+
+      var current = useMemo(
+        function () {
+          var list = options.executors || [];
+          for (var i = 0; i < list.length; i += 1) {
+            if (list[i].id === executor) return list[i];
+          }
+          return list[0] || { models: [], efforts: [] };
+        },
+        [options, executor],
+      );
+
+      // 面板的 options 是启动时拉的；如果这会儿还没到（比如刚打开面板就点了配置），
+      // 自己补拉一次，否则模型下拉会是空的、让人以为「没有模型可选」。
+      var fetchedState = useState(null);
+      var fetched = fetchedState[0];
+      var setFetched = fetchedState[1];
+      useEffect(
+        function () {
+          if ((options.executors || []).length) return;
+          var alive = true;
+          apiPost("/api/studio/options", {})
+            .then(function (body) {
+              if (alive) setFetched(body || null);
+            })
+            .catch(function () {});
+          return function () {
+            alive = false;
+          };
+        },
+        [options],
+      );
+
+      var view = (options.executors || []).length ? options : fetched || options;
+      var currentView = useMemo(
+        function () {
+          var list = view.executors || [];
+          for (var i = 0; i < list.length; i += 1) {
+            if (list[i].id === executor) return list[i];
+          }
+          return list[0] || { models: [], efforts: [] };
+        },
+        [view, executor],
+      );
+
+      // 换执行器 → 换模型候选；旧选择不属于新执行器就退回「跟随配置」，
+      // 否则会把 codex 的模型名发给 dsh，或者反过来。
+      useEffect(
+        function () {
+          var models = currentView.models || [];
+          var known = false;
+          for (var i = 0; i < models.length; i += 1) if (models[i].id === model) known = true;
+          if (model && !known) setModel("");
+        },
+        [executor],
+      );
+
+      // 档位必须跟着**模型**重新校验：不同模型的档位集合不同（v4.1-flash 是
+      // low/high/xhigh，gpt-6.1 是 low/medium/high/xhigh/max/ultra）。
+      // 只在换执行器时校验是不够的——换了模型仍会留着上一个模型的档位，
+      // 提交后被宿主拒掉（"模型 X 不支持思考程度 Y"）。
+      useEffect(
+        function () {
+          if (!effort) return;
+          var allowed = effortsFor(currentView, null, model);
+          if (allowed.length && allowed.indexOf(effort) < 0) setEffort("");
+        },
+        [model],
+      );
       var autoMergeState = useState(auto.auto_merge !== false);
       var autoMerge = autoMergeState[0];
       var setAutoMerge = autoMergeState[1];
@@ -892,12 +1147,23 @@ window.__ModuleLoader__.load({
       function submit() {
         setBusy(true);
         setError("");
+        // 隔离模式翻译回引擎认识的 work_dir：只有「指定目录」才带路径。
+        // 选了指定目录却留空，等于没选——直接拦下来，别让它悄悄跑成隔离 worktree。
+        if (isolation === "custom" && !workDir.trim()) {
+          setBusy(false);
+          setError("隔离模式选了「指定目录」，请填一个目录路径；想要隔离 worktree 就把模式切回去。");
+          return;
+        }
         apiPost("/api/mode", {
           mode: props.mode,
           auto: {
             executor: executor,
             session_strategy: strategy,
-            work_dir: workDir || null,
+            model: model || null,
+            effort: effort || null,
+            // 访问权限隔离只对 dsh 生效（codex 用 codex_sandbox）
+            sandbox: executor === "dsh" ? sandbox || null : null,
+            work_dir: isolation === "custom" ? workDir.trim() : null,
             auto_merge: autoMerge,
             wait_deployment: waitDeploy,
             auto_commit: autoCommit,
@@ -918,6 +1184,7 @@ window.__ModuleLoader__.load({
         Modal,
         {
           title: "全自动模式配置",
+          wide: true,
           onClose: props.onClose,
           footer: [
             h("button", { key: "c", type: "button", className: "hs-btn", onClick: props.onClose }, "取消"),
@@ -934,52 +1201,144 @@ window.__ModuleLoader__.load({
           "全自动模式会自动认领 open 的任务，单并发；同一时刻只跑一单。",
         ),
         h(
-          Field,
-          { label: "执行器" },
+          "div",
+          { className: "hs-cols2" },
           h(
-            "select",
-            {
-              className: "hs-select",
-              value: executor,
-              onChange: function (event) {
-                setExecutor(event.target.value);
+            Field,
+            { label: "执行器" },
+            h(
+              "select",
+              {
+                className: "hs-select",
+                value: executor,
+                onChange: function (event) {
+                  setExecutor(event.target.value);
+                },
               },
-            },
-            (options.executors || []).map(function (item) {
-              return h("option", { key: item.id, value: item.id }, item.label + "（" + item.id + "）");
-            }),
+              (view.executors || []).map(function (item) {
+                return h("option", { key: item.id, value: item.id }, item.label + "（" + item.id + "）");
+              }),
+            ),
+          ),
+          h(
+            Field,
+            { label: "会话策略" },
+            h(
+              "select",
+              {
+                className: "hs-select",
+                value: strategy,
+                onChange: function (event) {
+                  setStrategy(event.target.value);
+                },
+              },
+              h("option", { value: "new" }, "每次新会话"),
+              h("option", { value: "continue" }, "接续该任务上次的会话"),
+            ),
           ),
         ),
+        h(IsolationPicker, {
+          mode: isolation,
+          setMode: setIsolation,
+          path: workDir,
+          setPath: setWorkDir,
+          workDirs: (view && view.work_dirs) || [],
+          strategy: strategy,
+        }),
+        // 访问权限隔离：只对 dsh 有意义（codex 有自己那套 --sandbox 横幅）。
+        executor === "dsh"
+          ? h(SandboxPicker, {
+              value: sandbox,
+              setValue: setSandbox,
+              modes: view && view.sandbox_modes,
+            })
+          : null,
         h(
-          Field,
-          { label: "会话策略" },
+          "div",
+          { className: "hs-cols2" },
           h(
-            "select",
+            Field,
             {
-              className: "hs-select",
-              value: strategy,
-              onChange: function (event) {
-                setStrategy(event.target.value);
-              },
+              label: "模型",
+              hint:
+                executor === "dsh"
+                  ? "来自 DSH 当前可路由的模型；留空 = 跟随配置。"
+                  : "留空 = 跟随该执行器的配置。",
             },
-            h("option", { value: "new" }, "每次新会话"),
-            h("option", { value: "continue" }, "接续该任务上次的会话"),
+            (currentView.models || []).length
+              ? h(
+                  "select",
+                  {
+                    className: "hs-select",
+                    value: model,
+                    onChange: function (event) {
+                      setModel(event.target.value);
+                      // dsh 的档位是「每个模型声明一组」，换模型要重新拉一次候选。
+                      if (executor === "dsh") {
+                        apiPost("/api/studio/options", { model: event.target.value }).catch(function () {});
+                      }
+                    },
+                  },
+                  h("option", { value: "" }, "跟随配置"),
+                  (currentView.models || []).map(function (item) {
+                    // 同一个 model id 可能出现在多个 provider 下，且档位不同。
+                    // 用 provider/id 作 key，标签带上 provider，避免选了看不出是哪一个。
+                    var key = (item.provider ? item.provider + "/" : "") + item.id;
+                    var label = item.name || item.id;
+                    if (item.provider_name) label += " · " + item.provider_name;
+                    return h("option", { key: key, value: item.id }, label);
+                  }),
+                )
+              : h("input", {
+                  className: "hs-input",
+                  placeholder: "留空 = 跟随配置",
+                  value: model,
+                  onChange: function (event) {
+                    setModel(event.target.value);
+                  },
+                }),
           ),
-        ),
-        h(
-          Field,
-          {
-            label: "工作目录",
-            hint: "留空 = 按任务仓库走隔离 worktree；填了就固定在这个目录跑（不建 worktree）。",
-          },
-          h("input", {
-            className: "hs-input",
-            placeholder: "例如 D:/project/api",
-            value: workDir,
-            onChange: function (event) {
-              setWorkDir(event.target.value);
+          h(
+            Field,
+            {
+              label: "思考档位",
+              hint: model
+                ? (effortsFor(currentView, null, model).length
+                    ? "只列 " + model + " 自己声明的档位；留空 = 用模型默认。"
+                    : "该模型没有声明思考档位（或它不支持），留空即用默认。")
+                : "先选模型再看档位；留空 = 用模型默认。",
             },
-          }),
+            (function () {
+              // 档位候选严格来自当前选中的模型；没选模型就没得选，
+              // 不再拿执行器的全集冒充（那正是「选 A 模型却能选 B 的档位」的根因）。
+              var allowed = model
+                ? effortsFor(currentView, null, model)
+                : (currentView.efforts || []);
+              return allowed.length
+                ? h(
+                    "select",
+                    {
+                      className: "hs-select",
+                      value: effort,
+                      onChange: function (event) {
+                        setEffort(event.target.value);
+                      },
+                    },
+                    h("option", { value: "" }, "默认思考"),
+                    allowed.map(function (id) {
+                      return h("option", { key: id, value: id }, id);
+                    }),
+                  )
+                : h("input", {
+                    className: "hs-input",
+                    placeholder: "留空 = 默认",
+                    value: effort,
+                    onChange: function (event) {
+                      setEffort(event.target.value);
+                    },
+                  });
+            })(),
+          ),
         ),
         h(
           Field,
@@ -2233,6 +2592,18 @@ window.__ModuleLoader__.load({
     exports.apply = apply;
     exports.inject = ["slots"];
     exports.name = "dsh-handoff-studio-client";
+    // 仅供测试的出口：弹窗平时要靠人点开才挂载，测试没法从 Panel 里摸到它们。
+    // 导出的都是纯组件，不改变宿主侧的加载行为。
+    exports.__test = {
+      AutoConfigModal: AutoConfigModal,
+      RunModal: RunModal,
+      IsolationPicker: IsolationPicker,
+      SandboxPicker: SandboxPicker,
+      effortsFor: effortsFor,
+      // 真实样式表文本，供渲染验证用（页面里是 <style>{CSS}</style>）。
+      // CSS 在声明处就已经 join 成字符串了，这里不要再 join。
+      css: CSS,
+    };
 
     return module.exports;
   },

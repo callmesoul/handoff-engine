@@ -301,6 +301,8 @@ def _run_kwargs(payload: dict) -> dict:
         "resume_session_id": str(resume) if resume else None,
         "permission_mode": payload.get("permission_mode") or None,
         "codex_sandbox": payload.get("codex_sandbox") or None,
+        # 访问权限隔离（dsh）：三档沙箱，走 session 的 sandbox/mode
+        "sandbox": str(payload.get("sandbox") or "").strip() or None,
         "auto_merge": payload.get("auto_merge"),
         "wait_deployment": payload.get("wait_deployment"),
         "auto_commit": payload.get("auto_commit"),

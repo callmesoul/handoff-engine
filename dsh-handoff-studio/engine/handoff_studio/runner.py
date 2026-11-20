@@ -70,6 +70,7 @@ class DshAgentRunner:
         model: str | None = None,
         provider: str | None = None,
         effort: str | None = None,
+        sandbox: str | None = None,
         permission_mode: str | None = None,
         env_extra: dict[str, str] | None = None,
         resume_session: str | None = None,
@@ -82,7 +83,10 @@ class DshAgentRunner:
         self.model = model
         self.provider = provider
         self.effort = effort
-        # DSH 侧没有 --sandbox 档位；保留参数只是为了与其它执行器同形
+        # 访问权限隔离：DSH 侧的沙箱档位（read-only / workspace-write /
+        # danger-full-access）。它走插件宿主 session 的 sandbox/mode 事件，
+        # 不是命令行参数——所以和 codex 的 --sandbox 是两条不同的通路。
+        self.sandbox = sandbox
         self.permission_mode = permission_mode
         self.env_extra = env_extra or {}
         # 续跑：接续上一轮的 DSH 会话（sessionController 自己会 resume）
@@ -268,6 +272,7 @@ class DshAgentRunner:
             "provider": self.provider or None,
             "model": self.model or None,
             "effort": self.effort or None,
+            "sandbox": self.sandbox or None,
             "resumeSessionId": self.resume_session or None,
         }
         response = self._client.request(

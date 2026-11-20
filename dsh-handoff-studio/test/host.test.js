@@ -97,14 +97,32 @@ async function withPlugin(t, options = {}) {
       cancel: () => ({ accepted: true }),
     },
     agentLoop: {
-      createAgent: async (_owner, opts) => ({
-        agent: { id: opts.sessionId },
-        dispose: async () => {},
-      }),
-      resume: async (_owner, opts) => ({
-        agent: { id: opts.resumeSessionId },
-        dispose: async () => {},
-      }),
+      // 每个创建/恢复的 agent 都记下来，测试才能查它 session 上追加了什么
+      created: [],
+      createAgent: async (_owner, opts) => {
+        const agent = {
+          id: opts.sessionId,
+          // 沙箱模式是按 session 落的（sandbox/mode 事件）；这里暴露一个假的
+          // append，才能断言插件真的写进去了，而不只是把它塞进 agentOptions。
+          session: { id: opts.sessionId, appended: [], append(type, data) { this.appended.push({ type, data }); } },
+        };
+        ctx.agentLoop.created.push(agent);
+        return { agent, dispose: async () => {} };
+      },
+      resume: async (_owner, opts) => {
+        const agent = {
+          id: opts.resumeSessionId,
+          session: {
+            id: opts.resumeSessionId,
+            appended: [],
+            append(type, data) {
+              this.appended.push({ type, data });
+            },
+          },
+        };
+        ctx.agentLoop.created.push(agent);
+        return { agent, dispose: async () => {} };
+      },
     },
     approval: { setPolicy: () => {} },
     agentPresets: {
@@ -156,7 +174,17 @@ async function withPlugin(t, options = {}) {
       }
     }
     await new Promise((resolve) => server.close(resolve));
-    await rm(dir, { recursive: true, force: true });
+    // Windows 上后台写文件可能还没收尾，rmdir 会 ENOTEMPTY；短暂退避重试，
+    // 别让清理阶段的竞争把一条真实的断言失败盖成「测试挂了」。
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        await rm(dir, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (error?.code !== "ENOTEMPTY" || attempt === 19) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
   });
 
   const url = (path) => `http://127.0.0.1:${port}${ROUTE}${path}`;
@@ -350,4 +378,66 @@ test("config validation rejects unknown keys and bad ports", () => {
   assert.ok(bad.issues.some((issue) => issue.path[0] === "nope"));
   const port = schema.validate({ enginePort: 70000 });
   assert.ok(port.issues.some((issue) => issue.path[0] === "enginePort"));
+});
+
+test("a run applies the requested sandbox mode to the agent session", async (t) => {
+  const { call, auth, ctx } = await withPlugin(t, { finalText: "{}" });
+
+  const started = await call("/agent/run", {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({
+      cwd: process.cwd(),
+      prompt: "implement the thing",
+      taskId: "ho-1",
+      attempt: 1,
+      requestId: "handoff-ho-1-1",
+      sandbox: "read-only",
+    }),
+  });
+  assert.equal(started.status, 202);
+  const handle = await started.json();
+  // 响应里回显实际生效的档位，面板才能核对
+  assert.equal(handle.sandbox, "read-only");
+
+  // 等 execute() 跑完，agent 的 session 上应当有一条 sandbox/mode
+  for (let i = 0; i < 200; i += 1) {
+    const poll = await call(`/agent/run/${handle.runId}`, { headers: auth });
+    const body = await poll.json();
+    if (body.phase === "finished") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const agent = ctx.agentLoop.created.at(-1);
+  assert.equal(agent.session.appended.length, 1);
+  assert.deepEqual(agent.session.appended[0], { type: "sandbox/mode", data: { mode: "read-only" } });
+});
+
+test("an unknown sandbox mode is ignored instead of forwarded", async (t) => {
+  const { call, auth, ctx } = await withPlugin(t, { finalText: "{}" });
+
+  const started = await call("/agent/run", {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({
+      cwd: process.cwd(),
+      prompt: "implement the thing",
+      taskId: "ho-1",
+      attempt: 1,
+      requestId: "handoff-ho-1-1",
+      sandbox: "totally-open",
+    }),
+  });
+  assert.equal(started.status, 202);
+  const handle = await started.json();
+  assert.equal(handle.sandbox, null);
+  // 等 execute() 收尾再让 withPlugin 清理临时目录，否则后台写文件会和 rmdir 撞车
+  for (let i = 0; i < 200; i += 1) {
+    const poll = await call(`/agent/run/${handle.runId}`, { headers: auth });
+    const body = await poll.json();
+    if (body.phase === "finished") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const agent = ctx.agentLoop.created.at(-1);
+  // 没有合法档位就不写 sandbox/mode，跟随部署默认
+  assert.equal(agent.session.appended.length, 0);
 });

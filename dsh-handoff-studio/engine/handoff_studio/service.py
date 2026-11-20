@@ -45,6 +45,10 @@ from .runner import DEFAULT_ROUTE, DshAgentRunner
 #: studio 的执行器表。dsh 排第一：默认执行器就是它。
 EXECUTORS = ("dsh", "codex", "zcode")
 
+#: 访问权限隔离的三档，与宿主 `@deepseek-ai/dsh-sandbox` 的 SandboxMode 逐字一致。
+#: dsh 走 session 的 sandbox/mode 事件；codex 走 `--sandbox`。同一组取值，两条通路。
+SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+
 TOKEN_FILENAME = "handoff-studio.token"
 ENDPOINT_FILENAME = "handoff-studio.json"
 ENDPOINT_VERSION = 1
@@ -304,6 +308,7 @@ class StudioService(PanelService):
         on_event=None,
         model: str | None = None,
         effort: str | None = None,
+        sandbox: str | None = None,
     ):
         if executor != "dsh":
             return super()._build_runner(
@@ -314,6 +319,7 @@ class StudioService(PanelService):
                 on_event=on_event,
                 model=model,
                 effort=effort,
+                sandbox=sandbox,
             )
         studio = self._studio_state()
         return DshAgentRunner(
@@ -324,6 +330,8 @@ class StudioService(PanelService):
             model=model or studio.get("model"),
             provider=self._pending_provider or studio.get("provider"),
             effort=effort or studio.get("effort"),
+            # 访问权限隔离：面板/自动模式选的档位，留空则跟随部署默认
+            sandbox=sandbox,
             permission_mode=permission_mode,
             resume_session=resume_session_id,
             on_event=on_event,
@@ -354,9 +362,11 @@ class StudioService(PanelService):
             "default_effort": studio.get("effort"),
             "provider": studio.get("provider"),
             "models": list(studio.get("models") or []),
-            "efforts": list(self._efforts_for(studio.get("model")) or []),
+            "efforts": list(self._efforts_for(studio.get("model"), studio.get("provider")) or []),
             # 面板据此区分「宿主实时上报」与「当前拿不到」
             "catalog": "live" if studio.get("models") else "unavailable",
+            # 访问权限隔离的可选项：三档沙箱，null = 跟随部署默认
+            "sandbox_modes": list(SANDBOX_MODES),
         }
         return options
 
@@ -370,6 +380,9 @@ class StudioService(PanelService):
             kwargs.setdefault("effort", None)
             kwargs["model"] = kwargs["model"] or studio.get("model")
             kwargs["effort"] = kwargs["effort"] or studio.get("effort")
+            # 访问权限隔离：只接受宿主认识的三个值，别的当作「跟随部署默认」
+            sandbox = kwargs.pop("sandbox", None)
+            kwargs["sandbox"] = sandbox if sandbox in SANDBOX_MODES else None
             self._pending_provider = (provider or "").strip() or studio.get("provider")
         try:
             return super().run_task(task_id, executor=executor, **kwargs)
@@ -412,7 +425,7 @@ class StudioService(PanelService):
                     "note": "用 DSH 宿主里的模型跑实现",
                     "models": list(studio.get("models") or []),
                     "selected_model": chosen,
-                    "efforts": self._efforts_for(chosen),
+                    "efforts": self._efforts_for(chosen, studio.get("provider")),
                     "selected_effort": studio.get("effort"),
                 },
                 {
@@ -527,7 +540,7 @@ class StudioService(PanelService):
             "model": studio.get("model"),
             "effort": studio.get("effort"),
             "models": studio.get("models") or [],
-            "efforts": self._efforts_for(studio.get("model")),
+            "efforts": self._efforts_for(studio.get("model"), studio.get("provider")),
             "catalog_updated_at": studio.get("catalog_updated_at"),
         }
 
@@ -580,21 +593,43 @@ class StudioService(PanelService):
             patch[key] = value.strip() or None
 
         model = patch.get("model") or self._studio_state().get("model")
-        efforts = self._efforts_for(model)
+        # provider 一起参与解析：同名模型在不同 provider 下档位不同
+        provider = patch.get("provider") or self._studio_state().get("provider")
+        efforts = self._efforts_for(model, provider)
         effort = patch.get("effort")
+        # 换模型时：旧档位若不被新模型支持，直接清掉（沿用模型默认），
+        # 而不是报错——用户只是换了个模型，不该被上一个模型的档位卡住。
+        if patch.get("model") and effort and efforts and effort not in efforts:
+            patch["effort"] = None
+            effort = None
         if effort and efforts and effort not in efforts:
             raise SchemaError(
                 f"模型 {model} 不支持思考程度 {effort!r}（可选: {', '.join(efforts)}）"
             )
-        if patch.get("model") and effort and effort not in efforts:
-            patch["effort"] = None
         self._remember_studio(patch)
         return self.studio_models()
 
-    def _efforts_for(self, model: str | None) -> list[str]:
+    def _efforts_for(self, model: str | None, provider: str | None = None) -> list[str]:
+        """某个模型真正支持的思考档位。
+
+        关键点：同一个 model id 会在多个 provider 下出现，而且档位并不相同——
+        deepseek-v4.1-flash 在 trae 是 low/high/xhigh、在 workbuddy 是
+        low/high/max。以前只按 id 取第一条匹配，于是「选了 workbuddy 的同名模型，
+        面板却列的是 trae 的档位」，提交时被 select_model 拒掉。
+
+        所以带 provider 时必须一起对上；没给 provider 时才退回按 id 匹配。
+        """
         if not model:
             return []
-        for item in self._studio_state().get("models") or []:
+        rows = self._studio_state().get("models") or []
+        # 第一优先：id + provider 都对上
+        if provider:
+            for item in rows:
+                if item.get("id") == model and item.get("provider") == provider:
+                    reasoning = item.get("reasoning") or {}
+                    return [str(e.get("id")) for e in (reasoning.get("efforts") or []) if e.get("id")]
+        # 退一步：只按 id（调用方没给 provider，或目录里 provider 字段缺失）
+        for item in rows:
             if item.get("id") != model:
                 continue
             reasoning = item.get("reasoning") or {}
@@ -606,6 +641,7 @@ __all__ = [
     "ENDPOINT_FILENAME",
     "ENDPOINT_VERSION",
     "EXECUTORS",
+    "SANDBOX_MODES",
     "StudioService",
     "TOKEN_ENV",
     "TOKEN_FILENAME",

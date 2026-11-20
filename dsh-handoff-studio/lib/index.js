@@ -52,6 +52,14 @@ const LOG_PAGE = 400;
 /** Default engine port (8790 is the original panel, 8789 the listener). */
 const DEFAULT_ENGINE_PORT = 8791;
 
+/**
+ * 访问权限隔离的三档，与 `@deepseek-ai/dsh-sandbox` 的 `SandboxMode` 完全一致。
+ *
+ * 这不是我们自己发明的枚举：宿主 sandboxPolicy 的 `SANDBOX_MODES` 就是这三个值
+ * （dsh-sandbox-policy/src/session-mode.ts），传别的值会被静默忽略成「跟随默认」。
+ */
+const SANDBOX_MODES = Object.freeze(["read-only", "workspace-write", "danger-full-access"]);
+
 const FIELDS = {
   token: { kind: "string", fallback: "", check: () => true },
   tokenFile: { kind: "string", fallback: "", check: () => true },
@@ -415,6 +423,29 @@ function apply(ctx, config) {
   }
 
   /**
+   * 把这一轮选定的沙箱模式落到 Agent 所属的 Session 上。
+   *
+   * 为什么必须这么做：`AgentOptions` 只有 provider/model/reasoningEffort/
+   * maxTokens/subagentDepth，没有权限字段——沙箱模式是**按会话**的策略，由
+   * `ctx.sandboxPolicy` 解析（resolve({session}).mode），写入路径是唯一的那一条：
+   * 往 session 追加一个 `sandbox/mode` 事件。所以这里自己 append，而不是去
+   * 构造一个宿主不认识的 agentOptions 字段。
+   *
+   * 不做这件事的后果：mode 为 null 时 Agent 跑在部署默认档上，面板上选的
+   * 「访问隔离」就只是个装饰。
+   */
+  function applySandboxMode(run) {
+    if (!run.sandbox) return null;
+    const session = run.handle?.agent?.session;
+    if (!session || typeof session.append !== "function") {
+      // 拿不到 session 就没法保证隔离真的生效，明确失败比假装成功好
+      throw new Error("无法应用访问权限隔离：Agent 没有暴露 session");
+    }
+    session.append("sandbox/mode", { mode: run.sandbox });
+    return run.sandbox;
+  }
+
+  /**
    * Create (or resume) the agent, admit one prompt, and drive it to quiescence.
    * Everything is recorded on the run record so the Python side can poll it.
    */
@@ -455,6 +486,11 @@ function apply(ctx, config) {
         });
       }
       run.handle = handle;
+
+      // 访问权限隔离要在 Agent 干活之前就位：它作用于此后的每一次受限调用
+      // （bash / fs / terminal），晚一步就等于第一轮无隔离地跑过。
+      const appliedSandbox = applySandboxMode(run);
+      if (appliedSandbox) pushLine(run, `▶ 访问权限：${appliedSandbox}`);
 
       // 无人值守：不弹审批，别让一次 run 卡在一个等不到人的对话框上
       try {
@@ -822,6 +858,11 @@ function apply(ctx, config) {
         provider: typeof payload.provider === "string" ? payload.provider : null,
         model: typeof payload.model === "string" ? payload.model : null,
         effort: typeof payload.effort === "string" ? payload.effort : null,
+        // 访问权限隔离：三档沙箱模式，null 表示跟随部署默认。
+        // 这不是 AgentOptions 能表达的东西（AgentOptions 只有 provider/model/
+        // reasoningEffort/maxTokens/subagentDepth），必须走 sandboxPolicy 的
+        // 每会话覆盖路径，见 applySandboxMode()。
+        sandbox: SANDBOX_MODES.includes(payload.sandbox) ? payload.sandbox : null,
         resumeSessionId,
         sessionId: resumeSessionId || newSessionId(),
         logs: [],
@@ -846,7 +887,7 @@ function apply(ctx, config) {
         sessionId: run.sessionId,
         provider: run.provider,
         model: run.model,
-        effort: run.effort,
+        sandbox: run.sandbox,
       });
       return;
     }
@@ -868,7 +909,7 @@ function apply(ctx, config) {
         sessionId: run.sessionId,
         provider: run.provider,
         model: run.model,
-        effort: run.effort,
+        sandbox: run.sandbox,
         cursor: from + slice.length,
         logs: slice,
         text: run.phase === "finished" ? run.text : "",
