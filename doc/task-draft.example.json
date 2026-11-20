@@ -11,21 +11,12 @@
     "base_ref": "dev"
   },
   "requirement": "GET /api/orders 的响应 body 增加 status 字段。\n\n- 类型：string\n- 取值：OPEN | PAID | CANCELLED\n- 历史订单按 created_at 与 paid_at 推导，不回填数据库\n- 分页接口与单条接口必须一致\n- 未支付且已取消的订单返回 CANCELLED\n\n边界：status 缺失时前端按 OPEN 处理，但后端不得返回 null。",
+  "scope_profile": "application",
   "scope": {
     "out_of_scope": [
       "不改鉴权与租户隔离",
       "不改订单金额与优惠计算",
       "不新增数据库列（先按现有字段推导）"
-    ],
-    "allowed_paths": [
-      "src/orders/**",
-      "tests/orders/**"
-    ],
-    "forbidden_paths": [
-      ".github/**",
-      "infra/prod/**",
-      "**/migrations/**",
-      "**/auth/**"
     ]
   },
   "acceptance": {

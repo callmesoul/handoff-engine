@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from .errors import ConfigError
+from .pathgate import compile_glob
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -117,6 +118,21 @@ class StoreConfig:
 
 
 @dataclass(frozen=True)
+class ScopeProfileConfig:
+    """仓库拥有者维护的一组语义 scope；任务只保存解析后的路径。"""
+
+    allowed_paths: tuple[str, ...]
+    forbidden_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RepoScopeConfig:
+    default_profile: str
+    profiles: dict[str, ScopeProfileConfig]
+    forbidden_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     id: str
     role: str
@@ -126,6 +142,7 @@ class RepoConfig:
     pr_base_ref: str | None = None
     cache_dir: str | None = None
     remote: str | None = None
+    scope: RepoScopeConfig | None = None
 
     @property
     def remote_url(self) -> str:
@@ -133,6 +150,101 @@ class RepoConfig:
 
     def cache_path(self, root: Path) -> Path:
         return _resolve(root, self.cache_dir) or (root / ".handoff-run" / "repo-cache" / self.id.replace("/", "__"))
+
+
+_SCOPE_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _scope_globs(value, *, where: str, required: bool = False) -> tuple[str, ...]:
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        raise ConfigError(f"{where} 必须是 glob 字符串数组")
+    if required and not value:
+        raise ConfigError(f"{where} 至少要有一条路径")
+    if len(value) > 200:
+        raise ConfigError(f"{where} 最多允许 200 条路径")
+
+    result: list[str] = []
+    for index, pattern in enumerate(value):
+        if not isinstance(pattern, str) or not pattern:
+            raise ConfigError(f"{where}[{index}] 必须是非空字符串")
+        if len(pattern) > 500:
+            raise ConfigError(f"{where}[{index}] 最长 500 个字符")
+        try:
+            compile_glob(pattern)
+        except ValueError as exc:
+            raise ConfigError(f"{where}[{index}] 非法: {exc}") from exc
+        if pattern in result:
+            raise ConfigError(f"{where} 包含重复规则 {pattern!r}")
+        result.append(pattern)
+    return tuple(result)
+
+
+def _repo_scope(raw, *, repo_id: str) -> RepoScopeConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"repositories.yaml: {repo_id}.scope 必须是对象")
+    unknown = set(raw) - {"default_profile", "forbidden_paths", "profiles"}
+    if unknown:
+        raise ConfigError(
+            f"repositories.yaml: {repo_id}.scope 有未知键: {', '.join(sorted(unknown))}"
+        )
+
+    raw_profiles = raw.get("profiles")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        raise ConfigError(f"repositories.yaml: {repo_id}.scope.profiles 至少要配置一个 profile")
+    repo_forbidden = _scope_globs(
+        raw.get("forbidden_paths"),
+        where=f"repositories.yaml: {repo_id}.scope.forbidden_paths",
+    )
+
+    profiles: dict[str, ScopeProfileConfig] = {}
+    for name, spec in raw_profiles.items():
+        if not isinstance(name, str) or not _SCOPE_PROFILE_RE.fullmatch(name):
+            raise ConfigError(
+                f"repositories.yaml: {repo_id}.scope profile 名 {name!r} 非法；"
+                "只允许字母、数字、点、下划线和连字符"
+            )
+        if not isinstance(spec, dict):
+            raise ConfigError(f"repositories.yaml: {repo_id}.scope.profiles.{name} 必须是对象")
+        profile_unknown = set(spec) - {"allowed_paths", "forbidden_paths"}
+        if profile_unknown:
+            raise ConfigError(
+                f"repositories.yaml: {repo_id}.scope.profiles.{name} 有未知键: "
+                f"{', '.join(sorted(profile_unknown))}"
+            )
+        profile = ScopeProfileConfig(
+            allowed_paths=_scope_globs(
+                spec.get("allowed_paths"),
+                where=f"repositories.yaml: {repo_id}.scope.profiles.{name}.allowed_paths",
+                required=True,
+            ),
+            forbidden_paths=_scope_globs(
+                spec.get("forbidden_paths"),
+                where=f"repositories.yaml: {repo_id}.scope.profiles.{name}.forbidden_paths",
+            ),
+        )
+        effective_forbidden = set(repo_forbidden) | set(profile.forbidden_paths)
+        if len(effective_forbidden) > 200:
+            raise ConfigError(
+                f"repositories.yaml: {repo_id}.scope.profiles.{name} 合并仓库禁区后最多 200 条"
+            )
+        profiles[name] = profile
+
+    default_profile = raw.get("default_profile")
+    if not isinstance(default_profile, str) or not default_profile:
+        raise ConfigError(f"repositories.yaml: {repo_id}.scope.default_profile 不能为空")
+    if default_profile not in profiles:
+        raise ConfigError(
+            f"repositories.yaml: {repo_id}.scope.default_profile {default_profile!r} 不在 profiles 中"
+        )
+    return RepoScopeConfig(
+        default_profile=default_profile,
+        profiles=profiles,
+        forbidden_paths=repo_forbidden,
+    )
 
 
 @dataclass(frozen=True)
@@ -507,6 +619,7 @@ class Config:
                 pr_base_ref=item.get("pr_base_ref") or (allowed[0] if allowed else None),
                 cache_dir=item.get("cache_dir"),
                 remote=item.get("remote"),
+                scope=_repo_scope(item.get("scope"), repo_id=item["id"]),
             )
             if repo.role not in ("backend", "frontend"):
                 raise ConfigError(f"{repo.id}: role 必须是 backend/frontend")

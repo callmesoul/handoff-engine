@@ -152,12 +152,49 @@ repositories:
     pr_base_ref: dev
     remote: git@github.com:your-org/api.git
     cache_dir: .handoff-run/repo-cache/your-org__api
+    scope:
+      default_profile: application
+      forbidden_paths:              # 所有 profile 都不能修改
+        - ".github/**"
+        - "infra/prod/**"
+        - "**/auth/**"
+      profiles:                      # 前端只选语义 profile，不填写后端路径
+        application:
+          allowed_paths:
+            - "router/**"
+            - "controller/**"
+            - "service/**"
+            - "model/**"
+            - "internal/**"
+            - "pkg/**"
+            - "openapi/**"
+            - "tests/**"
+            - "docs/**"
+        migration:                   # 普通代码范围 + 迁移目录；必须显式选择
+          allowed_paths:
+            - "router/**"
+            - "controller/**"
+            - "service/**"
+            - "model/**"
+            - "internal/**"
+            - "pkg/**"
+            - "openapi/**"
+            - "tests/**"
+            - "docs/**"
+            - "migrations/**"
   - id: your-org/web
     role: frontend
     host: github
     allowed_base_refs: [dev]
     remote: git@github.com:your-org/web.git
 ```
+
+`scope` 是后端仓库拥有者维护的路径模板：
+
+- 新任务创建时按 `default_profile`（或调用方选择的 profile）解析，并把最终路径固化进任务 JSON；模板以后变化不会回写旧任务。
+- 没有 `scope`、默认 profile 不存在、`allowed_paths` 为空或 glob 非法时，创建任务直接失败；不会回退到 `**`。
+- 仓库级 `forbidden_paths` 会与 profile 自己的禁区合并，profile 不能移除仓库级禁区。
+- `gate.high_risk_paths` 只阻止自动合并，不等于这里的 `forbidden_paths`。
 
 `codex.yaml`：无人值守常见组合
 

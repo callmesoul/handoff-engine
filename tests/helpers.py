@@ -166,7 +166,7 @@ def write_config(
 
 
 def repo_entry(repo_id: str, role: str, remote: Path, cache_dir: str | None = None, host: str = "github") -> dict:
-    return {
+    entry = {
         "id": repo_id,
         "role": role,
         "host": host,
@@ -176,6 +176,17 @@ def repo_entry(repo_id: str, role: str, remote: Path, cache_dir: str | None = No
         "remote": str(remote),
         "cache_dir": cache_dir or f".handoff-run/repo-cache/{repo_id.replace('/', '__')}",
     }
+    if role == "backend":
+        entry["scope"] = {
+            "default_profile": "application",
+            "forbidden_paths": [".github/**", "infra/prod/**"],
+            "profiles": {
+                "application": {
+                    "allowed_paths": ["src/**", "tests/**"],
+                }
+            },
+        }
+    return entry
 
 
 def make_task(

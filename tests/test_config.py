@@ -175,3 +175,49 @@ def test_local_notification_paths_are_exact(tmp_path):
         local.write_text(yaml.safe_dump({"notifications": patch}), encoding="utf-8")
         with pytest.raises(ConfigError):
             Config.load(work)
+
+
+def test_repo_scope_profiles_are_loaded(tmp_path):
+    work, config = build(tmp_path)
+    scope = config.repo("org/api").scope
+    assert scope is not None
+    assert scope.default_profile == "application"
+    assert scope.profiles["application"].allowed_paths == ("src/**", "tests/**")
+    assert scope.forbidden_paths == (".github/**", "infra/prod/**")
+
+
+@pytest.mark.parametrize(
+    "scope,match",
+    [
+        ({"default_profile": "application", "profiles": {}}, "至少要配置一个"),
+        (
+            {
+                "default_profile": "missing",
+                "profiles": {"application": {"allowed_paths": ["src/**"]}},
+            },
+            "不在 profiles 中",
+        ),
+        (
+            {
+                "default_profile": "application",
+                "profiles": {"application": {"allowed_paths": ["../src/**"]}},
+            },
+            "非法",
+        ),
+        (
+            {
+                "default_profile": "application",
+                "profiles": {"application": {"allowed_paths": []}},
+            },
+            "至少要有一条",
+        ),
+    ],
+)
+def test_repo_scope_profiles_fail_closed_on_invalid_config(tmp_path, scope, match):
+    work, _config = build(tmp_path)
+    path = work / "config" / "repositories.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["repositories"][0]["scope"] = scope
+    path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ConfigError, match=match):
+        Config.load(work)

@@ -17,6 +17,29 @@ repositories:
     pr_base_ref: develop
     remote: git@github.com:your-org/api.git
     cache_dir: .handoff-run/repo-cache/your-org__api
+    # 路径由后端仓库拥有者集中维护；前端发单只选择语义 profile。
+    scope:
+      default_profile: application
+      forbidden_paths:
+        - ".github/**"
+        - "infra/prod/**"
+        - "**/auth/**"
+      profiles:
+        application:
+          allowed_paths:
+            - "src/**"
+            - "tests/**"
+            - "openapi/**"
+            - "docs/**"
+        migration:
+          allowed_paths:
+            - "src/**"
+            - "tests/**"
+            - "openapi/**"
+            - "docs/**"
+            - "migrations/**"
+          forbidden_paths:
+            - "**/auth/**"
 
   - id: your-org/web
     role: frontend

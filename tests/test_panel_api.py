@@ -385,7 +385,8 @@ def test_create_task_from_panel(env):
             "repo": "org/api",
             "base_ref": "dev",
             "requirement": "新增 /healthz 返回 200",
-            "allowed_paths": "src/**\ntests/**",
+            "scope_profile": "application",
+            "out_of_scope": "不改鉴权\n不改部署配置",
         },
     )
     assert status == 200, body
@@ -394,7 +395,37 @@ def test_create_task_from_panel(env):
     assert created["target"]["repo"] == "org/api"
     assert created["target"]["base_ref"] == "dev"
     assert created["scope"]["allowed_paths"] == ["src/**", "tests/**"]
+    assert created["scope"]["forbidden_paths"] == [".github/**", "infra/prod/**"]
+    assert created["scope"]["out_of_scope"] == ["不改鉴权", "不改部署配置"]
     assert created["acceptance"]["environment"] == "dev"
+
+
+def test_create_task_rejects_raw_path_scope(env):
+    status, body = _post(
+        f"{env.base_url}/api/tasks",
+        {
+            "title": "不允许前端传路径",
+            "repo": "org/api",
+            "requirement": "新增 /healthz 返回 200",
+            "allowed_paths": "**",
+        },
+    )
+    assert status == 400
+    assert "scope 模板" in body.get("message", body.get("error", ""))
+
+
+def test_create_task_rejects_unknown_scope_profile(env):
+    status, body = _post(
+        f"{env.base_url}/api/tasks",
+        {
+            "title": "未知路径模板",
+            "repo": "org/api",
+            "requirement": "新增 /healthz 返回 200",
+            "scope_profile": "does-not-exist",
+        },
+    )
+    assert status == 400
+    assert "does-not-exist" in body.get("message", body.get("error", ""))
 
 
 def test_create_task_rejects_unknown_or_wrong_role(env):

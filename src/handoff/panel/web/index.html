@@ -401,12 +401,14 @@
         <textarea id="nt-requirement" rows="6" placeholder="要做什么、验收标准、不要碰什么…"></textarea>
       </div>
       <div class="form-row">
-        <label>允许改动的路径（每行一个 glob）</label>
-        <textarea id="nt-allowed" rows="3">**</textarea>
+        <label>后端路径模板</label>
+        <select id="nt-scope-profile" style="width:100%"></select>
+        <div class="hint">路径由目标仓库维护；任务创建时固化，前端无需填写目录。</div>
+        <div class="pre" id="nt-scope-preview" style="margin-top:8px;max-height:150px;overflow:auto"></div>
       </div>
       <div class="form-row">
-        <label>禁止改动的路径（每行一个，可留空）</label>
-        <textarea id="nt-forbidden" rows="2">.github/**</textarea>
+        <label>不在本任务范围内的事项（每行一项，可留空）</label>
+        <textarea id="nt-out-of-scope" rows="3" placeholder="例：不改鉴权与租户隔离"></textarea>
       </div>
       <div class="form-row">
         <label>验收环境</label>
@@ -937,10 +939,10 @@ function openNewTaskModal() {
   $("nt-env").innerHTML = (envs.length ? envs : ["dev"]).map(e => `<option>${esc(e)}</option>`).join("");
   $("nt-title").value = "";
   $("nt-requirement").value = "";
-  $("nt-allowed").value = "**";
-  $("nt-forbidden").value = ".github/**";
+  $("nt-out-of-scope").value = "";
   $("nt-source-sha").value = "";
   renderBaseRefs();
+  renderScopeProfiles();
   $("new-modal").classList.add("show");
   $("nt-title").focus();
 }
@@ -952,20 +954,46 @@ function renderBaseRefs() {
   $("nt-base-ref").innerHTML = refs.map(r => `<option>${esc(r)}</option>`).join("");
 }
 
+function renderScopeProfiles() {
+  const proj = currentProject($("nt-repo").value);
+  const profiles = (proj && proj.scope_profiles) || [];
+  const select = $("nt-scope-profile");
+  select.innerHTML = profiles.length
+    ? profiles.map(p => `<option value="${esc(p.name)}"${p.default ? " selected" : ""}>${esc(p.name)}${p.default ? "（默认）" : ""}</option>`).join("")
+    : '<option value="">未配置</option>';
+  select.disabled = !profiles.length;
+  renderScopePreview();
+}
+
+function renderScopePreview() {
+  const proj = currentProject($("nt-repo").value);
+  const profiles = (proj && proj.scope_profiles) || [];
+  const selected = profiles.find(p => p.name === $("nt-scope-profile").value);
+  const preview = $("nt-scope-preview");
+  if (!selected) {
+    preview.textContent = "目标仓库尚未配置 scope，无法创建任务。";
+    return;
+  }
+  const allowed = (selected.allowed_paths || []).map(p => `  ${p}`).join("\n");
+  const forbidden = (selected.forbidden_paths || []).map(p => `  ${p}`).join("\n") || "  （无）";
+  preview.textContent = `允许：\n${allowed}\n\n禁止：\n${forbidden}`;
+}
+
 async function submitNewTask() {
   const body = {
     title: $("nt-title").value.trim(),
     repo: $("nt-repo").value,
     base_ref: $("nt-base-ref").value,
     requirement: $("nt-requirement").value.trim(),
-    allowed_paths: $("nt-allowed").value,
-    forbidden_paths: $("nt-forbidden").value,
+    scope_profile: $("nt-scope-profile").value,
+    out_of_scope: $("nt-out-of-scope").value,
     environment: $("nt-env").value,
     source_repo: $("nt-source-repo").value,
     source_sha: $("nt-source-sha").value.trim(),
   };
   if (!body.title) { toast("先写标题", true); return; }
   if (!body.requirement) { toast("先写需求正文", true); return; }
+  if (!body.scope_profile) { toast("目标仓库尚未配置 scope，不能创建任务", true); return; }
   const btn = $("nt-go");
   btn.disabled = true;
   btn.textContent = "创建中…";
@@ -1365,7 +1393,8 @@ $("btn-sync").addEventListener("click", syncTasks);
 $("btn-new-task").addEventListener("click", openNewTaskModal);
 $("nt-cancel").addEventListener("click", () => $("new-modal").classList.remove("show"));
 $("nt-go").addEventListener("click", submitNewTask);
-$("nt-repo").addEventListener("change", renderBaseRefs);
+$("nt-repo").addEventListener("change", () => { renderBaseRefs(); renderScopeProfiles(); });
+$("nt-scope-profile").addEventListener("change", renderScopePreview);
 $("rm-workdir-mode").addEventListener("change", syncWorkdirUi);
 $("rm-autocommit").addEventListener("change", syncWorkdirUi);
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });

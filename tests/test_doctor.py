@@ -26,12 +26,25 @@ def test_doctor_reports_ready_environment(tmp_path):
     assert by_name["store:clean"].status == doctor.OK
     assert by_name["store:remote"].status == doctor.OK
     assert by_name["repo:org/api"].status == doctor.OK
+    assert by_name["repo:org/api:scope"].status == doctor.OK
     assert by_name["repo:org/web"].status == doctor.OK
     assert by_name["env:dev"].status == doctor.OK
 
     summary = doctor.summarize(checks)
     assert summary["ok"] is True
     assert summary["failed"] == 0
+
+
+def test_doctor_fails_when_backend_scope_template_is_missing(tmp_path):
+    work, _bare = make_store_repo(tmp_path)
+    backend = make_bare_remote(tmp_path, "api", {"src/a.txt": "a\n"})
+    entry = repo_entry("org/api", "backend", backend)
+    entry.pop("scope")
+    write_config(work, repos=[entry])
+
+    checks = {check.name: check for check in doctor.run(Config.load(work), role="backend")}
+    assert checks["repo:org/api:scope"].status == doctor.FAIL
+    assert "新任务会 fail closed" in checks["repo:org/api:scope"].detail
 
 
 def test_doctor_flags_unreachable_remote(tmp_path):

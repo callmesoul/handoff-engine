@@ -156,6 +156,23 @@ def _repo_checks(config: Config, role: str | None = None) -> list[Check]:
     for repo_id, repo in config.repositories.items():
         if role is not None and repo.role != role:
             continue
+        if repo.role == "backend":
+            if repo.scope is None:
+                checks.append(
+                    Check(
+                        f"repo:{repo_id}:scope",
+                        FAIL,
+                        "未配置 scope 模板；新任务会 fail closed，请在 config/repositories.yaml 中配置",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        f"repo:{repo_id}:scope",
+                        OK,
+                        f"默认 profile {repo.scope.default_profile} · {len(repo.scope.profiles)} 个 profiles",
+                    )
+                )
         listing = git(".", "ls-remote", "--heads", repo.remote_url, timeout=30)
         if not listing.ok:
             first = (listing.stderr or listing.stdout).strip().splitlines()

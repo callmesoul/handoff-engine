@@ -36,6 +36,7 @@ from ..config import Config
 from ..errors import ConfigError, ConflictError, ExecutionError, HandoffError, SchemaError
 from ..frontend_session import FrontendSessions
 from ..gitcmd import git, git_out
+from ..scope import profile_options, resolve_scope
 from ..store import Actor, TaskStore
 from ..timeutil import iso, now, parse
 from ..worker import Worker, WorkerOptions
@@ -368,6 +369,7 @@ class PanelService:
                     "base_refs": list(repo.allowed_base_refs or ()),
                     "default_branch": repo.default_branch,
                     "local_path": str(local) if local else None,
+                    "scope_profiles": profile_options(repo),
                 }
             )
         return out
@@ -1393,6 +1395,15 @@ class PanelService:
             # 没有前端提交时用目标仓库占位，保证 schema/语义校验都能过
             source = {"role": repo.role, "repo": repo_id, "commit_sha": source_sha}
 
+        if _path_list(payload.get("allowed_paths")) or _path_list(payload.get("forbidden_paths")):
+            raise SchemaError("路径范围由后端仓库的 scope 模板管理；请提交 scope_profile 和语义边界")
+        scope_profile = str(payload.get("scope_profile") or "").strip() or None
+        resolved_scope = resolve_scope(
+            repo,
+            profile_name=scope_profile,
+            out_of_scope=_path_list(payload.get("out_of_scope")),
+        )
+
         task = {
             "schema_version": 1,
             "id": ids.task_id(),
@@ -1404,11 +1415,7 @@ class PanelService:
             "requirement": requirement,
             "contract": None,
             "repro": None,
-            "scope": {
-                "out_of_scope": _path_list(payload.get("out_of_scope")),
-                "allowed_paths": _path_list(payload.get("allowed_paths")) or ["**"],
-                "forbidden_paths": _path_list(payload.get("forbidden_paths")),
-            },
+            "scope": resolved_scope,
             "acceptance": {"environment": environment, "checks": []},
             "migration": {
                 "required": False,

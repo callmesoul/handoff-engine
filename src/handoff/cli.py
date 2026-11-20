@@ -25,6 +25,7 @@ from .errors import ConfigError, ExecutionError, HandoffError, SchemaError
 from .frontend_session import FrontendDispatcher, FrontendSessions
 from .gitcmd import git, resolve_remote_ref, run
 from .sanitize import clean
+from .scope import resolve_scope
 from .store import Actor, TaskStore
 from .timeutil import iso
 from .verifier import Verifier, summarize
@@ -273,6 +274,22 @@ def cmd_create(args, config: Config) -> dict:
     # 前端无权选择后端基线；兼容旧草稿，但由 worker 认领时重新固定。
     target = draft.get("target") or {}
     target.pop("base_sha", None)
+
+    # 路径知识属于目标仓库。旧草稿中的 raw glob 不再生效，只保留语义边界；
+    # 创建时把后端配置的 profile 解析并固化到任务单，后续配置变化不影响该任务。
+    target_repo_id = str(target.get("repo") or "")
+    target_repo = config.repositories.get(target_repo_id)
+    if target_repo is None:
+        raise SchemaError(f"目标项目未注册: {target_repo_id!r}")
+    draft_scope = draft.get("scope") or {}
+    if not isinstance(draft_scope, dict):
+        raise SchemaError("scope 必须是对象")
+    profile_name = draft.pop("scope_profile", None)
+    draft["scope"] = resolve_scope(
+        target_repo,
+        profile_name=profile_name,
+        out_of_scope=draft_scope.get("out_of_scope") or [],
+    )
 
     draft["id"] = task_id
     draft.setdefault("repro", None)

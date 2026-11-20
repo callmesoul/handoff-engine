@@ -94,6 +94,9 @@ def test_create_overrides_stale_draft_repo(tmp_path):
     assert saved["source"]["repo"] == "org/web-a"
     assert saved["source"]["commit_sha"] == git(clone_a, "rev-parse", "HEAD")
     assert "base_sha" not in saved["target"]
+    # 旧草稿里的 raw glob 不再决定后端路径，创建时统一固化仓库默认 profile。
+    assert saved["scope"]["allowed_paths"] == ["src/**", "tests/**"]
+    assert saved["scope"]["forbidden_paths"] == [".github/**", "infra/prod/**"]
     assert schema.errors_for("task", saved) == []
 
 

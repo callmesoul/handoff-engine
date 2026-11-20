@@ -60,7 +60,7 @@ git init -b main
 
 至少需要：
 
-- `config/repositories.yaml`：交接仓及业务仓、角色、基础分支和远端
+- `config/repositories.yaml`：交接仓及业务仓、角色、基础分支、远端，以及后端仓库的 scope profiles
 - `config/environments.yaml`：验收环境与版本接口
 - `config/checks.yaml`：允许执行的检查与确定性 gate
 - `config/admin.yaml`：索引/API 配置（示例 token 必须替换）
@@ -102,6 +102,7 @@ handoffctl --root "$HANDOFF_ROOT" admin index
 - [`doc/DEPLOY-BACKEND.md`](doc/DEPLOY-BACKEND.md)
 - [`doc/DEPLOY-FRONTEND.md`](doc/DEPLOY-FRONTEND.md)
 - [`doc/AUTO-UPDATE.md`](doc/AUTO-UPDATE.md)
+- [`doc/SCOPE-TEMPLATES-UPGRADE.md`](doc/SCOPE-TEMPLATES-UPGRADE.md)
 
 ## 本地验证
 
