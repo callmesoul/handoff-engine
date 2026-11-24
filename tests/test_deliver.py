@@ -122,3 +122,82 @@ def test_deliver_end_to_end_accepts_newer_stable_dev_version(tmp_path, monkeypat
         assert "verification.completed" in types
     finally:
         httpd.shutdown()
+
+
+def test_record_result_unblocks_a_manually_committed_direct_delivery(tmp_path):
+    """目录模式人工提交后，record-result 把 head_sha 写回去，deliver 才能对部署。
+
+    回归：目录模式默认不提交，人提交完却没有受支持的入口回填 sha，任务卡在
+    delivered，「恢复推进」只会回一句「任务缺少 merge_sha/head_sha」。
+    """
+    work, _bare = make_store_repo(tmp_path)
+    backend = make_bare_remote(tmp_path, "api2", {"src/orders/Order.java": "class Order {}\n"})
+    write_config(
+        work,
+        repos=[repo_entry("org/api", "backend", backend), repo_entry("org/web", "frontend", backend)],
+    )
+    config = Config.load(work)
+    store = TaskStore(work, config, actor=Actor("worker", "w1"))
+    task = make_task(ids.task_id(), base_sha=git(backend, "rev-parse", "dev"), checks=[])
+    store.create(task)
+
+    # 目录模式的典型产物：改动在用户工作副本里，任务单没有任何 sha
+    head = "a" * 40
+    store.update(
+        task["id"],
+        expected_revision=task["revision"],
+        mutate=lambda t: (
+            t.__setitem__("status", "delivered"),
+            t["result"].update({"worktree": str(tmp_path), "notes": "直接目录模式"}),
+        ),
+        event_type="task.status_changed",
+        summary="直接目录模式交付",
+    )
+    before = store.get(task["id"])
+    assert before["status"] == "delivered"
+    assert not before["result"]["head_sha"]
+
+    code = cli_main(
+        [
+            "--root",
+            str(work),
+            "record-result",
+            task["id"],
+            "--head-sha",
+            head,
+            "--branch",
+            "develop",
+        ]
+    )
+    assert code == 0
+
+    after = store.get(task["id"])
+    assert after["result"]["head_sha"] == head
+    assert after["result"]["branch"] == "develop"
+    # 只回填交付事实，不替人推进状态
+    assert after["status"] == "delivered"
+
+    events = [json.loads(p.read_text(encoding="utf-8")) for p in (work / "events" / task["id"]).glob("*.json")]
+    assert any(e["type"] == "audit.correction_recorded" for e in events)
+
+
+def test_record_result_rejects_a_malformed_sha(tmp_path):
+    """写坏 sha 会让部署永远对不上，宁可在入口就拒绝。"""
+    work, _bare = make_store_repo(tmp_path)
+    backend = make_bare_remote(tmp_path, "api3", {"src/orders/Order.java": "class Order {}\n"})
+    write_config(
+        work,
+        repos=[repo_entry("org/api", "backend", backend), repo_entry("org/web", "frontend", backend)],
+    )
+    config = Config.load(work)
+    store = TaskStore(work, config, actor=Actor("worker", "w1"))
+    task = make_task(ids.task_id(), base_sha=git(backend, "rev-parse", "dev"), checks=[])
+    store.create(task)
+
+    # cli_main 把错误转成返回码（schema_error = 3），不往上抛
+    for bad in ("abc", "z" * 40):
+        code = cli_main(["--root", str(work), "record-result", task["id"], "--head-sha", bad])
+        assert code == 3, f"{bad!r} 应当以 schema_error 拒绝，实际返回 {code}"
+    # 拒绝之后任务单不能被写脏
+    assert not store.get(task["id"])["result"]["head_sha"]
+

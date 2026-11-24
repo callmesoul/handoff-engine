@@ -962,6 +962,26 @@
             }
           ]
         },
+        "retryable": {
+          "type": "boolean",
+          "description": "该失败是否属于「过一会儿重试就可能好」的类别（额度用尽、限流、服务端故障）。"
+        },
+        "retry_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "计划重新入队的时刻；retryable 为 true 且未超过重试上限时才写入。"
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "本任务因可重试失败自动重新入队的次数。"
+        },
         "at": {
           "$ref": "#/$defs/timestamp"
         }

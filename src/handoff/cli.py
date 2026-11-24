@@ -72,11 +72,14 @@ def resolve_id_placeholders(task_id: str, task: dict) -> None:
 
     1. 把 `contracts/<id>/` 占位写成真实任务 id 路径。任务 id 在 create/amend
        时才生成，草稿里只能写 `<id>` 占位（见 doc/task-draft.example.json）。
-    2. openapi_diff 的 `actual_url` 若是裸的 `{base_url}/openapi.json`（该端点
-       404），改成带 apikey 的 `{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}`。
-       只规范化这个精确值，不碰调用方显式写的其它地址。
+    2. openapi_diff 的 `actual_url` 若指向 OpenAPI 却没带 apikey（裸
+       `{base_url}/openapi.json` 会 404，`{base_url}/docs/openapi.json` 会 401），
+       改成带 apikey 的 `{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}`。
+       只规范化这两个精确值，不碰调用方显式写的其它地址或已经带 key 的 URL。
     """
     canonical_openapi = "{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}"
+    # 这两个地址都需要补 apikey：裸路径 404，docs 路径 401。
+    openapi_without_key = ("{base_url}/openapi.json", "{base_url}/docs/openapi.json")
 
     def fix(value):
         return value.replace("<id>", task_id) if isinstance(value, str) else value
@@ -90,7 +93,10 @@ def resolve_id_placeholders(task_id: str, task: dict) -> None:
             continue
         if isinstance(check.get("expected_path"), str):
             check["expected_path"] = fix(check["expected_path"])
-        if check.get("type") == "openapi_diff" and check.get("actual_url") == "{base_url}/openapi.json":
+        if (
+            check.get("type") == "openapi_diff"
+            and check.get("actual_url") in openapi_without_key
+        ):
             check["actual_url"] = canonical_openapi
     repro = task.get("repro") or {}
     for att in repro.get("attachments") or []:
@@ -484,6 +490,70 @@ def cmd_transition(args, config: Config) -> dict:
         actor=Actor("user", args.actor or "cli"),
     )
     return _task_brief(updated)
+
+
+def cmd_record_result(args, config: Config) -> dict:
+    """回填目录模式下人工提交后的交付结果（head_sha / branch）。
+
+    为什么需要这条命令：目录模式（`work_dir`）默认不提交、不推送，改动留在用户
+    自己的工作副本里，由人 review 后自行提交。但 `result.head_sha` 是后续所有
+    环节的前置条件——`cmd_deliver` 要拿它对部署版本，「恢复推进」也要它才肯往下
+    走（没有就报「任务缺少 merge_sha/head_sha，无法对齐部署」）。人提交完却没有
+    受支持的入口把 sha 写回任务单，任务就永久卡在 delivered。
+
+    这条命令就是那个入口：只写 result 里的交付事实，不动 requirement /
+    acceptance / 状态；状态推进仍然由 transition / deliver / advance 决定。
+    """
+    store = TaskStore(config.root, config, push=not args.no_push)
+    task = store.get(args.task_id)
+    expected = args.expected_revision if args.expected_revision is not None else task["revision"]
+
+    head_sha = (args.head_sha or "").strip()
+    if head_sha and (len(head_sha) != 40 or any(c not in "0123456789abcdef" for c in head_sha.lower())):
+        raise SchemaError(f"--head-sha 必须是 40 位十六进制提交，得到 {head_sha!r}")
+    if not head_sha and not args.branch:
+        raise SchemaError("至少要给 --head-sha 或 --branch")
+
+    status = task["status"]
+    allowed = ("delivered", "awaiting_merge", "merged", "deployed", "verifying", "failed")
+    if status not in allowed:
+        raise SchemaError(
+            f"状态 {status} 不接受交付结果回填（仅 {', '.join(allowed)}）", errors=[f"当前状态: {status}"]
+        )
+
+    def mutate(t: dict) -> None:
+        result = t.setdefault("result", dict(EMPTY_RESULT))
+        if head_sha:
+            result["head_sha"] = head_sha
+        if args.branch:
+            result["branch"] = args.branch.strip()
+        notes = clean(args.note or "", 3600)
+        if notes:
+            result["notes"] = notes
+        elif not result.get("notes"):
+            result["notes"] = "目录模式：人工提交后回填交付结果"
+
+    updated = store.update(
+        args.task_id,
+        expected_revision=expected,
+        mutate=mutate,
+        # 复用既有的审计修正类型：这就是「人把任务单里缺的事实补上」，
+        # 没必要为它新增一个 schema 枚举值去扩大契约面。
+        event_type="audit.correction_recorded",
+        summary=args.reason
+        or f"回填交付结果：head_sha={head_sha[:12] or '-'} branch={args.branch or '-'}",
+        actor=Actor("user", args.actor or "cli"),
+        metadata={"head_sha": head_sha, "branch": args.branch},
+    )
+    return {
+        "id": updated["id"],
+        "status": updated["status"],
+        "revision": updated["revision"],
+        "result": {
+            "branch": (updated.get("result") or {}).get("branch"),
+            "head_sha": (updated.get("result") or {}).get("head_sha"),
+        },
+    }
 
 
 def cmd_amend(args, config: Config) -> dict:
@@ -1341,6 +1411,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--actor", default="cli")
     p.add_argument("--no-push", action="store_true")
     p.set_defaults(func=cmd_transition)
+
+    p = _sub("record-result", help="回填目录模式人工提交后的 head_sha / branch")
+    p.add_argument("task_id")
+    p.add_argument("--head-sha", help="已推送的提交（40 位十六进制）")
+    p.add_argument("--branch", help="提交所在分支（如 develop）")
+    p.add_argument("--note", help="写进 result.notes 的说明")
+    p.add_argument("--reason", help="事件摘要")
+    p.add_argument("--expected-revision", type=int)
+    p.add_argument("--actor", default="cli")
+    p.add_argument("--no-push", action="store_true")
+    p.set_defaults(func=cmd_record_result)
 
     p = _sub("amend", help="受控修订 verification 失败任务的验收契约")
     p.add_argument("task_id")

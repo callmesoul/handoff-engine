@@ -181,6 +181,25 @@ window.__ModuleLoader__.load({
       ".hs-checks{display:flex;gap:16px;flex-wrap:wrap;}",
       ".hs-checks label{display:flex;align-items:center;gap:6px;cursor:pointer;",
       "color:var(--dsw-alias-label-primary);font-size:12.5px;margin:0;}",
+      // 候选模型链：每行一条，顺序即优先级。模型名占满剩余宽度，档位和按钮定宽，
+      // 这样几行的列能对齐——不对齐的话「第几个」根本扫不出来。
+      //
+      // 宽度必须带 `.hs-formrow` 前缀：通用规则 `.hs-formrow .hs-select{width:100%}`
+      // 的优先级是 (0,2,0)，只写 `.hs-fb-effort`（(0,1,0)）根本盖不住。盖不住的
+      // 后果不是「档位宽一点」，而是同一行两个 100% 宽的下拉互相挤爆——档位吃掉
+      // 整行、模型被压成一条缝，右边的上移/下移/删除直接被推出弹窗看不见。
+      ".hs-fb{display:flex;flex-direction:column;gap:6px;}",
+      ".hs-fb-row{display:flex;align-items:center;gap:6px;}",
+      ".hs-fb-idx{width:18px;flex:0 0 auto;text-align:right;",
+      "color:var(--dsw-alias-label-secondary);font-size:11.5px;}",
+      ".hs-formrow .hs-fb .hs-fb-model{flex:1 1 auto;min-width:0;width:auto;}",
+      ".hs-formrow .hs-fb .hs-fb-effort{width:120px;flex:0 0 auto;}",
+      // 行内按钮不参与收缩：它们是定宽图标，被压扁就点不中了。
+      ".hs-fb-row .hs-btn{flex:0 0 auto;}",
+      ".hs-fb-warn{color:var(--dsw-alias-state-warn-primary);font-size:11px;",
+      "white-space:nowrap;flex:0 0 auto;}",
+      // 「加一个」是整块的操作入口，不该被拉成整行宽（看起来像又一个下拉）。
+      ".hs-fb-add{width:auto;align-self:flex-start;}",
       ".hs-sesslist{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;",
       "max-height:260px;overflow:auto;}",
       ".hs-sess{padding:7px 11px;border-bottom:1px solid var(--dsw-alias-border-l1);",
@@ -322,6 +341,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 顶栏「通知」按键的文案。
+     *
+     * 三件事必须一眼看出来：投递线程还在不在跑（✗ 表示没在跑）、还欠几条没发出去、
+     * 有多少是水位之前的历史积压（那些不会自动重发，得人工处理）。
+     *
+     * 为什么要把这个状态摆到顶栏：完成通知是两段式的（store 只写 outbox，投递由
+     * 常驻线程负责）。少了那一段时，任务会显示 verified 而前端什么都没收到，
+     * 界面上没有任何地方能看出「还欠一条通知」。
+     */
+    function pumpLabel(pump) {
+      if (!pump) return "";
+      var text =
+        "通知 " +
+        (pump.running ? "" : "✗ ") +
+        "pending " +
+        (pump.pending == null ? "?" : pump.pending);
+      if (pump.stale) text += "（历史 " + pump.stale + "）";
+      return text;
+    }
+
+    /**
      * 隔离模式选择器。
      *
      * 引擎里没有独立的「隔离」字段：隔离与否完全由 work_dir 是否为空决定
@@ -424,8 +464,9 @@ window.__ModuleLoader__.load({
      *   隔离模式   → 改动落在哪个目录（worktree 还是指定目录），是**位置**问题
      *   访问权限   → agent 在该目录里能读能写多少，是**权限**问题
      *
-     * dsh 的通路是往 Agent 所属 session 追加 sandbox/mode 事件；codex 走
-     * --sandbox 参数。所以这里只负责选值，落盘由各执行器自己实现。
+     * dsh 的通路是让宿主的权限服务切换预设（它一次写沙箱档位 + 审批策略，
+     * 和用户在 DSH 界面点那一档等价，顶部的权限名字才会显示「完全权限」而不是
+     * custom）；codex 走 --sandbox 参数。这里只负责选值，落盘由各执行器实现。
      */
     function SandboxPicker(props) {
       var value = props.value;
@@ -435,7 +476,7 @@ window.__ModuleLoader__.load({
       var LABELS = {
         "read-only": { name: "只读", note: "能读不能写，最安全" },
         "workspace-write": { name: "工作区可写", note: "推荐 · 只能改工作目录" },
-        "danger-full-access": { name: "完全放开", note: "不隔离 · 谨慎使用" },
+        "danger-full-access": { name: "完全权限", note: "沙箱全开 + 免审批 · 谨慎使用" },
       };
 
       return h(
@@ -444,11 +485,11 @@ window.__ModuleLoader__.load({
           label: "访问权限隔离",
           hint:
             value === "read-only"
-              ? "agent 只能读，任何写入都会被沙箱拒绝——适合只让它分析的任务。"
+              ? "agent 只能读，任何写入都会被沙箱拒绝——适合只让它分析的任务。任务无人值守，所以审批不询问；DSH 顶部会把这种组合显示成 Custom。"
               : value === "danger-full-access"
-                ? "不限制文件访问范围，agent 能改到工作目录之外。只在完全信任的任务上用。"
+                ? "沙箱全开、不再询问审批，DSH 顶部会显示「完全权限」。只在完全信任的任务上用。"
                 : value === "workspace-write"
-                  ? "写入被限制在工作目录内，越界会被拒绝。需要越权时可以临时提权。"
+                  ? "写入被限制在工作目录内，越界会被拒绝。任务无人值守，所以审批不询问；DSH 顶部会把这种组合显示成 Custom。"
                   : // 没选任何一档：不要在这里暗示已隔离，否则等于骗人
                     "没选就是跟随 DSH 部署的默认档位；想确保隔离请显式选一档。",
         },
@@ -470,6 +511,229 @@ window.__ModuleLoader__.load({
               h("div", { className: "note" }, meta.note),
             );
           }),
+        ),
+      );
+    }
+
+    /**
+     * 候选模型链选择器（全自动配置用）。
+     *
+     * 解决的是「主模型额度用完了，接下来怎么办」：以前只有一串模型下拉，
+     * 跑着跑着额度耗尽就整轮失败、任务退回队列等人发现。这里给一张有序的
+     * 候选表，运行器按顺序往下试。
+     *
+     * 三条界面规则，都是踩过的坑：
+     *   1. 顺序就是优先级，所以能上移/下移，而不是只给个多选框；
+     *   2. 同一条不能重复出现（重复只会让额度耗尽时白等两轮），加的时候就拦；
+     *   3. 模型已经不在可用目录里时**标出来但保留**，让人自己决定删不删——
+     *      静默删掉会让人的配置在某次目录变动后「自己消失」。
+     */
+    function FallbackPicker(props) {
+      var items = props.items || [];
+      var models = props.models || [];
+      var setItems = props.setItems;
+
+      function block(reason) {
+        if (props.onBlocked) props.onBlocked(reason);
+      }
+
+      function key(item) {
+        return (item.provider ? item.provider + "/" : "") + item.model;
+      }
+
+      function splitKey(raw) {
+        var cut = raw.indexOf("/");
+        // provider 来自目录的 group.id（trae / workbuddy / openai-codex…），
+        // 不含斜杠；所以第一个斜杠就是分隔符。
+        if (cut < 0) return { provider: null, model: raw };
+        return { provider: raw.slice(0, cut) || null, model: raw.slice(cut + 1) };
+      }
+
+      function effortsOf(provider, model) {
+        // 只按目录里该模型自己声明的档位给候选，绝不拿执行器全集冒充
+        return effortsFor({ models: models }, provider || null, model);
+      }
+
+      /** 这条候选还在不在当前目录里？不在的话下拉要按「已保存」保留它。 */
+      function known(item) {
+        for (var i = 0; i < models.length; i += 1) {
+          if (models[i].id !== item.model) continue;
+          if (!item.provider || models[i].provider === item.provider) return true;
+        }
+        return false;
+      }
+
+      function add() {
+        var used = {};
+        for (var i = 0; i < items.length; i += 1) used[key(items[i])] = true;
+        for (var j = 0; j < models.length; j += 1) {
+          var candidate = {
+            provider: models[j].provider || null,
+            model: models[j].id,
+            effort: null,
+          };
+          if (!used[key(candidate)]) {
+            setItems(items.concat([candidate]));
+            return;
+          }
+        }
+        // 全部模型都已经在链里：明确说一句，而不是点了没反应
+        block("可用的模型都已经在候选列表里了");
+      }
+
+      function remove(index) {
+        var next = items.slice();
+        next.splice(index, 1);
+        setItems(next);
+      }
+
+      function move(index, delta) {
+        var target = index + delta;
+        if (target < 0 || target >= items.length) return;
+        var next = items.slice();
+        var moving = next.splice(index, 1)[0];
+        next.splice(target, 0, moving);
+        setItems(next);
+      }
+
+      function change(index, patch) {
+        setItems(
+          items.map(function (item, at) {
+            return at === index ? Object.assign({}, item, patch) : item;
+          }),
+        );
+      }
+
+      var available = models.length > 0;
+
+      return h(
+        Field,
+        {
+          label: "后备模型（额度用完接着跑）",
+          hint: available
+            ? items.length
+              ? "按顺序尝试：当前模型额度用尽 / 被限流 / 鉴权失败时自动换下一个，直到有一个跑通。" +
+                "换模型会用新模型重跑这一轮（不接续上一个模型的会话）。"
+              : "留空 = 不换模型：当前模型不可用时这一轮直接失败。加几个候选，自动模式就不用别人盯着。"
+            : "读不到 DSH 的模型目录，暂时没法加候选；先确认插件与执行器在线。",
+        },
+        h(
+          "div",
+          { className: "hs-fb" },
+          items.length
+            ? items.map(function (item, index) {
+                return h(
+                  "div",
+                  { className: "hs-fb-row", key: key(item) + "#" + index },
+                  h("span", { className: "hs-fb-idx" }, String(index + 1)),
+                  h(
+                    "select",
+                    {
+                      className: "hs-select hs-fb-model",
+                      value: key(item),
+                      onChange: function (event) {
+                        var picked = splitKey(event.target.value);
+                        for (var i = 0; i < items.length; i += 1) {
+                          if (
+                            i !== index &&
+                            items[i].model === picked.model &&
+                            (items[i].provider || "") === (picked.provider || "")
+                          ) {
+                            block("这个模型已经在候选列表里了");
+                            return;
+                          }
+                        }
+                        var allowed = effortsOf(picked.provider, picked.model);
+                        // 换了模型，旧档位可能不属于它——留着会被宿主拒掉
+                        var keep = item.effort && allowed.indexOf(item.effort) >= 0 ? item.effort : null;
+                        change(index, { provider: picked.provider, model: picked.model, effort: keep });
+                      },
+                    },
+                    models.map(function (tuple) {
+                      var tupleKey = (tuple.provider ? tuple.provider + "/" : "") + tuple.id;
+                      var label = tuple.name || tuple.id;
+                      if (tuple.provider_name) label += " · " + tuple.provider_name;
+                      return h("option", { key: tupleKey, value: tupleKey }, label);
+                    }),
+                    // 已保存但已不在目录里的候选：给一个占位 option，否则下拉会
+                    // 静默跳到第一项，看起来像配置被改了。
+                    known(item)
+                      ? null
+                      : h(
+                          "option",
+                          { key: key(item), value: key(item) },
+                          item.model + "（已不在目录）",
+                        ),
+                  ),
+                  h(
+                    "select",
+                    {
+                      className: "hs-select hs-fb-effort",
+                      value: item.effort || "",
+                      onChange: function (event) {
+                        change(index, { effort: event.target.value || null });
+                      },
+                    },
+                    h("option", { value: "" }, "默认思考"),
+                    effortsOf(item.provider, item.model).map(function (id) {
+                      return h("option", { key: id, value: id }, id);
+                    }),
+                  ),
+                  item.available === false
+                    ? h("span", { className: "hs-fb-warn", title: "这个模型已经不在可用目录里" }, "不在目录")
+                    : null,
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      className: "hs-btn sm",
+                      disabled: index === 0,
+                      title: "上移（更早被尝试）",
+                      onClick: function () {
+                        move(index, -1);
+                      },
+                    },
+                    "↑",
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      className: "hs-btn sm",
+                      disabled: index === items.length - 1,
+                      title: "下移",
+                      onClick: function () {
+                        move(index, 1);
+                      },
+                    },
+                    "↓",
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      className: "hs-btn sm danger",
+                      title: "从候选链里去掉",
+                      onClick: function () {
+                        remove(index);
+                      },
+                    },
+                    "删",
+                  ),
+                );
+              })
+            : h("div", { className: "hs-muted", style: { fontSize: 12 } }, "还没有后备模型"),
+          h(
+            "button",
+            {
+              type: "button",
+              className: "hs-btn sm hs-fb-add",
+              style: { marginTop: 8 },
+              disabled: !available,
+              onClick: add,
+            },
+            "+ 加一个后备模型",
+          ),
         ),
       );
     }
@@ -1059,6 +1323,29 @@ window.__ModuleLoader__.load({
       var sandboxState = useState(auto.sandbox || "");
       var sandbox = sandboxState[0];
       var setSandbox = sandboxState[1];
+      // 后备模型链：主模型额度用尽时按顺序往下试。存在 auto.fallback_models。
+      // 每条只认 {provider, model, effort}，多出来的字段提交时会被丢掉。
+      var fallbacksState = useState(function () {
+        var saved = Array.isArray(auto.fallback_models) ? auto.fallback_models : [];
+        return saved
+          .filter(function (item) {
+            return item && typeof item.model === "string" && item.model.trim();
+          })
+          .map(function (item) {
+            return {
+              provider: item.provider || null,
+              model: String(item.model).trim(),
+              effort: item.effort || null,
+            };
+          });
+      });
+      var fallbacks = fallbacksState[0];
+      var setFallbacks = fallbacksState[1];
+      // 候选链的就地提示（「重复了」「都在列表里了」）。放在选择器下面而不是
+      // 弹窗底部的统一报错里，否则看不出是哪一行触发的。
+      var fbNoteState = useState("");
+      var fbNote = fbNoteState[0];
+      var setFbNote = fbNoteState[1];
 
       var current = useMemo(
         function () {
@@ -1167,6 +1454,10 @@ window.__ModuleLoader__.load({
             auto_merge: autoMerge,
             wait_deployment: waitDeploy,
             auto_commit: autoCommit,
+            // 后备模型链只在 dsh 下有实际意义（codex/zcode 的模型来自各自
+            // 配置文件，换模型不由这个面板管）。非 dsh 提交空表，免得让人以为
+            // 一条 dsh 的候选链对 codex 也生效。
+            fallback_models: executor === "dsh" ? fallbacks : [],
           },
         })
           .then(function () {
@@ -1340,6 +1631,25 @@ window.__ModuleLoader__.load({
             })(),
           ),
         ),
+        // 后备模型链：只在 dsh 下出现。codex/zcode 的模型来自各自的配置文件，
+        // 换模型不是这个面板的事——把控件藏起来比放一个不生效的下拉诚实。
+        executor === "dsh"
+          ? h(
+              "div",
+              null,
+              h(FallbackPicker, {
+                items: fallbacks,
+                models: currentView.models || [],
+                setItems: setFallbacks,
+                // 「加不进去 / 重复了」这类拒绝要就地说明：写在弹窗最底部会被
+                // 当成一个莫名其妙的报错。
+                onBlocked: function (reason) {
+                  setFbNote(reason);
+                },
+              }),
+              fbNote ? h("div", { className: "hs-hint" }, fbNote) : null,
+            )
+          : null,
         h(
           Field,
           { label: "执行选项" },
@@ -1491,6 +1801,7 @@ window.__ModuleLoader__.load({
         "）。";
 
       var checks = (task.acceptance && task.acceptance.checks) || [];
+      var notifyInfo = props.notifyInfo;
 
       return h(
         "div",
@@ -1528,6 +1839,45 @@ window.__ModuleLoader__.load({
                 h("div", { className: "hs-pre hs-err" }, failure.message || ""),
               )
             : null,
+
+          // 完成通知的送达情况。以前这块完全不可见：任务 verified 了、前端却没
+          // 收到事件，人只能在 outbox 里数 pending。现在这里直接说清「送到哪 /
+          // 送没送到 / 为什么没送到」。
+          h(
+            "div",
+            { className: "hs-sec" },
+            h("h3", null, "完成通知"),
+            notifyInfo && notifyInfo.reason === "no_event"
+              ? h(
+                  "div",
+                  { className: "hs-hint" },
+                  "这个任务还没有完成通知（只有 verified / failed 才会生成，且需要创建时登记过前端回程地址）。",
+                )
+              : notifyInfo
+                ? h(
+                    "div",
+                    null,
+                    h(
+                      "div",
+                      { className: "hs-kv" },
+                      kv("状态", notifyInfo.delivered ? "已送达前端 ✔" : "待发送 / 重试中"),
+                      kv("目标", notifyInfo.target),
+                      kv("revision", notifyInfo.revision),
+                      kv("任务状态", notifyInfo.status),
+                      kv("尝试次数", notifyInfo.attempts),
+                      kv("送达时间", fmtTime(notifyInfo.delivered_at)),
+                      kv("最近错误", notifyInfo.last_error),
+                    ),
+                    notifyInfo.delivered
+                      ? null
+                      : h(
+                          "div",
+                          { className: "hs-hint" },
+                          "投递线程会自动重试（指数退避）。若一直是这个状态，看顶部「通知」指示灯里报的原因——常见是前端监听端口没起或不在允许网段。",
+                        ),
+                  )
+                : h("div", { className: "hs-hint" }, "查不到这个任务的通知记录。"),
+          ),
 
           h(
             "div",
@@ -1850,6 +2200,9 @@ window.__ModuleLoader__.load({
       var sessionsState = useState(null);
       var sessionModal = sessionsState[0];
       var setSessionModal = sessionsState[1];
+      var notifyInfoState = useState(null);
+      var notifyInfo = notifyInfoState[0];
+      var setNotifyInfo = notifyInfoState[1];
       var logRef = useRef(null);
       var aliveRef = useRef(true);
 
@@ -1940,14 +2293,25 @@ window.__ModuleLoader__.load({
           setSelectedId(taskId);
           setLogFiles([]);
           setLogText("");
+          setNotifyInfo(null);
           apiGet("/api/tasks/" + q(taskId))
             .then(function (body) {
               if (!aliveRef.current) return null;
               setDetail(body);
-              return apiGet("/api/logs?task=" + q(taskId));
+              // 通知送达情况单独查：它不是任务单的一部分，而是本机 outbox 的状态。
+              return Promise.all([
+                apiGet("/api/tasks/" + q(taskId) + "/notify-status").catch(function () {
+                  return null;
+                }),
+                apiGet("/api/logs?task=" + q(taskId)),
+              ]);
             })
-            .then(function (logs) {
-              if (logs && aliveRef.current) setLogFiles(logs.files || []);
+            .then(function (results) {
+              if (!results || !aliveRef.current) return;
+              var notify = results[0];
+              var logs = results[1];
+              if (notify) setNotifyInfo(notify);
+              if (logs) setLogFiles(logs.files || []);
             })
             .catch(fail);
         },
@@ -2064,12 +2428,38 @@ window.__ModuleLoader__.load({
         [fail, notify, refreshAll, state],
       );
 
+      // 通知补发：让投递线程立刻扫一轮 outbox（相当于原面板的 `handoffctl notifier --once`）。
+      var flushPump = useCallback(
+        function () {
+          setBusy("notify");
+          apiPost("/api/notify/flush", {})
+            .then(function (body) {
+              var sent = (body.flush && body.flush.sent) || 0;
+              notify(sent ? "补发完成通知：" + sent + " 条已送达" : "补发完成通知：没有可发的事件", false);
+              return refreshAll();
+            })
+            .catch(fail)
+            .then(function () {
+              if (aliveRef.current) setBusy("");
+            });
+        },
+        [fail, notify, refreshAll],
+      );
+
       var run = state && state.active;
       var mode = (state && state.mode) || "manual";
       var auto = (state && state.auto) || {};
       var engineOk = state && state.executors && state.executors.dsh && state.executors.dsh.ok;
       var deliverInfo = state && state.deliver;
       var advanceInfo = state && state.advance;
+      var pumpInfo = state && state.notify_pump;
+      var pumpTitle = pumpInfo
+        ? (pumpInfo.running ? "完成通知投递线程在跑" : "完成通知投递线程没在跑") +
+          "；每 " +
+          pumpInfo.interval_seconds +
+          "s 扫一次本机 outbox" +
+          (pumpInfo.last_error ? "；最近错误：" + pumpInfo.last_error : "；点一下立刻发一轮")
+        : "完成通知投递状态未知";
 
       var progress = "";
       if (advanceInfo && !advanceInfo.done) {
@@ -2077,6 +2467,11 @@ window.__ModuleLoader__.load({
       } else if (advanceInfo && advanceInfo.done) {
         progress =
           "恢复推进：" + (advanceInfo.result || "done") + (advanceInfo.error ? " ✘ " + advanceInfo.error : "");
+        // 推进把任务带到 verified 后，完成通知由后台投递线程发。这里把「还欠几条没发」
+        // 直接写在进度里——不然任务显示 verified、前端没收到事件，人看不出还差哪一步。
+        if (advanceInfo.result === "verified" && pumpInfo && pumpInfo.pending) {
+          progress += "；完成通知还有 " + pumpInfo.pending + " 条待发";
+        }
       } else if (deliverInfo && !deliverInfo.done) {
         progress = "验收进行中：" + deliverInfo.task_id + " …";
       } else if (deliverInfo && deliverInfo.done) {
@@ -2139,6 +2534,21 @@ window.__ModuleLoader__.load({
             },
             "⚙ 自动配置",
           ),
+          // 完成通知的投递线程状态。以前这块完全不可见：任务 verified 了，
+          // 前端却收不到事件，只能去 outbox 里数 pending 才知道。
+          pumpInfo
+            ? h(
+                "button",
+                {
+                  type: "button",
+                  className: "hs-btn",
+                  title: pumpTitle,
+                  disabled: Boolean(busy),
+                  onClick: flushPump,
+                },
+                pumpLabel(pumpInfo),
+              )
+            : null,
           h("span", { className: "hs-spacer" }),
           h(
             "span",
@@ -2448,6 +2858,7 @@ window.__ModuleLoader__.load({
             ? h(Drawer, {
                 detail: detail,
                 run: run,
+                notifyInfo: notifyInfo,
                 logFiles: logFiles,
                 logText: logText,
                 progress: progress,
@@ -2597,9 +3008,12 @@ window.__ModuleLoader__.load({
     exports.__test = {
       AutoConfigModal: AutoConfigModal,
       RunModal: RunModal,
+      Drawer: Drawer,
       IsolationPicker: IsolationPicker,
       SandboxPicker: SandboxPicker,
+      FallbackPicker: FallbackPicker,
       effortsFor: effortsFor,
+      pumpLabel: pumpLabel,
       // 真实样式表文本，供渲染验证用（页面里是 <style>{CSS}</style>）。
       // CSS 在声明处就已经 join 成字符串了，这里不要再 join。
       css: CSS,

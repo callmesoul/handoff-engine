@@ -49,6 +49,12 @@ class WorkerOptions:
     reuse_worktree: str | None = None
     # direct 模式执行完自动提交并推送到当前分支；提交信息用执行器写的 commit_message
     auto_commit: bool = False
+    # 额度用尽 / 限流 / 服务端故障这类失败是否排进「到点自动重试」而不是判死。
+    # 关掉就退回旧行为：任务停在 failed 等人点「重新入队」。
+    auto_retry: bool = True
+    # 自动重试上限（不含第一次执行）与指数退避的基数秒数
+    max_auto_retries: int = 3
+    retry_base_seconds: int = 300
 
 
 class Worker:
@@ -353,7 +359,16 @@ class Worker:
                 if outcome.result:
                     detail += f"；{executor} 自述：{clean(outcome.result.get('notes') or '', 800)}"
                 heartbeat.stop()
-                self._fail(task_id, "codex", detail, notes=outcome.stderr_tail, event_type="codex.failed")
+                # 额度用尽 / 限流 / 服务端故障的机器码在 outcome.failure 里；只有
+                # 它能让 worker 区分「等一会儿再来」和「真的做不成」。
+                self._fail(
+                    task_id,
+                    "codex",
+                    detail,
+                    notes=outcome.stderr_tail,
+                    event_type="codex.failed",
+                    failure=getattr(outcome, "failure", None),
+                )
                 return
 
             # blocked 意味着"做不完就停手"，不是"做错了"。它手上的改动是有价值的，
@@ -731,11 +746,40 @@ class Worker:
         *,
         notes: str | None = None,
         event_type: str = "task.status_changed",
+        failure: dict | None = None,
     ) -> None:
+        """写失败状态；若失败属于「等一下就能好」的类别，同时排好重试。
+
+        `failure` 是执行器回传的结构化失败（`{code, message, status}`）。它决定了
+        任务是被判死等人处理，还是被排进重试队列——两者都必须能从任务单上看出来。
+        """
         try:
             task = self.store.get(task_id)
             if task["status"] in state.TERMINAL:
                 return
+            retry = None
+            if self.options.auto_retry and failure:
+                from . import retry_policy
+
+                prior = task.get("failure") or {}
+                # 连续失败时次数要累加：上一次自动重试过 2 次，这一次就是第 3 次
+                already = int(prior.get("retry_count") or 0)
+                if prior.get("retryable") and prior.get("retry_at"):
+                    already += 1
+                retry = retry_policy.retry_plan(
+                    failure,
+                    already,
+                    base=self.options.retry_base_seconds,
+                    max_retries=self.options.max_auto_retries,
+                )
+                if retry.get("retry_at") is not None:
+                    self.log(
+                        f"{task_id}: 额度/服务暂时不可用，"
+                        f"{retry['retry_at'].astimezone().strftime('%H:%M:%S')} 后自动重试"
+                        f"（第 {already + 1} 次，最多 {self.options.max_auto_retries} 次）"
+                    )
+                elif retry.get("reason"):
+                    self.log(f"{task_id}: 不再自动重试——{retry['reason']}")
             self.store.fail(
                 task_id,
                 stage=stage,
@@ -744,6 +788,7 @@ class Worker:
                 notes=notes,
                 expected_revision=task["revision"],
                 event_type=event_type,
+                retry=retry,
             )
         except HandoffError as exc:
             detail = "; ".join(getattr(exc, "errors", []) or [])

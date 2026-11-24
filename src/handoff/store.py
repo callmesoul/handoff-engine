@@ -52,6 +52,14 @@ def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     return git(root, "merge-base", "--is-ancestor", ancestor, descendant).ok
 
 
+class _FatalConflict(ConflictError):
+    """不可重试的 revision 冲突。
+
+    与可重试的冲突（纯心跳推进 revision、push 非快进）区分开：这条意味着区间内
+    还有心跳以外的写入，别人的改动就在眼前，重试只会把它覆盖掉。
+    """
+
+
 def _serialized(method):
     """同一 checkout 的同步与提交串行执行，防止心跳重置未推送事务。"""
     @wraps(method)
@@ -456,6 +464,30 @@ class TaskStore:
             raise ConflictError(f"事件已存在，禁止覆盖: {path.name}")
         self._atomic_write(path, event)
 
+    def _only_heartbeats_between(self, task: dict, from_revision: int) -> bool:
+        """revision 从 `from_revision` 到当前之间，是不是只有心跳在写？
+
+        心跳续租（`claim.heartbeat`）不改变任何业务事实，只是把租约往后推。它却
+        和别的事件一样 +1 revision，于是严格比较 revision 会把「我这边还在跑」
+        误判成「别人改了任务」。这里读事件历史来区分：区间内全是心跳 → 可以
+        直接沿用最新 revision 继续写；只要夹了任何非心跳事件 → 仍然是真冲突。
+
+        读不到事件历史时保守返回 False（按真冲突处理）：宁可让调用方重来一次，
+        也不要在一个说不清的并发窗口里覆盖别人的写入。
+        """
+        try:
+            directory = self.event_dir(task["id"])
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in directory.glob("*.json")
+            ]
+        except Exception:  # noqa: BLE001 - 读事件失败时按真冲突处理
+            return False
+        newer = [e for e in events if int(e.get("task_revision") or 0) > int(from_revision)]
+        if not newer:
+            return False
+        return all(e.get("type") == "claim.heartbeat" for e in newer)
+
     @_serialized
     def _write(
         self,
@@ -471,17 +503,33 @@ class TaskStore:
     ) -> dict:
         actor = actor or self.actor
         last_error: Exception | None = None
+        # 乐观锁：调用方给的 expected_revision 表达的是「我看到的状态是最新的」。
+        #
+        # 但 revision 是**整张任务单**的版本号，任何写入都会 +1——包括心跳续租
+        # 这种与业务状态无关的写入。严格相等比较会把「心跳刚写过」和「别人改了
+        # 状态」当成同一件事：worker 认领时读到 r2，心跳续租把它推到 r3，随后写
+        # 失败状态就必然冲突；三次重试用的是同一个 r2，于是三次必然全失败，
+        # 任务莫名停在 failed(internal)「写入冲突」。
+        #
+        # 判据因此改为「距上次读到的 revision 之间，除了心跳之外还有没有别的写入」：
+        # 只放行纯心跳推进的 revision，任何其它写入（含状态变化）都照旧算真冲突。
+        # 这样乐观锁语义不变——陈旧 revision 依然被拒——只是不再把心跳当成竞争。
+        expected = expected_revision
         for attempt in range(1, self.max_retries + 1):
             try:
                 self.sync()
                 task = self._read(task_id)
-                if expected_revision is not None and task["revision"] != expected_revision:
-                    raise ConflictError(
-                        f"{task_id}: revision 冲突（本地期望 {expected_revision}，仓库实际 {task['revision']}）",
-                        task_id=task_id,
-                        expected=expected_revision,
-                        actual=task["revision"],
-                    )
+                if expected is not None and task["revision"] != expected:
+                    if not self._only_heartbeats_between(task, expected):
+                        # 真冲突：区间内夹了心跳以外的写入。这条必须**穿透**重试
+                        # 循环——否则下一轮 expected=None 就会把别人的写入覆盖掉，
+                        # 乐观锁等于失效。所以用专用子类标记它不可重试。
+                        raise _FatalConflict(
+                            f"{task_id}: revision 冲突（本地期望 {expected}，仓库实际 {task['revision']}）",
+                            task_id=task_id,
+                            expected=expected,
+                            actual=task["revision"],
+                        )
                 prev_status = task["status"]
                 base_revision = task["revision"]
                 mutate(task)
@@ -528,10 +576,16 @@ class TaskStore:
                             notification_result,
                         )
                 return task
+            except _FatalConflict:
+                # 不可重试：区间内有心跳以外的写入，重试只会覆盖别人的改动
+                raise
             except ConflictError as exc:
                 last_error = exc
                 if attempt >= self.max_retries:
                     break
+                # 走到这里的只有「纯心跳推进了 revision」或「push 非快进」：
+                # 下一轮以最新 revision 为基准重写，mutate 的状态机校验照旧把关。
+                expected = None
                 continue
         raise ConflictError(
             f"{task_id}: 写入冲突，已重试 {self.max_retries} 次，停止自动覆盖",
@@ -801,6 +855,7 @@ class TaskStore:
         expected_revision: int | None = None,
         notes: str | None = None,
         event_type: str = "task.status_changed",
+        retry: dict | None = None,
     ) -> dict:
         task = self.get(task_id, sync=False)
         limit = 4000
@@ -808,13 +863,22 @@ class TaskStore:
         def apply(t: dict) -> None:
             state.assert_transition(t["status"], "failed", task_id)
             t["status"] = "failed"
-            t["failure"] = {
+            failure = {
                 "stage": stage,
                 "message": clean(message, limit),
                 "check_id": check_id,
                 "observed_sha": observed_sha,
                 "at": iso(),
             }
+            # 可重试的失败（额度/限流/服务端故障）记下重试时刻，后台线程到点把它
+            # 放回 open。不可重试或已超上限时 retryable=False，任务就停在 failed
+            # 等人处理——这两种结局都必须能从任务单上直接看出来。
+            if retry is not None:
+                failure["retryable"] = bool(retry.get("retryable"))
+                at = retry.get("retry_at")
+                failure["retry_at"] = iso(at) if at is not None else None
+                failure["retry_count"] = max(0, int(retry.get("retry_count") or 0))
+            t["failure"] = failure
             if notes:
                 t["result"]["notes"] = clean(notes, limit)
 

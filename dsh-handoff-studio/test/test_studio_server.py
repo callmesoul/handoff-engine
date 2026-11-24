@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from http.client import HTTPConnection
@@ -19,9 +20,23 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+def _repo_root() -> Path:
+    """交接仓根：优先 HANDOFF_ROOT，否则往上找 config/repositories.yaml。"""
+    override = os.environ.get("HANDOFF_ROOT", "").strip()
+    if override:
+        return Path(override)
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "config" / "repositories.yaml").is_file():
+            return candidate
+    return Path(__file__).resolve().parents[2]
+
+
+REPO_ROOT = _repo_root()
 ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
-for extra in (str(REPO_ROOT / "src"), str(ENGINE_DIR)):
+# handoff 包从引擎仓的 src/ 加载；交接仓只提供 config/ 与 schemas/。
+ENGINE_SRC = Path(__file__).resolve().parents[1].parent / "src"
+for extra in (str(ENGINE_SRC), str(ENGINE_DIR)):
     if extra not in sys.path:
         sys.path.insert(0, extra)
 
@@ -34,8 +49,10 @@ from handoff_studio.service import StudioService  # noqa: E402
 def live_server(tmp_path: Path, monkeypatch):
     root = tmp_path / "store"
     root.mkdir()
-    for name in ("config", "schemas"):
-        shutil.copytree(REPO_ROOT / name, root / name)
+    shutil.copytree(REPO_ROOT / "config", root / "config")
+    # schemas 是 handoff 包的内部资源，仓根不一定有副本；存在才拷。
+    if (REPO_ROOT / "schemas").is_dir():
+        shutil.copytree(REPO_ROOT / "schemas", root / "schemas")
     for name in ("tasks", "events", "contracts"):
         (root / name).mkdir()
 
@@ -222,6 +239,34 @@ def test_resend_notify_route_exists(live_server):
         live_server["port"], "POST", f"/api/tasks/{live_server['task_id']}/resend-notify", {}
     )
     assert status != 404
+
+
+def test_notify_status_route_reports_no_event(live_server):
+    """没有通知历史不是错误：面板是轮询调用，回 404 会让它每次刷红。"""
+    status, body = call(live_server["port"], "GET", f"/api/tasks/{live_server['task_id']}/notify-status")
+    assert status == 200
+    assert body["task_id"] == live_server["task_id"]
+    assert body["delivered"] is False
+    assert body["reason"] == "no_event"
+
+
+def test_notify_flush_route_drains_nothing_and_says_so(live_server):
+    """投递线程的「立刻发一轮」入口：空 outbox 不该报错。"""
+    status, body = call(live_server["port"], "POST", "/api/notify/flush", {})
+    assert status == 200
+    flush = body["flush"]
+    assert flush["sent"] == 0
+    assert flush["idle"] is True
+
+
+def test_state_reports_the_notification_pump(live_server):
+    """顶栏的「通知 pending N」靠这个字段；缺了界面就只能猜。"""
+    status, body = call(live_server["port"], "GET", "/api/state")
+    assert status == 200
+    pump = body["notify_pump"]
+    assert pump["running"] is True
+    for key in ("pending", "stale", "interval_seconds", "watermark", "last_error"):
+        assert key in pump, key
 
 
 def test_deliver_route_starts_background_verification(live_server):

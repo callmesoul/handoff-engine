@@ -88,6 +88,13 @@ class CodexOutcome:
     log_path: str | None = None
     stderr_tail: str = ""
     duration_seconds: float = 0.0
+    #: 执行器回传的结构化模型级失败（`{code, message, status}`）。
+    #:
+    #: 只有 dsh 执行器会填：它从 `turn/end.reason.error.code` 读出稳定机器码
+    #: （`QUOTA` / `ACCOUNT_QUOTA` / `RATE_LIMIT` / `SERVER` …）。worker 用它判断
+    #: 「等一会儿就能好」还是「真的做不成」，所以必须随结果一起带出来，不能只
+    #: 揉进 message 里当文案。
+    failure: dict | None = None
 
     @property
     def ok(self) -> bool:

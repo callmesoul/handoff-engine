@@ -7,21 +7,37 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _repo_root() -> Path:
+    """交接仓根：优先 HANDOFF_ROOT，否则往上找 config/repositories.yaml。"""
+    override = os.environ.get("HANDOFF_ROOT", "").strip()
+    if override:
+        return Path(override)
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "config" / "repositories.yaml").is_file():
+            return candidate
+    return Path(__file__).resolve().parents[2]
+
+
+REPO_ROOT = _repo_root()
 ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
-for extra in (str(REPO_ROOT / "src"), str(ENGINE_DIR)):
+# handoff 包从引擎仓的 src/ 加载；交接仓只提供 config/ 与 schemas/。
+ENGINE_SRC = Path(__file__).resolve().parents[1].parent / "src"
+for extra in (str(ENGINE_SRC), str(ENGINE_DIR)):
     if extra not in sys.path:
         sys.path.insert(0, extra)
 
 from handoff.config import Config  # noqa: E402
+from handoff.notification import load_secret  # noqa: E402
 from handoff.panel import service as panel_service  # noqa: E402
 import handoff_studio.service as studio  # noqa: E402
+from handoff_studio import secrets_bridge  # noqa: E402
 
 
 @pytest.fixture()
@@ -29,8 +45,11 @@ def store_root(tmp_path: Path) -> Path:
     """把交接仓的 config/ 与 schemas/ 拷到一个临时目录，得到可加载的根。"""
     root = tmp_path / "store"
     root.mkdir()
-    for name in ("config", "schemas"):
-        shutil.copytree(REPO_ROOT / name, root / name)
+    shutil.copytree(REPO_ROOT / "config", root / "config")
+    # schemas 是 handoff 包的内部资源（src/handoff/schemas），仓根不一定有副本；
+    # 只在旧布局里存在时才拷，避免测试绑死目录结构。
+    if (REPO_ROOT / "schemas").is_dir():
+        shutil.copytree(REPO_ROOT / "schemas", root / "schemas")
     (root / "tasks").mkdir()
     (root / "events").mkdir()
     (root / "contracts").mkdir()
@@ -222,6 +241,278 @@ def test_sessions_rejects_unknown_executor(service):
     assert service.sessions("dsh") == []
 
 
+# -- 候选模型链 --------------------------------------------------------------
+# 实机需求：主模型额度用完时，自动模式要能往下换候选模型，而不是把任务退回队列
+# 等人发现。链存在 auto.fallback_models 里，跟其它自动配置放一起。
+
+CATALOG = {
+    "groups": [
+        {
+            "id": "p1",
+            "name": "Provider One",
+            "models": [
+                {"id": "m1", "reasoning": {"efforts": [{"id": "low"}, {"id": "high"}]}},
+                {"id": "m2", "reasoning": {"efforts": [{"id": "max"}]}},
+            ],
+        },
+        {
+            "id": "p2",
+            "name": "Provider Two",
+            "models": [
+                # 同名模型在另一个 provider 下档位不同——这正是要按 provider 对齐的原因
+                {"id": "m2", "reasoning": {"efforts": [{"id": "xhigh"}]}},
+            ],
+        },
+    ]
+}
+
+
+def test_fallback_chain_defaults_to_empty(service):
+    assert service.state()["auto"]["fallback_models"] == []
+    # 空链不能报错，也不能被当成「配置有误」
+    assert service.set_mode({"mode": "manual", "auto": {"fallback_models": []}})["auto"]["fallback_models"] == []
+
+
+def test_set_mode_stores_the_fallback_chain(service):
+    service.remember_catalog(CATALOG)
+    state = service.set_mode(
+        {
+            "mode": "auto",
+            "auto": {
+                "executor": "dsh",
+                "model": "m1",
+                "fallback_models": [
+                    {"provider": "p1", "model": "m1", "effort": "high"},
+                    {"provider": "p2", "model": "m2", "effort": "xhigh"},
+                ],
+            },
+        }
+    )
+    assert state["auto"]["fallback_models"] == [
+        {"provider": "p1", "model": "m1", "effort": "high"},
+        {"provider": "p2", "model": "m2", "effort": "xhigh"},
+    ]
+    # 顺序即优先级：读回来必须一样
+    assert [item["model"] for item in service._fallback_chain()] == ["m1", "m2"]
+
+
+def test_set_mode_rejects_a_fallback_without_a_model(service):
+    with pytest.raises(Exception) as exc:
+        service.set_mode({"mode": "manual", "auto": {"fallback_models": [{"provider": "p1"}]}})
+    assert "fallback_models" in str(exc.value)
+
+
+def test_set_mode_rejects_a_non_list_fallback_chain(service):
+    with pytest.raises(Exception) as exc:
+        service.set_mode({"mode": "manual", "auto": {"fallback_models": "m1"}})
+    assert "fallback_models" in str(exc.value)
+
+
+def test_a_rejected_fallback_chain_leaves_the_old_one_intact(service):
+    """校验失败不能留下半套配置：先校验后落盘。"""
+    service.remember_catalog(CATALOG)
+    service.set_mode({"mode": "manual", "auto": {"fallback_models": [{"model": "m1"}]}})
+    with pytest.raises(Exception):
+        service.set_mode({"mode": "manual", "auto": {"fallback_models": [{"provider": "p1"}]}})
+    assert service.state()["auto"]["fallback_models"] == [{"provider": None, "model": "m1", "effort": None}]
+
+
+def test_fallback_chain_drops_models_that_left_the_catalog(service):
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {
+            "mode": "manual",
+            "auto": {"fallback_models": [{"model": "m1"}, {"model": "retired-model"}]},
+        }
+    )
+    # 保存时照收（面板允许保留一条「不在目录」的候选给人自己决定），
+    # 但真正构造链时只留下还能路由的
+    assert len(service.state()["auto"]["fallback_models"]) == 2
+    assert [item["model"] for item in service._fallback_chain()] == ["m1"]
+
+
+def test_fallback_chain_resolves_the_provider_from_the_catalog(service):
+    service.remember_catalog(CATALOG)
+    service.set_mode({"mode": "manual", "auto": {"fallback_models": [{"model": "m1"}]}})
+    chain = service._fallback_chain()
+    assert chain[0]["provider"] == "p1", "a bare model must be pinned to its provider"
+
+
+def test_fallback_chain_clears_an_effort_the_model_does_not_declare(service):
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {
+            "mode": "manual",
+            "auto": {"fallback_models": [{"provider": "p2", "model": "m2", "effort": "max"}]},
+        }
+    )
+    # p2 的 m2 只声明 xhigh：把 max 留着会在派单时被宿主拒掉
+    assert service._fallback_chain()[0]["effort"] is None
+
+
+def test_fallback_chain_is_deduped(service):
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {
+            "mode": "manual",
+            "auto": {
+                "fallback_models": [
+                    {"provider": "p1", "model": "m1"},
+                    {"provider": "p1", "model": "m1", "effort": "high"},
+                ]
+            },
+        }
+    )
+    # 同一条重复只会让额度耗尽时白试一轮
+    assert len(service._fallback_chain()) == 1
+
+
+def test_fallback_chain_survives_a_restart(store_root, monkeypatch):
+    monkeypatch.setenv("HANDOFF_STUDIO_URL", "http://127.0.0.1:59999/handoff-studio")
+    config = Config.load(store_root)
+    first = studio.StudioService(store_root, config)
+    first.remember_catalog(CATALOG)
+    first.set_mode({"mode": "manual", "auto": {"fallback_models": [{"provider": "p2", "model": "m2"}]}})
+
+    second = studio.StudioService(store_root, config)
+    assert second.state()["auto"]["fallback_models"] == [
+        {"provider": "p2", "model": "m2", "effort": None}
+    ]
+    assert [item["model"] for item in second._fallback_chain()] == ["m2"]
+
+
+def test_a_hand_broken_fallback_entry_does_not_break_startup(store_root, monkeypatch):
+    monkeypatch.setenv("HANDOFF_STUDIO_URL", "http://127.0.0.1:59999/handoff-studio")
+    state_path = store_root / ".handoff-run" / "studio-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "mode": "manual",
+                "auto": {
+                    "executor": "dsh",
+                    "fallback_models": ["nope", {"provider": "p1"}, {"model": "  m1  ", "effort": "  "}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = studio.StudioService(store_root, Config.load(store_root))
+    # 坏条目被丢掉，好条目被清洗后留下——不是整份状态作废
+    assert service.state()["auto"]["fallback_models"] == [
+        {"provider": None, "model": "m1", "effort": None}
+    ]
+
+
+def test_run_options_expose_the_fallback_chain(service):
+    service.remember_catalog(CATALOG)
+    service.set_mode({"mode": "manual", "auto": {"fallback_models": [{"provider": "p1", "model": "m1"}]}})
+    options = service.run_options()
+    dsh = options["executors"][0]
+    assert dsh["fallbacks"] == [
+        {
+            "provider": "p1",
+            "model": "m1",
+            "effort": None,
+            "available": True,
+            "efforts": ["low", "high"],
+        }
+    ]
+
+
+def test_studio_models_expose_the_fallback_chain(service):
+    service.remember_catalog(CATALOG)
+    service.set_mode({"mode": "manual", "auto": {"fallback_models": [{"provider": "p1", "model": "m1"}]}})
+    assert service.studio_models()["fallbacks"][0]["model"] == "m1"
+
+
+def test_the_runner_is_built_with_the_fallback_chain(service, monkeypatch):
+    """真正的接线点：构造 DshAgentRunner 时必须把链带上，否则一次都不换。"""
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {
+            "mode": "manual",
+            "auto": {
+                "executor": "dsh",
+                "model": "m1",
+                "fallback_models": [{"provider": "p2", "model": "m2", "effort": "xhigh"}],
+            },
+        }
+    )
+    service._pending_provider = "p1"
+    # 自动模式会把这些作为 run_task 参数传下来（父类 _auto_loop 就是这么做的）
+    runner = service._build_runner("dsh", model="m1", effort=None)
+    assert runner.model == "m1"
+    assert runner.provider == "p1"
+    assert runner.model_chain() == [
+        {"provider": "p1", "model": "m1", "effort": None},
+        {"provider": "p2", "model": "m2", "effort": "xhigh"},
+    ]
+
+
+def test_the_runner_uses_the_configured_sandbox_when_the_request_omits_it(service, monkeypatch):
+    """配置里选的访问权限必须真的生效，不能只在请求里带才生效。
+
+    真机踩到的坑：自动配置里写的是「完全权限」，但面板的「执行」按钮只发
+    executor，`run_task` 又只认请求参数，于是每一轮都退回部署默认的
+    workspace-write——每个新建 worktree 都要现场补 ACL，补不上就是
+    SANDBOX_PREPARATION_FAILED，agent 的每个 shell 工具全部失败。
+    """
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {
+            "mode": "manual",
+            "auto": {"executor": "dsh", "model": "m1", "sandbox": "danger-full-access"},
+        }
+    )
+    captured = {}
+
+    def fake_run_task(self_, task_id, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(panel_service.PanelService, "run_task", fake_run_task)
+    service.run_task("ho-test", executor="dsh")
+
+    assert captured.get("sandbox") == "danger-full-access"
+
+
+def test_an_explicit_sandbox_in_the_request_wins_over_the_config(service, monkeypatch):
+    """请求显式给了档位就按请求走：那是这一轮的临时选择。"""
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {"mode": "manual", "auto": {"executor": "dsh", "model": "m1", "sandbox": "danger-full-access"}}
+    )
+    captured = {}
+
+    def fake_run_task(self_, task_id, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(panel_service.PanelService, "run_task", fake_run_task)
+    service.run_task("ho-test", executor="dsh", sandbox="read-only")
+
+    assert captured.get("sandbox") == "read-only"
+
+
+def test_an_unknown_sandbox_value_falls_back_to_the_config(service, monkeypatch):
+    """拼错的档位不能原样派给宿主，也不能把配置里的有效值一起弄丢。"""
+    service.remember_catalog(CATALOG)
+    service.set_mode(
+        {"mode": "manual", "auto": {"executor": "dsh", "model": "m1", "sandbox": "workspace-write"}}
+    )
+    captured = {}
+
+    def fake_run_task(self_, task_id, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(panel_service.PanelService, "run_task", fake_run_task)
+    service.run_task("ho-test", executor="dsh", sandbox="totally-wrong")
+
+    assert captured.get("sandbox") == "workspace-write"
+
+
 def test_token_env_wins(monkeypatch, tmp_path):
     monkeypatch.setenv("HANDOFF_STUDIO_TOKEN", "abc")
     assert studio.studio_token() == "abc"
@@ -271,3 +562,64 @@ def test_endpoint_with_wrong_version_falls_back(monkeypatch, tmp_path):
     monkeypatch.setenv("DSH_WEB_URL", "http://127.0.0.1:2")
     route, _ = studio.discover_route()
     assert route == "http://127.0.0.1:2/handoff-studio"
+
+
+# -- 通知密钥发现 ------------------------------------------------------------
+# 实机 bug：studio 引擎是 DSH 插件 spawn 的，不继承 run-panel.ps1 注入的
+# HANDOFF_NOTIFY_SECRET，于是每次用到通知都报「密钥缺失或少于 32 字节」——
+# 密钥其实好好躺在 secrets/notify-secret.txt 里。这组测试锁住按文件发现这条路。
+
+LONG_SECRET = "a1" * 32  # 64 个十六进制字符 = 32 字节随机值的十六进制编码
+
+
+def _clear_secret_env(monkeypatch):
+    for name in (
+        "HANDOFF_NOTIFY_SECRET",
+        "HANDOFF_NOTIFY_SECRET_FILE",
+        "HANDOFF_STUDIO_NOTIFY_SECRET_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_notify_secret_found_next_to_store(store_root: Path, monkeypatch):
+    """本机布局：store-github + 上一级 secrets/notify-secret.txt。"""
+    _clear_secret_env(monkeypatch)
+    secrets = store_root.parent / "secrets"
+    secrets.mkdir(exist_ok=True)
+    (secrets / "notify-secret.txt").write_text(LONG_SECRET + "\n", encoding="utf-8")
+
+    status = secrets_bridge.discover_notify_secret(store_root)
+    assert status.ok is True
+    assert status.length == len(LONG_SECRET)
+    assert os.environ["HANDOFF_NOTIFY_SECRET"] == LONG_SECRET
+    # 状态里绝不能出现密钥本身
+    assert LONG_SECRET not in json.dumps(status.as_dict())
+
+
+def test_short_secret_is_reported_not_injected(store_root: Path, monkeypatch):
+    """短密钥是配置错误：不能静默降级成「能用」。"""
+    _clear_secret_env(monkeypatch)
+    secrets = store_root / "secrets"
+    secrets.mkdir(exist_ok=True)
+    (secrets / "notify-secret.txt").write_text("too-short", encoding="utf-8")
+    status = secrets_bridge.discover_notify_secret(store_root)
+    assert status.ok is False
+    assert "少于" in (status.error or "")
+    assert "HANDOFF_NOTIFY_SECRET" not in os.environ
+
+
+def test_service_seeds_environment_before_parent_starts(store_root: Path, monkeypatch):
+    """服务构造完就该能用：父类唤醒监听第一件事就是读密钥。"""
+    _clear_secret_env(monkeypatch)
+    secrets = store_root.parent / "secrets"
+    secrets.mkdir(exist_ok=True)
+    (secrets / "notify-secret.txt").write_text(LONG_SECRET, encoding="utf-8")
+    monkeypatch.setenv("HANDOFF_STUDIO_URL", "http://127.0.0.1:59999/handoff-studio")
+    service = studio.StudioService(store_root, Config.load(store_root))
+
+    state = service.state()
+    assert state["notify_secret"]["ok"] is True
+    assert state["notify_secret"]["length"] == len(LONG_SECRET)
+    # app 自己的 load_secret 现在能过（原始报错发生的地方）
+    config = Config.load(store_root)
+    assert load_secret(config.notifications) == LONG_SECRET.encode("utf-8")

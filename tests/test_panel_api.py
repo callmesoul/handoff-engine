@@ -1526,6 +1526,49 @@ def test_direct_wait_deployment_false_stays_delivered(env, tmp_path, monkeypatch
     assert current["deployment"]["status"] in (None, "pending")
 
 
+def test_direct_without_auto_commit_skips_auto_verify_instead_of_failing(
+    env, tmp_path, monkeypatch
+):
+    """目录模式没开自动提交：没有可对齐的目标，自动验收应明确跳过而不是报错。
+
+    回归：以前这里照样调 cmd_deliver，它只能抛「任务缺少 merge_sha/head_sha，
+    无法对齐部署」，面板上显示成一次验收失败——其实什么都没做错，只是改动
+    还没提交。状态应留在 delivered，deliver 记录给出可照做的原因。
+    """
+    direct, remote = _direct_repo_with_origin(tmp_path)
+    env.service._runner_overrides["zcode"] = FakeZcodeCommit(
+        files={"src/orders/Status.java": "enum Status { OPEN }\n"},
+        commit_message=None,
+    )
+    status, _body = _post(
+        f"{env.base_url}/api/tasks/{env.task['id']}/run",
+        {
+            "executor": "zcode",
+            "work_dir": str(direct),
+            "auto_commit": False,
+            "wait_deployment": True,
+        },
+    )
+    assert status == 200
+    _wait_run_done(env.service)
+
+    current = env.store.peek(env.task["id"])
+    # 交付本身成功，只是没提交
+    assert current["status"] == "delivered", current.get("failure")
+    assert not (current.get("result") or {}).get("head_sha")
+
+    deliver_state = env.service.state()["deliver"]
+    assert deliver_state and deliver_state.get("auto") is True
+    # 不是错误：是「没有可验证的目标」这一明确结论
+    assert deliver_state.get("error") is None
+    assert deliver_state["result"]["result"] == "no_target"
+    assert "提交" in deliver_state["result"]["message"]
+
+    active_logs = env.service.state()["active"]["logs"]
+    assert any("跳过自动验收" in line for line in active_logs)
+    assert not any("自动验收失败" in line for line in active_logs)
+
+
 def test_verify_mutex_blocks_concurrent_advance_and_deliver(env, monkeypatch):
     """恢复推进与手动验收并发时，第二个入口必须被挡住。
 

@@ -54,6 +54,15 @@ const STATE = {
   default_executor: "dsh",
   deliver: null,
   advance: null,
+  // 完成通知投递线程的状态（引擎的 notify_pump）
+  notify_pump: {
+    running: true,
+    pending: 2,
+    stale: 0,
+    interval_seconds: 2,
+    last_error: null,
+    watermark: "2026-11-23T06:00:00Z",
+  },
   active: null,
   studio: { model: "deepseek-v4.1-flash", provider: "workbuddy", efforts: ["low", "high"] },
 };
@@ -109,6 +118,19 @@ const DETAIL = {
 function payloadFor(url) {
   if (url.includes("/api/state")) return STATE;
   if (url.includes("/api/studio/options")) return OPTIONS;
+  if (url.includes("/notify-status")) {
+    return {
+      ok: true,
+      task_id: TASK.id,
+      delivered: true,
+      target: "http://127.0.0.1:8789/v1/handoff/completed",
+      revision: 3,
+      status: "verified",
+      attempts: 0,
+      delivered_at: "2026-11-18T02:00:05Z",
+      last_error: null,
+    };
+  }
   if (url.includes("/api/tasks/") && url.includes("/sessions")) return { sessions: [] };
   if (url.includes("/api/tasks/")) return DETAIL;
   if (url.includes("/api/logs")) return { attempts: [], files: [] };
@@ -330,6 +352,77 @@ test("the modal width shrinks with the viewport", () => {
   assert.ok(!/max-width:96vw/.test(body), "modal should cap via width:min(), not a separate max-width");
 });
 
+/**
+ * 候选链的行内宽度不能被通用规则吃掉。
+ *
+ * 通用规则 `.hs-formrow .hs-select{width:100%}` 的优先级是 (0,2,0)。候选链每行
+ * 有两个下拉，如果 `.hs-fb-effort{width:120px}` 只写一个类（(0,1,0)），它根本
+ * 盖不住——于是两个下拉同时 100% 宽、互相挤爆：档位吃掉整行、模型被压成一条缝、
+ * 右边的上移/下移/删除被推出弹窗。这不是「宽一点」的观感问题，是控件不可用。
+ *
+ * 断言方式：把每条规则的选择器按 CSS 优先级折算成 (id, class, tag) 权重，
+ * 要求候选链的行内规则严格高于通用规则。
+ */
+test("fallback row widths outrank the generic full-width form rule", () => {
+  const css = cssText();
+
+  // 一条规则可以带多个选择器（逗号分隔），优先级按其中最高的那个算。
+  function weight(selector) {
+    return Math.max(
+      ...selector.split(",").map((single) => {
+        const ids = (single.match(/#[\w-]+/g) || []).length;
+        const classes = (single.match(/\.[\w-]+/g) || []).length;
+        const tags = (single.match(/(?:^|[\s>+~])[a-z][\w-]*/gi) || []).length;
+        return ids * 10000 + classes * 100 + tags;
+      }),
+    );
+  }
+
+  function rulesFor(needle) {
+    const out = [];
+    const re = /([^{}]+)\{([^}]*)\}/g;
+    let match;
+    while ((match = re.exec(css))) {
+      const selector = match[1].trim();
+      if (selector.includes(needle)) out.push({ selector, body: match[2] });
+    }
+    return out;
+  }
+
+  const generic = rulesFor(".hs-formrow .hs-select").filter((rule) =>
+    rule.body.includes("width:100%"),
+  );
+  assert.ok(generic.length, "the generic full-width rule must still exist");
+  const floor = Math.max(...generic.map((rule) => weight(rule.selector)));
+
+  // 模型那格：必须能压住通用规则，否则它被档位挤成零宽
+  const model = rulesFor(".hs-fb-model").filter((rule) => /(^|;)width:auto/.test(rule.body));
+  assert.ok(model.length, ".hs-fb-model must reset the inherited 100% width");
+  for (const rule of model) {
+    assert.ok(
+      weight(rule.selector) > floor,
+      `.hs-fb-model width rule must outrank the generic rule (${rule.selector} vs ${floor})`,
+    );
+  }
+
+  // 档位那格：定宽，同样必须压住通用规则
+  const effort = rulesFor(".hs-fb-effort").filter((rule) => /(^|;)width:\d+px/.test(rule.body));
+  assert.ok(effort.length, ".hs-fb-effort must keep a fixed width");
+  for (const rule of effort) {
+    assert.ok(
+      weight(rule.selector) > floor,
+      `.hs-fb-effort width rule must outrank the generic rule (${rule.selector} vs ${floor})`,
+    );
+  }
+
+  // 行内按钮是定宽图标：被 flex 压扁就点不中
+  const buttons = rulesFor(".hs-fb-row .hs-btn");
+  assert.ok(
+    buttons.some((rule) => /flex:0 0 auto/.test(rule.body)),
+    "fallback row buttons must not shrink",
+  );
+});
+
 /** 渲染一个来自模块 __test 出口的组件。 */
 function renderTestComponent(name, props) {
   const mod = loadModule();
@@ -402,6 +495,77 @@ test("a saved work_dir opens the isolation picker in direct-directory mode", () 
   );
 });
 
+/**
+ * 后备模型链：主模型额度用完后按顺序换下一个。
+ *
+ * 钉住三件事：控件真的出现、已保存的候选按顺序带回、候选的档位来自它自己
+ * 声明的集合（不是执行器全集）。这三条任何一条跑偏，用户看到的「配置好了」
+ * 都与实际执行不一致。
+ */
+test("the auto-config modal offers a saved fallback-model chain in order", () => {
+  const html = renderTestComponent("AutoConfigModal", {
+    options: OPTIONS,
+    auto: {
+      executor: "dsh",
+      model: "deepseek-v4.1-flash",
+      fallback_models: [
+        { provider: "trae", model: "deepseek-v4.1-flash", effort: "xhigh" },
+        { provider: "workbuddy", model: "deepseek-v4.1-flash", effort: "max" },
+      ],
+    },
+    mode: "auto",
+    onClose() {},
+    onDone() {},
+  });
+
+  assert.ok(html.includes("后备模型"), "auto config must offer the fallback chain editor");
+  // 两条都在，且顺序按保存的顺序（1 在 2 前面）
+  const first = html.indexOf("trae/deepseek-v4.1-flash");
+  const second = html.indexOf("workbuddy/deepseek-v4.1-flash");
+  assert.ok(first >= 0 && second >= 0, "both saved candidates must be rendered");
+  assert.ok(first < second, "the saved order must be preserved");
+  // 已保存的档位必须原样选中，而不是被重置成「默认思考」
+  assert.ok(html.includes('value="xhigh"'), "the saved effort of a candidate must be kept");
+  assert.ok(html.includes('value="max"'), "the saved effort of a candidate must be kept");
+});
+
+test("the fallback chain is hidden for executors that do not support it", () => {
+  // codex 的模型来自配置文件：给一个不生效的下拉等于骗人。
+  const html = renderTestComponent("AutoConfigModal", {
+    options: OPTIONS,
+    auto: { executor: "codex" },
+    mode: "auto",
+    onClose() {},
+    onDone() {},
+  });
+  assert.ok(!html.includes("后备模型"), "codex must not show a dsh-only fallback editor");
+});
+
+test("FallbackPicker explains itself when the catalog is empty", () => {
+  const html = renderTestComponent("FallbackPicker", {
+    items: [],
+    models: [],
+    setItems: () => {},
+    onBlocked: () => {},
+  });
+  assert.ok(html.includes("读不到 DSH 的模型目录"), "an empty catalog must be explained");
+  assert.ok(html.includes("还没有后备模型"), "an empty chain must not look broken");
+});
+
+test("FallbackPicker flags a candidate that left the catalog instead of dropping it", () => {
+  // 静默删掉会让人的配置在某次目录变动后「自己消失」——标出来，让人自己决定。
+  const html = renderTestComponent("FallbackPicker", {
+    items: [
+      { provider: "gone", model: "retired-model", effort: null, available: false },
+    ],
+    models: [{ id: "retired-model", name: "Retired", provider: "gone" }],
+    setItems: () => {},
+    onBlocked: () => {},
+  });
+  assert.ok(html.includes("不在目录"), "a missing candidate must be marked");
+  assert.ok(html.includes("retired-model"), "a missing candidate must stay in the list");
+});
+
 test("the run modal offers the same isolation picker", () => {
   const html = renderTestComponent("RunModal", {
     taskId: TASK.id,
@@ -456,7 +620,9 @@ test("SandboxPicker offers the three real sandbox modes", () => {
   assert.match(html, /访问权限隔离/);
   assert.match(html, /只读/);
   assert.match(html, /工作区可写/);
-  assert.match(html, /完全放开/);
+  // 这一档的名字必须和 DSH 界面一致：写成「完全放开」会让人以为切了权限，
+  // 而顶部 chip 显示 custom 时对不上号。
+  assert.match(html, /完全权限/);
 });
 
 test("effortsFor keys on provider so duplicate model ids resolve correctly", () => {
@@ -472,4 +638,104 @@ test("effortsFor keys on provider so duplicate model ids resolve correctly", () 
   assert.deepEqual(effortsFor(dsh, "trae", "deepseek-v4.1-flash"), ["low", "high", "xhigh"]);
   // 不存在的模型退回执行器全集，不伪造
   assert.deepEqual(effortsFor(dsh, null, "no-such-model"), ["low", "medium", "high"]);
+});
+
+/**
+ * 完成通知的可见性回归。
+ *
+ * 实机 bug：面板点「恢复推进」，任务确实被推进到 verified，但前端会话收不到
+ * task.completed —— 因为 store 只把事件写进本机 outbox，真正投递的是另一个
+ * 常驻进程 `handoffctl notifier`，而 studio 引擎从来没起过它。
+ *
+ * 界面上必须能看出「这条通知送到哪了 / 送没送到」，否则用户只能看到任务变成
+ * verified 却什么也收不到，完全无从判断卡在哪。
+ */
+test("the drawer shows where a task's completion notification went", () => {
+  const html = renderTestComponent("Drawer", {
+    detail: DETAIL,
+    run: null,
+    logFiles: [],
+    notifyInfo: {
+      task_id: TASK.id,
+      delivered: true,
+      target: "http://192.168.1.3:8789/v1/handoff/completed",
+      revision: 3,
+      status: "verified",
+      attempts: 0,
+      delivered_at: "2026-11-18T02:00:05Z",
+      last_error: null,
+    },
+    onClose() {},
+  });
+  assert.ok(html.includes("完成通知"), "drawer must have a notification section");
+  assert.ok(html.includes("已送达前端"), "a delivered event must say so");
+  assert.ok(
+    html.includes("192.168.1.3:8789"),
+    "the drawer must name the frontend endpoint the event was sent to",
+  );
+});
+
+test("an undelivered notification explains that delivery is still retrying", () => {
+  const html = renderTestComponent("Drawer", {
+    detail: DETAIL,
+    run: null,
+    logFiles: [],
+    notifyInfo: {
+      task_id: TASK.id,
+      delivered: false,
+      target: "http://192.168.1.3:8789/v1/handoff/completed",
+      revision: 3,
+      status: "verified",
+      attempts: 4,
+      last_error: "通知发送失败: timed out",
+      will_retry: true,
+    },
+    onClose() {},
+  });
+  assert.ok(html.includes("待发送"), "a pending notification must not look delivered");
+  assert.ok(html.includes("timed out"), "the last error must be visible");
+  assert.ok(html.includes("自动重试"), "the user must be told retries are automatic");
+});
+
+test("a task with no notification event says so instead of looking broken", () => {
+  const html = renderTestComponent("Drawer", {
+    detail: DETAIL,
+    run: null,
+    logFiles: [],
+    notifyInfo: { task_id: TASK.id, delivered: false, reason: "no_event" },
+    onClose() {},
+  });
+  assert.ok(html.includes("还没有完成通知"), "no-event must be explained, not blank");
+});
+
+test("the pump label shows liveness and the outstanding count", () => {
+  const { pumpLabel } = loadModule().__test;
+  assert.match(pumpLabel({ running: true, pending: 2, stale: 0 }), /pending 2/);
+  // 线程没在跑必须看得出来，否则「一条也发不出去」会被当成网络问题
+  assert.match(pumpLabel({ running: false, pending: 0, stale: 0 }), /✗/);
+  // 历史积压要单独标出来：它们不会被自动重发
+  assert.match(pumpLabel({ running: true, pending: 3, stale: 2 }), /历史 2/);
+  assert.equal(pumpLabel(null), "");
+});
+
+test("the toolbar surfaces the notification pump and lets you flush it", () => {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  // 投递线程必须挂在顶栏（否则用户看不到 pending 数）
+  assert.ok(source.includes("pumpLabel(pumpInfo)"), "toolbar must render the pump label");
+  assert.ok(
+    source.includes("/api/notify/flush"),
+    "the panel must be able to flush the outbox manually",
+  );
+  assert.ok(
+    source.includes("完成通知还有"),
+    "advance progress must mention outstanding notifications",
+  );
+});
+
+test("the notify-status endpoint is polled alongside the task detail", () => {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.ok(
+    source.includes("/notify-status"),
+    "the drawer's notification section needs /api/tasks/:id/notify-status",
+  );
 });

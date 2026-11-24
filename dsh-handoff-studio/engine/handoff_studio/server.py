@@ -88,6 +88,11 @@ class StudioServer:
                             {"executor": executor, "sessions": owner.service.sessions(executor, task_id=task_id)}
                         )
                         return
+                    if path.startswith("/api/tasks/") and path.endswith("/notify-status"):
+                        # 必须在通用的 /api/tasks/<id> 之前：否则被当成任务 id 解析
+                        task_id = _task_id(path, suffix="/notify-status")
+                        self._send_json({"ok": True, **owner.service.notification_status(task_id)})
+                        return
                     if path.startswith("/api/sessions/"):
                         executor = _task_id(path, prefix="/api/sessions/")
                         task_id = (parse_qs(parts.query).get("task") or [None])[-1]
@@ -144,6 +149,11 @@ class StudioServer:
                     if path == "/api/runs/cancel":
                         self._send_json({"ok": True, **owner.service.cancel()})
                         return
+                    if path == "/api/notify/flush":
+                        # 手动把 outbox 里到期的完成通知发一轮；面板在「恢复推进」
+                        # 结束后会调它兜底（后台线程本身也会自动发）。
+                        self._send_json({"ok": True, "flush": owner.service.flush_notifications()})
+                        return
                     if path == "/api/runs/steer":
                         self._send_json({"ok": True, **owner.service.steer(str(payload.get("text") or ""))})
                         return
@@ -166,6 +176,12 @@ class StudioServer:
                     if path.startswith("/api/tasks/") and path.endswith("/run"):
                         task_id = _task_id(path, suffix="/run")
                         self._send_json({"ok": True, **owner.service.run_task(task_id, **_run_kwargs(payload))})
+                        return
+                    if path.startswith("/api/tasks/") and path.endswith("/session"):
+                        # 手动登记「上一轮用的 DSH 会话」：升级前的老任务没有索引，
+                        # 引擎换进程后内存里的 run 也没了，靠这条把它补回来。
+                        task_id = _task_id(path, suffix="/session")
+                        self._send_json({"ok": True, **owner.service.remember_session(task_id, payload)})
                         return
                     if path.startswith("/api/tasks/") and path.endswith("/retry"):
                         self._send_json({"ok": True, **owner.service.retry(_task_id(path, suffix="/retry"))})

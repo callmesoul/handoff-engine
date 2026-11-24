@@ -735,6 +735,11 @@ class PanelService:
                 keep_worktree=True,
                 workdir=work_dir,
                 reuse_worktree=reuse_worktree,
+                # 额度用尽/限流/服务端故障：在任务单上排好重试时刻，由自动循环
+                # 到点放回 open。关掉就退回「停在 failed 等人点按钮」。
+                auto_retry=self.config.panel.auto_retry,
+                max_auto_retries=self.config.panel.max_auto_retries,
+                retry_base_seconds=self.config.panel.retry_base_seconds,
             )
             run.auto_merge = options.auto_merge
             run.wait_deployment = options.wait_deployment
@@ -823,6 +828,36 @@ class PanelService:
         # delivered 且带未合并 PR 时 cmd_deliver 自己会返回 not_ready，这里不重复判断。
         if status not in ("delivered", "awaiting_merge", "merged", "deployed", "verifying"):
             run.logs.append(f"[{_stamp()}] 状态 {status} 无需自动验收")
+            return
+        # 目录模式的手动执行默认不开自动提交（auto_commit 默认 False），此时的
+        # delivered 任务没有 head_sha / merge_sha，也就没有可对齐的部署目标。
+        # 以前这里照样往下调 cmd_deliver，它只能抛
+        # 「任务缺少 merge_sha/head_sha，无法对齐部署」，在面板上显示成一次
+        # **验收失败**——其实什么都没做错，只是没有可验证的东西。
+        #
+        # 所以先看有没有目标：没有就明确跳过，并把人该做什么写进 deliver 状态。
+        # 这不是把失败藏起来：状态仍是 delivered，日志与面板都说明「未提交」。
+        target = (
+            (task.get("deployment") or {}).get("target_sha")
+            or (task.get("result") or {}).get("merge_sha")
+            or (task.get("result") or {}).get("head_sha")
+        )
+        if not target:
+            message = (
+                "改动尚未提交/推送（目录模式未开自动提交），没有可对齐的部署目标；"
+                "先在工作目录提交并推送，再「恢复推进」重新验收"
+            )
+            run.logs.append(f"[{_stamp()}] 跳过自动验收：{message}")
+            with self._lock:
+                self._deliver = {
+                    "task_id": task_id,
+                    "done": True,
+                    "started_at": iso(),
+                    "finished_at": iso(),
+                    "result": {"id": task_id, "result": "no_target", "message": message},
+                    "error": None,
+                    "auto": True,
+                }
             return
         from ..cli import cmd_deliver
 
@@ -1237,6 +1272,62 @@ class PanelService:
                 return task["id"]
         return None
 
+    def _requeue_due_retries(self) -> list[str]:
+        """把到点的可重试失败放回 open，返回本轮放回的任务 id。
+
+        额度用尽、限流、服务端故障这类失败不是「做不成」，只是「现在不行」。
+        worker 失败时已经在 `failure.retry_at` 记下了该重试的时刻，这里到点就把它
+        转回 open——自动循环下一轮自然会捡起来，并按 session_strategy 续跑原会话。
+
+        为什么用 `failed → open` 而不是新状态：状态机本来就有这条合法转换
+        （「重新入队，attempt+1」），语义完全一致，没必要为它多开一个状态去扩散
+        影响面。为什么不用 `claimed`：那是 worker 认领时的转移，面板不该抢。
+        """
+        reopened: list[str] = []
+        try:
+            candidates = self._store().peek_tasks(status="failed")
+        except HandoffError:
+            return reopened
+        current = now()
+        for task in candidates:
+            failure = task.get("failure") or {}
+            if not failure.get("retryable"):
+                continue
+            retry_at = failure.get("retry_at")
+            if not retry_at:
+                continue
+            try:
+                due = parse(retry_at) <= current
+            except (ValueError, TypeError):
+                continue
+            if not due:
+                continue
+            task_id = task.get("id")
+            try:
+                # 先把 claim 清掉：失败时 claim 还留着，直接 transition 会在
+                # claim 校验处被挡（租约未过期）。release_lease 本身就会把状态
+                # 一并置回 open。
+                if task.get("claim"):
+                    self._store(push=False).release_lease(
+                        task_id,
+                        actor=self.PANEL_ACTOR,
+                        reason="额度/服务恢复，自动重试",
+                        sync=False,
+                    )
+                else:
+                    self._store(push=False).transition(
+                        task_id,
+                        "open",
+                        expected_revision=task["revision"],
+                        summary="额度/服务恢复，自动重试重新入队",
+                        actor=self.PANEL_ACTOR,
+                    )
+                reopened.append(task_id)
+            except HandoffError:
+                # 单个任务重排失败（revision 变了、别人抢先了）不该拖垮整轮
+                continue
+        return reopened
+
     def _auto_loop(self) -> None:
         self._start_wake_server()
         panel = self.config.panel
@@ -1246,6 +1337,13 @@ class PanelService:
             with self._lock:
                 mode = self._panel_state["mode"]
                 auto_cfg = dict(self._panel_state["auto"])
+            # 两种模式都要跑：任务可能是人在手动模式下点执行时撞上额度耗尽的，
+            # 那时不该因为「没切到自动模式」就把重试一起丢掉。这一步只做状态
+            # 回收（failed → open），真正执行仍然受下面 auto 分支的串行闸约束。
+            for retried in self._requeue_due_retries():
+                # 面板服务没有自己的 logger；这行只作诊断，写到 stderr 免得
+                # 依赖一个不存在的属性把整个自动循环打挂。
+                print(f"[panel] 额度/服务已恢复，重新入队：{retried}", flush=True)
             if mode == "auto":
                 # 串行闸 1：本面板的执行线程还没收尾，等它跑完，本轮绝不挑新任务
                 with self._lock:

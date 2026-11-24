@@ -361,6 +361,13 @@ class PanelConfig:
     wait_deployment: bool = True
     # 目录模式执行完自动提交并推送（AI 写提交信息）；默认关，勾了才生效
     auto_commit: bool = False
+    # 额度用尽 / 限流 / 服务端故障这类失败，是否排进「到点自动重试」。
+    # 默认开：这类失败不是「做不成」，只是「现在不行」，按死在 failed 等人回来
+    # 点按钮是浪费。关掉就退回旧行为。
+    auto_retry: bool = True
+    # 自动重试上限（不含第一次执行）与指数退避的基数秒数
+    max_auto_retries: int = 3
+    retry_base_seconds: int = 300
     # 自动模式的默认工作目录：填了就直接在这个目录跑，不建隔离 worktree。
     # 留空时按任务的 target.repo 回退到 config/local.yaml 的 repo_paths。
     default_work_dir: str | None = None

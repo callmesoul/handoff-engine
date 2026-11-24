@@ -261,7 +261,13 @@ def test_resolve_id_placeholders_leaves_real_paths_alone():
     }
     before = repr(task)
     resolve_id_placeholders("ho-other", task)
-    assert repr(task) == before
+    # 契约路径是真实路径，不该被 <id> 替换逻辑误改；裸 openapi 端点仍按规则补 key。
+    assert task["contract"]["path"] == "contracts/ho-real/api.yaml"
+    assert task["acceptance"]["checks"][0]["expected_path"] == "contracts/ho-real/api.yaml"
+    assert task["acceptance"]["checks"][0]["actual_url"] == (
+        "{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}"
+    )
+    assert "sha256" in task["contract"]
 
 
 def test_create_with_explicit_source_repo_wins(tmp_path):
@@ -417,19 +423,32 @@ def test_create_remains_successful_when_notification_is_pending(tmp_path, monkey
 
 
 def test_resolve_id_placeholders_normalizes_bare_openapi_url():
-    """裸 {base_url}/openapi.json（404）落库前规范化为带 apikey 的 docs 端点。"""
+    """裸 openapi 端点（404/401）落库前规范化为带 apikey 的 docs 端点。"""
     from handoff.cli import resolve_id_placeholders
 
     task_id = "ho-20261117-01TEST0000000000000000"
+    canonical = "{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}"
     task = {
         "id": task_id,
         "acceptance": {
             "checks": [
                 {
-                    "id": "contract",
+                    "id": "bare-root",
                     "type": "openapi_diff",
                     "expected_path": "contracts/<id>/spec.yaml",
                     "actual_url": "{base_url}/openapi.json",
+                },
+                {
+                    "id": "bare-docs",
+                    "type": "openapi_diff",
+                    "expected_path": "contracts/<id>/spec2.yaml",
+                    "actual_url": "{base_url}/docs/openapi.json",
+                },
+                {
+                    "id": "already-keyed",
+                    "type": "openapi_diff",
+                    "expected_path": "contracts/<id>/spec3.yaml",
+                    "actual_url": "{base_url}/docs/openapi.json?apikey=explicit",
                 },
                 {
                     "id": "other",
@@ -440,12 +459,14 @@ def test_resolve_id_placeholders_normalizes_bare_openapi_url():
         },
     }
     resolve_id_placeholders(task_id, task)
-    assert task["acceptance"]["checks"][0]["actual_url"] == (
-        "{base_url}/docs/openapi.json?apikey={env:DOCS_API_KEY}"
-    )
-    assert task["acceptance"]["checks"][0]["expected_path"] == f"contracts/{task_id}/spec.yaml"
-    # 非 openapi_diff / 显式其它地址不受影响
-    assert task["acceptance"]["checks"][1]["url"] == "{base_url}/healthz"
+    checks = task["acceptance"]["checks"]
+    # 裸 root（404）与裸 docs（401）都补上 apikey
+    assert checks[0]["actual_url"] == canonical
+    assert checks[1]["actual_url"] == canonical
+    # 已经显式带 key 的地址、非 openapi_diff 的地址不受影响
+    assert checks[2]["actual_url"] == "{base_url}/docs/openapi.json?apikey=explicit"
+    assert checks[3]["url"] == "{base_url}/healthz"
+    assert checks[0]["expected_path"] == f"contracts/{task_id}/spec.yaml"
 
     # 幂等：再跑一次不再变化
     before = repr(task)

@@ -24,7 +24,8 @@
  * @module dsh-handoff-studio
  */
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -33,6 +34,21 @@ import { fileURLToPath } from "node:url";
 
 /** Stable Cordis plugin name. */
 const name = "dsh-handoff-studio";
+
+const execFileAsync = promisify(execFile);
+
+/** engineAlive 探测超时（毫秒）。 */
+const ENGINE_PROBE_TIMEOUT_MS = 1200;
+
+/**
+ * Windows 上 `venv/Scripts/python.exe` 会把真正的解释器再 exec 一层：
+ * 外层 wrapper 退出后，监听端口的是内层进程。`netstat /taskkill` 都按 pid 走，
+ * 所以必须知道这个「监听 pid」才能可靠释放端口。
+ *
+ * 这些是可调常量，测试里可以缩短等待时间。
+ */
+const ENGINE_PROBE_INTERVAL_MS = 50;
+const ENGINE_STOP_TIMEOUT_MS = 3000;
 
 /** Services required before the routes can be claimed. */
 const inject = ["webServer", "agentLoop", "sessionController", "agentPresets"];
@@ -59,6 +75,20 @@ const DEFAULT_ENGINE_PORT = 8791;
  * （dsh-sandbox-policy/src/session-mode.ts），传别的值会被静默忽略成「跟随默认」。
  */
 const SANDBOX_MODES = Object.freeze(["read-only", "workspace-write", "danger-full-access"]);
+
+/**
+ * 沙箱档位 → 宿主权限预设名。
+ *
+ * 宿主的权限是「沙箱 + 审批」两个旋钮的组合，界面上的名字（只读 / 工作区内修改 /
+ * 完全权限）是拿这两个旋钮去预设表里**反查**出来的；两个旋钮对不上任何一行就显示
+ * `custom`。发版默认表里档位名与预设名一一同名（dsh-base/cordis.patch.yml 的
+ * `permission` 条目），所以直接按同名映射。表被改过时下面的代码会先查目录再决定。
+ */
+const PRESET_FOR_SANDBOX = Object.freeze({
+  "read-only": "read-only",
+  "workspace-write": "workspace-write",
+  "danger-full-access": "danger-full-access",
+});
 
 const FIELDS = {
   token: { kind: "string", fallback: "", check: () => true },
@@ -345,6 +375,35 @@ function oneLine(text, limit = 400) {
 }
 
 /**
+ * The machine-readable reason a turn ended, or null for a clean ending.
+ *
+ * Only `turn/end` with `reason.kind === "error"` carries one: the agent loop
+ * writes `{ kind: "error", error: <LlmError failure> }` and the failure's `code`
+ * is the stable taxonomy of `@deepseek-ai/dsh-llm` (`QUOTA`, `ACCOUNT_QUOTA`,
+ * `RATE_LIMIT`, `UNKNOWN_MODEL`, …). `completed` / `aborted` / `blocked` /
+ * `max-tokens` are not failures and must not be reported as one.
+ *
+ * Why the panel needs it: when a turn dies because the model's quota is gone,
+ * the turn ends *before* an assistant message, so the run only shows "no
+ * structured JSON" — which reads like the agent misbehaved instead of like the
+ * model being unavailable. The code says which it was, and the studio engine
+ * uses exactly this to decide whether switching to another model can help.
+ */
+function turnFailureOf(event) {
+  if (!event || event.type !== "turn/end") return null;
+  const reason = event.data?.reason;
+  if (!reason || reason.kind !== "error") return null;
+  const raw = reason.error;
+  if (!raw || typeof raw !== "object") {
+    return { code: "UNKNOWN", message: "", status: null };
+  }
+  const code = typeof raw.code === "string" && raw.code ? raw.code : "UNKNOWN";
+  const message = typeof raw.message === "string" ? raw.message : "";
+  const status = Number.isInteger(raw.status) ? raw.status : null;
+  return { code, message: oneLine(message, 400), status };
+}
+
+/**
  * Turn one committed session event into a human log line, or null.
  * Mirrors what the panel showed for codex/zcode so the log reads the same way.
  */
@@ -355,6 +414,11 @@ function describeEvent(event) {
     case "turn/start":
       return `▶ 第 ${data.turn} 轮开始`;
     case "turn/end": {
+      const failure = turnFailureOf(event);
+      if (failure) {
+        const detail = failure.message ? ` ${failure.message}` : "";
+        return `■ 第 ${data.turn} 轮结束（error: ${failure.code}${detail}）`;
+      }
       const reason = data.reason?.kind ?? "?";
       return `■ 第 ${data.turn} 轮结束（${reason}）`;
     }
@@ -425,24 +489,144 @@ function apply(ctx, config) {
   /**
    * 把这一轮选定的沙箱模式落到 Agent 所属的 Session 上。
    *
-   * 为什么必须这么做：`AgentOptions` 只有 provider/model/reasoningEffort/
-   * maxTokens/subagentDepth，没有权限字段——沙箱模式是**按会话**的策略，由
-   * `ctx.sandboxPolicy` 解析（resolve({session}).mode），写入路径是唯一的那一条：
-   * 往 session 追加一个 `sandbox/mode` 事件。所以这里自己 append，而不是去
-   * 构造一个宿主不认识的 agentOptions 字段。
+   * `AgentOptions` 只有 provider/model/reasoningEffort/maxTokens/subagentDepth，
+   * 没有权限字段——权限是**按会话**的策略。写它有两条路：
    *
-   * 不做这件事的后果：mode 为 null 时 Agent 跑在部署默认档上，面板上选的
-   * 「访问隔离」就只是个装饰。
+   *  1. 只往 session 追加一条 `sandbox/mode`（老做法）。沙箱确实变了，但审批
+   *     策略还停在部署默认（通常是 `ask`），于是 DSH 界面拿「沙箱 + 审批」两个
+   *     旋钮去预设表反查时对不上任何一行，权限 chip 显示成 `Custom`。用户会以为
+   *     自己没切成，其实只是标签反查失败。
+   *  2. `ctx.permissionPresets.set(session, 预设名)`（DSH 自带的权限服务）。它会
+   *     一次性写 `permission/preset` + 两个旋钮，和用户在界面上点那一档完全等价，
+   *     chip 显示的就是「只读 / 工作区内修改 / 完全权限」。
+   *
+   * 所以优先走 (2)；(2) 不可用（老版本宿主、或该 profile 没装权限服务）时退回 (1)，
+   * 这样至少沙箱隔离是真的生效的，只是标签可能显示 custom——失败要可解释，
+   * 不能假装成功。
+   *
+   * 但 (2) 只在预设自带「不审批」时才用。原因：这个插件跑的是无人值守任务，没人
+   * 守着那个会话回答审批框。预设表里只有 `danger-full-access` 是 `never`，
+   * 另外两档都带 `ask`——照抄预设会让「只读/工作区可写」的任务卡在一个没人回答
+   * 的审批上。宁可让那两档显示 custom，也不能让任务停在那儿。
+   *
+   * 预设表被部署改过时（比如 `danger-full-access` 被配成别的沙箱），同名预设
+   * 未必还是同一个沙箱：那种情况也退回 (1)，保证沙箱正确，不按名字盲选。
    */
   function applySandboxMode(run) {
     if (!run.sandbox) return null;
-    const session = run.handle?.agent?.session;
+    const agent = run.handle?.agent;
+    const session = agent?.session;
     if (!session || typeof session.append !== "function") {
       // 拿不到 session 就没法保证隔离真的生效，明确失败比假装成功好
       throw new Error("无法应用访问权限隔离：Agent 没有暴露 session");
     }
+
+    // 用 ctx.get 读可选服务：宿主没装权限服务时它返回 undefined；直接读
+    // ctx.permissionPresets 在 cordis 里会抛「cannot get property without inject」。
+    const presets = ctx.get?.("permissionPresets");
+    const name = PRESET_FOR_SANDBOX[run.sandbox];
+    if (presets && name) {
+      let spec;
+      try {
+        // resolve() 在不认识这个名字时会抛错，正好判断「这个部署有没有这一档」
+        spec = presets.resolve(name);
+      } catch {
+        spec = undefined;
+      }
+      // 沙箱必须对得上（部署改过表就不信任），审批必须是 never（无人值守能跑）
+      if (spec && spec.sandbox === run.sandbox && spec.approval === "never") {
+        try {
+          presets.set(session, name);
+          run.permissionPreset = name;
+          return run.sandbox;
+        } catch (error) {
+          pushLine(run, `⚠ 权限预设 ${name} 应用失败，退回只写沙箱档位：${oneLine(error?.message ?? String(error), 200)}`);
+        }
+      }
+    }
+
     session.append("sandbox/mode", { mode: run.sandbox });
     return run.sandbox;
+  }
+
+  /**
+   * 在 Agent **发布之前**把 preset 组成挂上去，这是宿主自己创建会话时走的同一条路
+   * （`dsh-api-session-controller` 的 `composeAgent()`：`presets.resolve()` → setup
+   * 里 `presets.mount()`）。
+   *
+   * 为什么不能在 createAgent/resume 返回之后再 `select()`：`select()` 只允许在
+   * 会话开始第一轮**之前**改组成，否则抛 `agent-preset/locked`
+   * “This session has already started”。续跑一个跑过的会话必然踩到它——上一轮
+   * 的日志明明就在那儿，人点「继续上次会话」却只能得到一句绑定失败。
+   *
+   * 挂载失败的语义保持不变：宁可这一轮直接失败并说清原因，也不要让 Agent 带着
+   * 分析型的工具集跑一圈回来报「我没有工具」。
+   */
+  function presetSetup(run) {
+    if (!config.agentPreset) return undefined;
+    return async (agentCtx, agent) => {
+      let recorded = null;
+      try {
+        // projection 读的是会话日志里的 agent-preset/selected（新建会话则读
+        // header 的 meta.agentPreset）。读不到就当没有记录，别让一次投影故障
+        // 把整轮拦下来。
+        recorded = ctx.agentPresets.presetForSession?.(agent.session) ?? null;
+      } catch {
+        recorded = null;
+      }
+      let id = config.agentPreset;
+      if (recorded) {
+        try {
+          // 宿主的 resolve() 是 async 的：不 await 就会拿一个 Promise 的 .id，
+          // 而且它的 not-found 会变成没人处理的 rejection。
+          id = (await ctx.agentPresets.resolve(recorded))?.id ?? recorded;
+        } catch {
+          pushLine(
+            run,
+            `⚠ 会话记录的组成 ${recorded} 已不在本机花名册里，改用插件配置的 ${config.agentPreset}`,
+          );
+          id = config.agentPreset;
+        }
+      }
+      if (typeof ctx.agentPresets.mount !== "function") {
+        // 老宿主没有 mount()：留给 createAgent 之后的 select() 兜底
+        run.presetTarget = id;
+        return;
+      }
+      try {
+        const mounted = await ctx.agentPresets.mount(agentCtx, id);
+        run.preset = mounted?.id ?? id;
+      } catch (error) {
+        throw presetFailure(id, error);
+      }
+      // 日志必须诚实：续跑时若挂的组成与会话记录的不同（老会话没记录、或记录
+      // 的已下架），就把这次选择写进会话事件，而不是让 projection 停在旧值上。
+      // 新建会话不用补：宿主已经把它写进 session header（meta.agentPreset），
+      // 再追加一条只会让「这一轮动了什么」变得难读。
+      if (recorded !== run.preset && run.resumeSessionId) {
+        try {
+          agent.session.append("agent-preset/selected", { agentPreset: run.preset });
+        } catch {
+          // 记录失败不影响已经挂好的组成，只是历史里少一行
+        }
+      }
+      pushLine(run, `▶ 执行组成：${run.preset}`);
+    };
+  }
+
+  /** 把 preset 绑定失败翻成一句能照做的话（含本机实际有哪些）。 */
+  function presetFailure(id, error) {
+    // 宿主的 not-found 是 RemoteError：结构化字段在 `details`，老版本/普通
+    // Error 上可能落在 `data`。两个都看，拿不到就不硬塞提示。
+    const payload = error?.details ?? error?.data;
+    const available = Array.isArray(payload?.available) ? payload.available : [];
+    const hint = available.length > 0 ? `本机可用：${available.join(", ")}` : "";
+    const reason = error?.message ?? String(error);
+    const suffix = hint ? `（${hint}）` : "";
+    return new Error(
+      `执行型 Agent 需要 preset ${id}，但绑定失败：${reason}${suffix}。` +
+        "确认该 preset 在 DSH 里存在且未损坏（插件配置项 agentPreset）。",
+    );
   }
 
   /**
@@ -459,6 +643,12 @@ function apply(ctx, config) {
         if (text) run.text = text;
         if (event.data?.interrupted) run.interrupted = true;
       }
+      // 模型不可用（额度耗尽 / 限流 / 鉴权 / 未知模型）只能从 turn/end 的
+      // 结构化 reason 里读出来：那一轮不会产出 assistant/message，光看最终文本
+      // 只会得到「没有结构化结果」，把「额度用完了」显示成「agent 不听话」。
+      // 记在这里，Python 侧据此决定「换下一个候选模型」还是「直接失败」。
+      const failure = turnFailureOf(event);
+      if (failure) run.failure = failure;
       const line = describeEvent(event);
       if (line) pushLine(run, line);
     });
@@ -470,10 +660,14 @@ function apply(ctx, config) {
       if (run.model) agentOptions.model = run.model;
       if (run.effort) agentOptions.reasoningEffort = run.effort;
 
+      // 组成在 publish 之前挂载：宿主的 createAgent/resume 都接受 setup，
+      // 而这时候会话还没有任何一轮，正是唯一允许改组成的窗口（见 presetSetup）。
+      const setup = presetSetup(run);
       if (run.resumeSessionId) {
         handle = await ctx.agentLoop.resume(ctx, {
           resumeSessionId: run.resumeSessionId,
           agentOptions,
+          ...(setup ? { setup } : {}),
           signal: controller.signal,
         });
         run.sessionId = handle.agent.id;
@@ -482,6 +676,7 @@ function apply(ctx, config) {
           sessionId: run.sessionId,
           meta: { cwd: run.cwd, agentPreset: config.agentPreset || undefined },
           agentOptions,
+          ...(setup ? { setup } : {}),
           signal: controller.signal,
         });
       }
@@ -490,28 +685,39 @@ function apply(ctx, config) {
       // 访问权限隔离要在 Agent 干活之前就位：它作用于此后的每一次受限调用
       // （bash / fs / terminal），晚一步就等于第一轮无隔离地跑过。
       const appliedSandbox = applySandboxMode(run);
-      if (appliedSandbox) pushLine(run, `▶ 访问权限：${appliedSandbox}`);
-
-      // 无人值守：不弹审批，别让一次 run 卡在一个等不到人的对话框上
-      try {
-        ctx.approval?.setPolicy?.(handle.agent, "never");
-      } catch {
-        // 没有 approval 服务的 profile 不影响执行
+      if (appliedSandbox) {
+        pushLine(
+          run,
+          run.permissionPreset
+            ? `▶ 访问权限：${appliedSandbox}（权限模式 ${run.permissionPreset}）`
+            : `▶ 访问权限：${appliedSandbox}（宿主的权限模式会显示 custom）`,
+        );
       }
 
-      // Agent 的执行能力来自它的 preset 组成。不显式绑定时，新建 Agent 会加入
-      // **当前 Session** 的组成——从分析型会话里发起的 run 因此没有 shell，
-      // 连写一个文件都做不到。这里显式选 preset，并在选不上时直接失败，
-      // 而不是让 Agent 跑一圈回来报「我没有工具」。
-      if (config.agentPreset) {
+      // 无人值守的兜底：不弹审批，别让一次 run 卡在一个等不到人的对话框上。
+      //
+      // 注意顺序上的因果关系：审批策略是预设的一部分。走了预设（下面
+      // permissionPreset 非空）时，审批已经由预设定好——完全权限本来就是
+      // never，所以无需再动；此时如果硬改成 never，遇到「只读/工作区可写」
+      // 反而会把「沙箱 + 审批」拧成预设表里没有的组合，标签又变回 custom。
+      // 所以只有退回「只写沙箱」那条路（没装权限服务）时才补这一手，保证
+      // 无人值守这个行为不丢。
+      if (!run.permissionPreset) {
         try {
-          await ctx.agentPresets.select(handle.agent, config.agentPreset);
-          pushLine(run, `▶ 执行组成：${config.agentPreset}`);
+          ctx.approval?.setPolicy?.(handle.agent, "never");
+        } catch {
+          // 没有 approval 服务的 profile 不影响执行
+        }
+      }
+
+      // 老宿主没有 agentPresets.mount()：setup 里只记下了目标 id，这里补一次
+      // select()。新宿主上 setup 已经把组成挂好，run.preset 非空，跳过。
+      if (config.agentPreset && !run.preset && run.presetTarget) {
+        try {
+          run.preset = await ctx.agentPresets.select(handle.agent, run.presetTarget);
+          pushLine(run, `▶ 执行组成：${run.preset ?? run.presetTarget}`);
         } catch (error) {
-          throw new Error(
-            `执行型 Agent 需要 preset ${config.agentPreset}，但绑定失败：${error?.message ?? String(error)}。` +
-              "确认该 preset 在 DSH 里存在且未损坏（插件配置项 agentPreset）。",
-          );
+          throw presetFailure(run.presetTarget, error);
         }
       }
 
@@ -582,10 +788,10 @@ function apply(ctx, config) {
   }
 
   /** Is something already answering as a studio engine on this port? */
-  async function engineAlive(port) {
+  async function engineAlive(port, timeoutMs = ENGINE_PROBE_TIMEOUT_MS) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/studio/models`, {
-        signal: AbortSignal.timeout(1200),
+        signal: AbortSignal.timeout(timeoutMs),
         headers: { accept: "application/json" },
       });
       if (!response.ok) return false;
@@ -596,8 +802,69 @@ function apply(ctx, config) {
     }
   }
 
+  /** Which pid is listening on a loopback TCP port?  `[]` when nobody is. */
+  async function portOwnerPids(port) {
+    if (process.platform !== "win32") return [];
+    try {
+      const { stdout } = await execFileAsync(
+        "netstat",
+        ["-ano", "-p", "TCP"],
+        { windowsHide: true, timeout: ENGINE_PROBE_TIMEOUT_MS, encoding: "utf8" },
+      );
+      const pids = new Set();
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!/LISTENING/i.test(line)) continue;
+        const cells = line.trim().split(/\s+/);
+        // IPv4: TCP  127.0.0.1:8791  0.0.0.0:0  LISTENING  1234
+        // IPv6: TCP  [::1]:8791      [::]:0     LISTENING  1234
+        const local = cells[1] ?? "";
+        const pid = Number(cells.at(-1));
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        if (/^127\.0\.0\.1:/.test(local) || /^\[::1\]:/.test(local)) {
+          if (Number(local.replace(/^.*:/, "")) === port) pids.add(pid);
+        }
+      }
+      return [...pids];
+    } catch {
+      return [];
+    }
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * Wait for the port to be free, killing any listener we find.
+   * The venv python re-execs a base interpreter, so the pid we spawned is only
+   * a wrapper — the real listener must be found by port and killed too.
+   * Returns `{ ok, pids }`; `ok: false` means a foreign process refused to die.
+   */
+  async function freePort(port, timeoutMs = ENGINE_STOP_TIMEOUT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    const killed = new Set();
+    while (Date.now() < deadline) {
+      const pids = (await portOwnerPids(port)).filter((pid) => pid !== process.pid);
+      if (pids.length === 0) return { ok: true, pids: [...killed] };
+      for (const pid of pids) {
+        if (killed.has(pid)) continue;
+        killed.add(pid);
+        try {
+          process.kill(pid, "SIGKILL");
+          ctx.logger?.info?.(`handoff studio: killed stale engine pid ${pid} on port ${port}`);
+        } catch {
+          // 进程可能刚好自己退了，下一轮探测会确认
+        }
+      }
+      await sleep(ENGINE_PROBE_INTERVAL_MS);
+    }
+    const remaining = (await portOwnerPids(port)).filter((pid) => pid !== process.pid);
+    return { ok: remaining.length === 0, pids: [...killed] };
+  }
+
   function ensureEngine() {
-    if (engine && engine.child && engine.child.exitCode === null) return engine.ready;
+    // 无论成功与否，都复用同一条 in-flight promise：
+    // 否则并发的面板请求会在 engineAlive 的时间窗里各自 spawn 一个引擎，
+    // 第二个 bind 8791 就得到 WinError 10048。
+    if (engine) return engine.ready;
     const paths = enginePaths();
     const port = config.enginePort;
     const env = {
@@ -612,8 +879,6 @@ function apply(ctx, config) {
     const args = ["-m", "handoff_studio", "--port", String(port)];
     if (paths.root) args.push("--root", paths.root);
 
-    // 端口上已经有一个引擎在跑（比如插件重启、而旧引擎还活着）：直接用它，
-    // 别去 spawn 第二个——第二个会在 bind 时失败，或者更糟，让请求落到旧代码上。
     const record = { child: null, port, ready: null };
     engine = record;
     record.ready = (async () => {
@@ -621,8 +886,23 @@ function apply(ctx, config) {
         ctx.logger?.info?.(`handoff studio: reusing the engine already listening on ${port}`);
         return { ok: true, port, reused: true };
       }
+      // 有进程占着端口但不是健康引擎（半死不活的旧实例）：先清掉再拉新的。
+      const freed = await freePort(port);
+      if (!freed.ok) {
+        return {
+          ok: false,
+          error:
+            `端口 ${port} 被占用且无法释放（pid ${(await portOwnerPids(port)).join(", ")}）。` +
+            "关闭占用程序或改用其它 enginePort 后重启 DSH。",
+        };
+      }
       return await spawnEngine(paths, port, env, args, record);
-    })();
+    })().then((result) => {
+      // 失败的 ready 不能永久缓存：否则一次超时/启动错误会让面板 forever 503，
+      // 后续请求再也没有重试机会。清掉 record，下一条请求重新探测并拉起。
+      if (!result?.ok && engine === record) engine = null;
+      return result;
+    });
     return record.ready;
   }
 
@@ -638,10 +918,10 @@ function apply(ctx, config) {
       // 引擎把真正的失败原因写在 stderr（比如缺 handoff 包、config 加载失败）。
       // 只报 "exited (1)" 等于让人猜，所以把尾巴留着一起返回。
       let stderrTail = "";
-      const done = (ok, reason) => {
+      const done = (ok, result) => {
         if (settled) return;
         settled = true;
-        resolve(ok ? { ok: true, port } : { ok: false, error: reason });
+        resolve(result !== undefined ? result : { ok, port });
       };
       child.stdout?.on("data", () => {});
       child.stderr?.on("data", (chunk) => {
@@ -653,21 +933,43 @@ function apply(ctx, config) {
       child.on("error", (error) => {
         done(
           false,
-          `无法启动 studio 引擎（${paths.python}）：${error?.message ?? String(error)}。` +
-            "在插件配置里设 pythonPath 指向一个能 import handoff 的解释器。",
+          {
+            ok: false,
+            error:
+              `无法启动 studio 引擎（${paths.python}）：${error?.message ?? String(error)}。` +
+              "在插件配置里设 pythonPath 指向一个能 import handoff 的解释器。",
+          },
         );
       });
       child.on("exit", (code) => {
         const detail = stderrTail.trim().split("\n").slice(-6).join(" | ");
-        done(
-          false,
-          `studio 引擎退出（code ${code}）${detail ? `：${detail}` : ""}。` +
-            `检查 pythonPath=${paths.python}、engineModulePath=${paths.modulePath || "(空)"}、engineRoot=${paths.root || "(空)"}。`,
-        );
+        // WinError 10048 是端口冲突：按错误码精确识别，换成可操作的提示，
+        // 不再把 pythonPath / engineModulePath / engineRoot 一并倒给用户（它们与冲突无关）。
+        const bindFailure = code === 1 && detail.includes("WinError 10048");
+        const error = bindFailure
+          ? `studio 引擎启动失败：端口 ${port} 已被占用（WinError 10048）。` +
+            "通常是上一次的引擎进程还没退出（venv python 会再 exec 一层基础解释器，外层被杀掉后内层仍占着端口）。" +
+            "请在 DSH 里重载/禁用再启用本插件以释放旧引擎，或改用其它 enginePort 后重启 DSH。"
+          : `studio 引擎退出（code ${code}）${detail ? `：${detail}` : ""}。` +
+            `检查 pythonPath=${paths.python}、engineModulePath=${paths.modulePath || "(空)"}、engineRoot=${paths.root || "(空)"}。`;
+        done(false, { ok: false, error });
         if (engine === record) engine = null;
       });
-      // 等不到横幅也别一直挂着：端口可能已经能连（横幅被缓存/丢失）
-      setTimeout(() => done(true), 4000).unref?.();
+      // 等不到横幅也别一直挂着：端口可能已经能连（横幅被缓存/丢失），
+      // 但要先确认真的连得上，避免把失败当成成功而静默挂掉。
+      setTimeout(async () => {
+        const alive = await engineAlive(port, 600);
+        if (alive) done(true);
+        else if (!settled) {
+          const detail = stderrTail.trim().split("\n").slice(-6).join(" | ");
+          done(false, {
+            ok: false,
+            error:
+              `studio 引擎启动超时（4s）且端口 ${port} 无响应${detail ? `：${detail}` : ""}。` +
+              `检查 pythonPath=${paths.python}、engineModulePath=${paths.modulePath || "(空)"}、engineRoot=${paths.root || "(空)"}。`,
+          });
+        }
+      }, 4000).unref?.();
     });
   }
 
@@ -677,15 +979,19 @@ function apply(ctx, config) {
     return status.port;
   }
 
-  function stopEngine() {
+  async function stopEngine() {
     const record = engine;
     engine = null;
-    if (!record?.child) return;
-    try {
-      record.child.kill();
-    } catch {
-      // 已经退出
+    // 先杀 wrapper；venv python 会再 exec 一层基础解释器，真正的监听 pid
+    // 只能按端口找到，所以随后用 freePort 把它一起收掉。
+    if (record?.child) {
+      try {
+        record.child.kill();
+      } catch {
+        // 已经退出
+      }
     }
+    if (record?.port) await freePort(record.port);
   }
 
   /** Proxy one panel request to the studio engine, same origin, no CORS. */
@@ -815,6 +1121,13 @@ function apply(ctx, config) {
         },
         engine: engineStatus,
         agentPreset: config.agentPreset,
+        // 组成是怎么挂上去的：setup（发布前 mount，唯一对续跑也成立的路）或
+        // select（老宿主的退回路径）。人排查「续跑报 This session has already
+        // started」时先看这一行。
+        agentPresetBinding: typeof ctx.agentPresets?.mount === "function" ? "setup" : "select",
+        // 访问权限隔离靠宿主的权限服务才写得成「命名预设」；没有它就只能退回
+        // 只写沙箱档位，界面会显示 custom。自检时一眼能看出是哪条路。
+        permissionPresets: Boolean(ctx.get?.("permissionPresets")),
         runs: [...runs.values()].length,
       });
       return;
@@ -860,14 +1173,23 @@ function apply(ctx, config) {
         effort: typeof payload.effort === "string" ? payload.effort : null,
         // 访问权限隔离：三档沙箱模式，null 表示跟随部署默认。
         // 这不是 AgentOptions 能表达的东西（AgentOptions 只有 provider/model/
-        // reasoningEffort/maxTokens/subagentDepth），必须走 sandboxPolicy 的
-        // 每会话覆盖路径，见 applySandboxMode()。
+        // reasoningEffort/maxTokens/subagentDepth），必须走每会话覆盖，
+        // 见 applySandboxMode()。
         sandbox: SANDBOX_MODES.includes(payload.sandbox) ? payload.sandbox : null,
+        // 实际应用的宿主权限预设名；null = 只写了沙箱档位（界面会显示 custom）
+        permissionPreset: null,
         resumeSessionId,
         sessionId: resumeSessionId || newSessionId(),
+        // 实际挂载的执行组成；null = 这轮没挂（旧宿主只走 select 时有 presetTarget）
+        preset: null,
+        // 旧宿主退回 select() 时才用得到（没有 agentPresets.mount）
+        presetTarget: null,
         logs: [],
         text: "",
         error: null,
+        // 本轮最后一轮的模型级失败（额度 / 限流 / 鉴权…），来自 turn/end 的
+        // 结构化 reason；null 表示没观察到这类失败。
+        failure: null,
         timedOut: false,
         interrupted: false,
         cancelRequested: false,
@@ -888,6 +1210,7 @@ function apply(ctx, config) {
         provider: run.provider,
         model: run.model,
         sandbox: run.sandbox,
+        // 权限预设随后在 execute() 里才写入，这里先不报；状态接口里有
       });
       return;
     }
@@ -910,10 +1233,17 @@ function apply(ctx, config) {
         provider: run.provider,
         model: run.model,
         sandbox: run.sandbox,
+        // 实际写入的宿主权限预设；null 表示这轮只写了沙箱档位（界面显示 custom）
+        permissionPreset: run.permissionPreset,
+        // 实际挂载的执行组成（agent preset）；null 表示这轮没挂
+        agentPreset: run.preset ?? null,
         cursor: from + slice.length,
         logs: slice,
         text: run.phase === "finished" ? run.text : "",
         error: run.error,
+        // 模型级失败（额度 / 限流 / 鉴权 / 未知模型）的结构化原因：Python 侧
+        // 用它区分「这个模型这轮用不了，换下一个候选」和「agent 真的没做好」。
+        failure: run.failure,
         timedOut: run.timedOut,
         interrupted: run.interrupted,
         startedAt: run.startedAt,
@@ -980,6 +1310,7 @@ export {
   describeEvent,
   inject,
   name,
+  turnFailureOf,
   validateConfig,
 };
 export default { name, apply, Config, inject };
