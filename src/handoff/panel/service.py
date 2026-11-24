@@ -204,6 +204,11 @@ class PanelService:
         # 启动时先把自己留下的僵尸租约放回 open，否则人只能干瞪眼。
         self._reclaimed: list[dict] = []
         self._reclaim_stale_leases()
+        # 交付链自动推进：自动模式下周期清扫卡在 delivered/merged/deployed/verifying
+        # 的任务——历史上这些全靠人点「恢复推进/验收」。_sweep_history 供 /api/state
+        # 展示最近动作；_sweep_cooldown 保证同一任务不被连续接管轰炸。
+        self._sweep_history: list[dict] = []
+        self._sweep_cooldown: dict[str, object] = {}
 
     # -- 状态持久化 ----------------------------------------------------------
     def _default_state(self) -> dict:
@@ -291,6 +296,7 @@ class PanelService:
             "executors": {name: self._executor_health(name) for name in EXECUTORS},
             "wake_listener": dict(self._wake_status),
             "reclaimed": list(getattr(self, "_reclaimed", [])[-5:]),
+            "auto_advance": list(getattr(self, "_sweep_history", [])[-5:]),
             "projects": self._projects(),
             "environments": list(self.config.environments.keys()),
             "executor_options": self._executor_options(),
@@ -1344,6 +1350,22 @@ class PanelService:
                 # 面板服务没有自己的 logger；这行只作诊断，写到 stderr 免得
                 # 依赖一个不存在的属性把整个自动循环打挂。
                 print(f"[panel] 额度/服务已恢复，重新入队：{retried}", flush=True)
+            # 过期租约回收：崩溃的执行器/面板留下的租约曾让任务一停就是几个小时
+            try:
+                expired = self.expire_stale_leases_sweep()
+                if expired:
+                    print(f"[panel] 回收过期租约，重新入队：{expired}", flush=True)
+            except Exception:  # noqa: BLE001 - 清扫绝不能把自动循环带崩
+                pass
+            # 交付链自动推进：任务最容易停在 delivered/merged/deployed/verifying
+            # 等人点「恢复推进/验收」；自动模式下每轮扫一遍能推的就推。
+            if mode == "auto":
+                try:
+                    advanced = self.auto_advance_sweep()
+                    for record in advanced:
+                        print(f"[panel] 自动推进交付链：{record['task_id']}", flush=True)
+                except Exception:  # noqa: BLE001 - 清扫绝不能把自动循环带崩
+                    pass
             if mode == "auto":
                 # 串行闸 1：本面板的执行线程还没收尾，等它跑完，本轮绝不挑新任务
                 with self._lock:
@@ -1583,6 +1605,112 @@ class PanelService:
             except HandoffError:
                 continue
             self._reclaimed.append({"task_id": task["id"], "at": iso()})
+
+    # -- 交付链自动推进 --------------------------------------------------------
+    # delivered/merged/deployed 在状态里停多久才接管：给运行收尾的自动验收让路
+    # （那条路径自己会跑 cmd_deliver，抢早了就是又一次「状态没有变化」竞态）。
+    _SWEEP_AGE_SECONDS = 90
+    # verifying 但 checks 迟迟不落盘：验收线程死了的表现。给足余量覆盖慢网络下
+    # 的大 OpenAPI 拉取（实测有 8 分钟的），超过这个时间基本可以断定没人管了。
+    _SWEEP_VERIFY_STUCK_SECONDS = 600
+    # 同一任务两次接管的最小间隔：advance blocked/失败时不要每轮都打
+    _SWEEP_COOLDOWN_SECONDS = 180
+
+    def _auto_advance_candidates(self, tasks: list[dict], current) -> list[str]:
+        """从任务列表里挑出「交付链停着、且能自动推进」的任务 id。
+
+        只做流程推进，不做需要人判断的事：PR 合并只在 auto_merge 开启时接管
+        （gate 没过 advance 自己会返回 blocked，靠冷却避免反复打）；目录模式
+        没提交的（没有 head_sha）没有可对齐的部署目标，等人提交。
+        """
+        panel_auto_merge = bool(self._panel_state["auto"].get("auto_merge"))
+        cooldown = self._sweep_cooldown
+        picked: list[str] = []
+        for task in tasks:
+            tid = task.get("id")
+            status = task.get("status")
+            if status not in ("delivered", "awaiting_merge", "merged", "deployed", "verifying"):
+                continue
+            last = cooldown.get(tid)
+            if last is not None:
+                try:
+                    if (current - last).total_seconds() < self._SWEEP_COOLDOWN_SECONDS:
+                        continue
+                except TypeError:
+                    pass
+            updated = task.get("updated_at")
+            try:
+                age = (current - parse(updated)).total_seconds()
+            except (ValueError, TypeError):
+                continue
+            result = task.get("result") or {}
+            if status == "verifying":
+                # 验收线程活着的表现是 checks 迟早落盘；停很久还没落盘就是没人管了
+                if age < self._SWEEP_VERIFY_STUCK_SECONDS or result.get("checks"):
+                    continue
+            elif age < self._SWEEP_AGE_SECONDS:
+                continue
+            if status in ("delivered", "awaiting_merge"):
+                pr = result.get("pr_number")
+                if pr and not panel_auto_merge:
+                    continue
+                if not pr and status == "awaiting_merge":
+                    # 目录模式不该有 awaiting_merge；卡在这里说明状态本身有疑问
+                    continue
+                if not result.get("head_sha") and not result.get("merge_sha"):
+                    continue
+            picked.append(tid)
+        return picked
+
+    def auto_advance_sweep(self) -> list[dict]:
+        """扫一遍交付链，把能自动推进的任务交给 advance()（后台线程跑）。
+
+        安全阀：执行器运行中不碰（运行收尾自己会验收）；_verify_mutex 被手动
+        验收占用时本轮直接放弃（advance() 内部会抛 Conflict，这里顺势停扫，
+        不跟人抢）；每个任务带冷却，失败不会变成重试轰炸。
+        """
+        active = self._active
+        if active is not None and active.phase == "running":
+            return []
+        try:
+            tasks = self._shared_store.peek_tasks(
+                status=["delivered", "awaiting_merge", "merged", "deployed", "verifying"]
+            )
+        except HandoffError:
+            return []
+        current = now()
+        picked = self._auto_advance_candidates(tasks, current)
+        fired: list[dict] = []
+        for tid in picked:
+            record: dict = {"task_id": tid, "at": iso(), "action": "advance", "result": None, "error": None}
+            try:
+                self.advance(tid)
+            except ConflictError as exc:
+                # 锁被占用：本轮到此为止，后续任务下轮再说
+                record["error"] = exc.message
+                self._sweep_history.append(record)
+                del self._sweep_history[:-10]
+                break
+            except HandoffError as exc:
+                record["error"] = f"{exc.code}: {exc.message}"
+            else:
+                record["result"] = "started"
+                fired.append(record)
+            self._sweep_history.append(record)
+            del self._sweep_history[:-10]
+            self._sweep_cooldown[tid] = current
+        return fired
+
+    def expire_stale_leases_sweep(self) -> list[str]:
+        """把租约已过期的 claimed/in_progress 任务放回 open。
+
+        崩溃的执行器/面板留下的过期租约曾让任务一停就是几个小时；store 层的
+        expire_stale 只动真正过期的租约，正在心跳的运行不受影响。
+        """
+        try:
+            return self._shared_store.expire_stale(actor=self.PANEL_ACTOR)
+        except HandoffError:
+            return []
 
     def retry(self, task_id: str) -> dict:
         store = self._store(push=True)

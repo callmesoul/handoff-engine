@@ -1710,3 +1710,68 @@ def test_auto_loop_passes_model_and_effort_to_run_task(env, monkeypatch):
         assert kw["trigger"] == "auto"
     finally:
         env.service.set_mode({"mode": "manual"})
+
+
+# -- 交付链自动推进 ---------------------------------------------------------
+
+
+def test_auto_advance_candidates_selection(env):
+    from datetime import timedelta
+
+    from handoff.timeutil import iso, now
+
+    service = env.service
+    current = now()
+    fresh = iso(current)
+    stale = iso(current - timedelta(seconds=600))
+
+    def task(tid, status, updated, *, pr=None, head="a" * 40, checks=None, merge=None):
+        result = {"pr_number": pr, "head_sha": head, "merge_sha": merge, "checks": checks or []}
+        return {"id": tid, "status": status, "updated_at": updated, "result": result}
+
+    # 刚交付的先不动：运行收尾的自动验收可能正在路上
+    assert service._auto_advance_candidates([task("t1", "delivered", fresh)], current) == []
+    # 停够 90s 的 delivered（目录模式：无 PR、有 head_sha）→ 接管
+    assert service._auto_advance_candidates([task("t2", "delivered", stale)], current) == ["t2"]
+    # 目录模式没有提交：没有可对齐的部署目标，不接管
+    assert (
+        service._auto_advance_candidates([task("t3", "delivered", stale, head=None, merge=None)], current) == []
+    )
+    # 带 PR 且 auto_merge 开启 → 接管（走自动合并）；关掉则不碰
+    assert service._auto_advance_candidates([task("t4", "delivered", stale, pr=7)], current) == ["t4"]
+    service._panel_state["auto"]["auto_merge"] = False
+    try:
+        assert service._auto_advance_candidates([task("t5", "delivered", stale, pr=7)], current) == []
+    finally:
+        service._panel_state["auto"]["auto_merge"] = True
+    # merged / deployed 停够时间 → 接管
+    assert service._auto_advance_candidates([task("t6", "merged", stale), task("t7", "deployed", stale)], current) == [
+        "t6",
+        "t7",
+    ]
+    # verifying：checks 落盘了=验收线程活着，不碰；没落盘但停够 10min=线程死了，接管
+    assert (
+        service._auto_advance_candidates(
+            [task("t8", "verifying", stale, checks=[{"id": "x", "status": "passed"}])], current
+        )
+        == []
+    )
+    fresh_verifying = iso(current - timedelta(seconds=120))
+    assert service._auto_advance_candidates([task("t9", "verifying", fresh_verifying)], current) == []
+    assert service._auto_advance_candidates([task("t10", "verifying", stale)], current) == ["t10"]
+    # 冷却中的任务不重复接管
+    service._sweep_cooldown["t7"] = current
+    try:
+        assert service._auto_advance_candidates([task("t7", "deployed", stale)], current) == []
+    finally:
+        service._sweep_cooldown.clear()
+
+
+def test_auto_advance_sweep_uses_advance_and_records_history(env):
+    from handoff.panel.service import PanelService  # noqa: F401  确认可导入即可
+
+    service = env.service
+    fired = service.auto_advance_sweep()
+    # fixture 里只有一个 open 任务：本轮不应有任何可推进对象，也不该留下报错记录
+    assert fired == []
+    assert all(record.get("error") is None for record in service._sweep_history)
