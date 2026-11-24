@@ -13,6 +13,7 @@
     任意非终态 → failed / cancelled
     failed → open（重新入队，attempt+1）/ claimed（原地重试，attempt+1）
     failed(verification) → deployed（修正验收契约后重新验收，不增加 attempt）
+    failed(交付已部署) → deployed（重新验收，不增加 attempt；如执行器被取消但产物已上线）
     delivered / verified / frontend_accepted → open（会话续跑：任务结束后用户在会话里继续派活，attempt+1）
 
     前端验收：verified → frontend_accepted。
@@ -85,15 +86,30 @@ def assert_transition(src: str, dst: str, task_id: str = "") -> None:
 
 
 def assert_reverify_transition(task: dict, task_id: str = "") -> None:
-    """重新验收的窄入口；实现失败不能借此绕过 worker。"""
+    """重新验收的窄入口；实现失败不能借此绕过 worker。
+
+    failed 但交付已部署对齐（deployment.status=deployed 且有 target/observed_sha）
+    的情况——典型是执行器中途被取消、验收没跑完——同样放行：重新验收只是重跑
+    环境检查，不重做实现，不构成绕过 worker；否则这种任务只能重新入队，为了一句
+    验收结果重跑一次完整执行。
+    """
     src = task.get("status")
     if src in ("deployed", "verified"):
         return
     failure = task.get("failure") or {}
+    deployment = task.get("deployment") or {}
     if src == "failed" and failure.get("stage") == "verification":
         return
+    if (
+        src == "failed"
+        and deployment.get("status") == "deployed"
+        and deployment.get("target_sha")
+        and deployment.get("observed_sha")
+    ):
+        return
     raise TransitionError(
-        f"{task_id}: 只有 deployed/verified 或 verification 失败的任务可以重新验收",
+        f"{task_id}: 只有 deployed/verified、failed(verification) 或 failed 但交付已部署的任务可以重新验收"
+        f"（当前 status={src!r}, failure.stage={failure.get('stage')!r}, deployment={deployment.get('status')!r}）",
         task_id=task_id,
         src=src,
         dst="deployed",

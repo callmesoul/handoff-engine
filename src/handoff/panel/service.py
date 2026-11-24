@@ -1801,6 +1801,74 @@ class PanelService:
         steps.append(f"git push origin HEAD:{branch} 成功（{sha[:12]}）")
         return branch, sha or ""
 
+    # -- 重新验收 ------------------------------------------------------------
+    def reverify_task(self, task_id: str, reason: str = "面板：重新验收") -> dict:
+        """重新验收：清除上一次验收结果回到 deployed，随即重跑部署对齐 + checks。
+
+        与恢复推进共用 `_advance` 槽位和 `_verify_mutex`（所以进度也走同一个
+        state.advance 读数）；差别只在入口先过 `store.request_reverify`，让
+        deployed/verified/failed(verification)/failed(交付已部署) 都能在**不重跑
+        执行器、不加 attempt** 的情况下重新验收。
+        """
+        from ..state import assert_reverify_transition
+
+        try:
+            current = self._store(push=True).peek(task_id)
+        except (HandoffError, AttributeError):
+            current = None
+        if isinstance(current, dict):
+            # 同步挡掉明显不合法的状态，别让按钮点了只回一句"已启动"再默默失败
+            assert_reverify_transition(current, task_id)
+        with self._lock:
+            if self._advance and not self._advance.get("done"):
+                raise ConflictError(f"已有恢复推进在进行: {self._advance.get('task_id')}")
+            if not self._verify_mutex.acquire(blocking=False):
+                raise ConflictError("已有部署/验收在进行（含自动验收），请等它结束")
+            self._advance = {
+                "task_id": task_id,
+                "done": False,
+                "started_at": iso(),
+                "steps": [],
+                "result": None,
+                "message": None,
+                "error": None,
+            }
+        threading.Thread(
+            target=self._reverify_task, args=(task_id, reason), name=f"panel-reverify-{task_id}", daemon=True
+        ).start()
+        return dict(self._advance)
+
+    def _reverify_task(self, task_id: str, reason: str) -> None:
+        from ..cli import cmd_deliver
+
+        store = self._store(push=True)
+        steps: list[str] = self._advance["steps"] if self._advance else []
+        try:
+            task = store.get(task_id)
+            updated = store.request_reverify(
+                task_id,
+                expected_revision=task["revision"],
+                reason=reason,
+                actor=self.PANEL_ACTOR,
+            )
+            steps.append(f"重新验收：已清除验收结果回到 deployed（r{updated['revision']}）")
+            args = SimpleNamespace(task_id=task_id, no_push=False)
+            with contextlib.redirect_stderr(io.StringIO()):
+                outcome = cmd_deliver(args, self.config)
+            steps.append(f"验收：{outcome.get('result', 'unknown')}")
+            self._advance.update(
+                done=True,
+                result=outcome.get("result"),
+                message=outcome.get("message"),
+                deliver=outcome,
+            )
+        except HandoffError as exc:
+            self._advance.update(done=True, error=f"{exc.code}: {exc.message}")
+        except Exception as exc:  # noqa: BLE001 - 后台线程不能崩
+            self._advance.update(done=True, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            self._verify_mutex.release()
+
     # -- 生命周期 ------------------------------------------------------------
     def shutdown(self) -> None:
         self._auto_stop.set()

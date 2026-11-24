@@ -94,14 +94,33 @@ def test_state_machine_whitelist():
         state.assert_transition("open", "merged", "ho-x")
 
 
-def test_reverify_transition_only_accepts_verification_failure():
+def test_reverify_transition_accepts_verification_failure_and_deployed_delivery():
     state.assert_reverify_transition(
         {"status": "failed", "failure": {"stage": "verification"}},
+        "ho-x",
+    )
+    # failed 但交付已部署对齐（执行器被取消、验收没跑完）：重跑检查不重做实现
+    state.assert_reverify_transition(
+        {
+            "status": "failed",
+            "failure": {"stage": "codex"},
+            "deployment": {"status": "deployed", "target_sha": "a" * 40, "observed_sha": "b" * 40},
+        },
         "ho-x",
     )
     with pytest.raises(TransitionError):
         state.assert_reverify_transition(
             {"status": "failed", "failure": {"stage": "worker"}},
+            "ho-x",
+        )
+    # 部署没对齐的 failed 不放行：环境里没有交付物，重验没有意义
+    with pytest.raises(TransitionError):
+        state.assert_reverify_transition(
+            {
+                "status": "failed",
+                "failure": {"stage": "codex"},
+                "deployment": {"status": "timeout", "target_sha": "a" * 40, "observed_sha": "b" * 40},
+            },
             "ho-x",
         )
 

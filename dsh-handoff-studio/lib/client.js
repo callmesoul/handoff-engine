@@ -1787,6 +1787,12 @@ window.__ModuleLoader__.load({
       var canAccept = task.status === "verified";
       var canAdvance =
         ["delivered", "awaiting_merge", "merged", "deployed", "verifying"].indexOf(task.status) >= 0;
+      var deployment = task.deployment || {};
+      var canReverify =
+        ["deployed", "verified"].indexOf(task.status) >= 0 ||
+        (task.status === "failed" &&
+          ((failure && failure.stage === "verification") ||
+            (deployment.status === "deployed" && deployment.target_sha && deployment.observed_sha)));
 
       var runWhy =
         "当前状态 " + task.status + " 不能直接执行（只有 open / failed / cancelled 可以）。卡在 in_progress 的话先「释放租约」。";
@@ -1798,6 +1804,11 @@ window.__ModuleLoader__.load({
       var advanceWhy =
         "恢复推进只接手交付链路中途断掉的状态（delivered / awaiting_merge / merged / deployed / verifying；当前 " +
         task.status +
+        "）。";
+      var reverifyWhy =
+        "重新验收只对 deployed / verified、failed(verification) 或 failed 但交付已部署的任务开放（当前 " +
+        task.status +
+        (failure && failure.stage ? "，失败阶段 " + failure.stage : "") +
         "）。";
 
       var checks = (task.acceptance && task.acceptance.checks) || [];
@@ -1998,6 +2009,22 @@ window.__ModuleLoader__.load({
                 },
               }),
               h(ActionButton, {
+                label: "重新验收",
+                disabled: !canReverify,
+                reason: reverifyWhy,
+                title:
+                  "清除上一次验收结果回到 deployed 并立即重跑部署对齐 + 检查；不重跑执行器、不加 attempt",
+                onBlocked: props.onBlocked,
+                onClick: function () {
+                  props.onAction(
+                    "POST",
+                    "/api/tasks/" + q(task.id) + "/reverify",
+                    { reason: "studio：重新验收" },
+                    "重新验收已启动（后台执行）",
+                  );
+                },
+              }),
+              h(ActionButton, {
                 label: "恢复推进",
                 disabled: !canAdvance,
                 reason: advanceWhy,
@@ -2016,7 +2043,7 @@ window.__ModuleLoader__.load({
             h(
               "div",
               { className: "hs-hint" },
-              "灰掉的按钮点一下会告诉你为什么不能用。「恢复推进」只接手交付后中断的任务，不会伪造 merged / verified。",
+              "灰掉的按钮点一下会告诉你为什么不能用。「恢复推进」只接手交付后中断的任务，不会伪造 merged / verified。「重新验收」不重跑执行器：清掉旧验收结果直接重跑检查。",
             ),
             props.progress ? h("div", { className: "hs-hint" }, props.progress) : null,
           ),

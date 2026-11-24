@@ -970,6 +970,16 @@ class StudioService(PanelService):
         self._watch_advance(task_id)
         return result
 
+    def reverify_task(self, task_id: str, reason: str = "studio：重新验收") -> dict:
+        """重新验收：与 advance 同一个坑——验收结果（verified/failed 都是终态事件）
+        只入 outbox，没有常驻 notifier 就发不出去；后台线程结束后踢一脚投递线程。
+
+        复用 `_watch_advance`：重新验收走的也是 `_advance` 槽位。
+        """
+        result = super().reverify_task(task_id, reason)
+        self._watch_advance(task_id)
+        return result
+
     def _watch_advance(self, task_id: str) -> None:
         def wait_done() -> None:
             while True:

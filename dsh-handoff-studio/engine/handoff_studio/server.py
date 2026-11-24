@@ -199,6 +199,11 @@ class StudioServer:
                     if path.startswith("/api/tasks/") and path.endswith("/advance"):
                         self._send_json({"ok": True, **owner.service.advance(_task_id(path, suffix="/advance"))})
                         return
+                    if path.startswith("/api/tasks/") and path.endswith("/reverify"):
+                        task_id = _task_id(path, suffix="/reverify")
+                        reason = str(payload.get("reason") or "studio：重新验收")
+                        self._send_json({"ok": True, **owner.service.reverify_task(task_id, reason)})
+                        return
                     if path.startswith("/api/tasks/") and path.endswith("/resend-notify"):
                         task_id = _task_id(path, suffix="/resend-notify")
                         self._send_json({"ok": True, **owner.service.resend_completed(task_id)})

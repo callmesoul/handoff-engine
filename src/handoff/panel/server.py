@@ -181,6 +181,11 @@ class PanelServer:
                         task_id = _task_id_from(path, suffix="/advance")
                         self._send_json({"ok": True, **owner.service.advance(task_id)})
                         return
+                    if path.startswith("/api/tasks/") and path.endswith("/reverify"):
+                        task_id = _task_id_from(path, suffix="/reverify")
+                        reason = str(payload.get("reason") or "面板：重新验收")
+                        self._send_json({"ok": True, **owner.service.reverify_task(task_id, reason)})
+                        return
                     self._send_json({"ok": False, "error": f"未找到路由: {path}"}, status=404)
                 except HandoffError as exc:
                     self._send_json({"ok": False, **exc.as_dict()}, status=_status_for(exc))

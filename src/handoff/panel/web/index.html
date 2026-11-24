@@ -765,6 +765,11 @@ function renderDrawer() {
   const canResend = ["verified", "failed"].includes(t.status);
   const canAccept = t.status === "verified";
   const canAdvance = ["delivered", "awaiting_merge", "merged", "deployed", "verifying"].includes(t.status);
+  const dep = t.deployment || {};
+  const canReverify = ["deployed", "verified"].includes(t.status) ||
+    (t.status === "failed" &&
+      (((t.failure || {}).stage === "verification") ||
+        (dep.status === "deployed" && dep.target_sha && dep.observed_sha)));
   const hasLease = ["claimed", "in_progress"].includes(t.status);
   const scope = t.scope || {};
   const acc = t.acceptance || {};
@@ -812,11 +817,13 @@ function renderDrawer() {
   const resendWhy = `只有 verified / failed 才有完成通知可重发（当前 ${t.status}）。`;
   const acceptWhy = `只有后端验收通过（verified）才能标记前端已验收（当前 ${t.status}）。`;
   const advanceWhy = `恢复推进只接手交付链路中途断掉的状态（delivered / awaiting_merge / merged / deployed / verifying；当前 ${t.status}）。`;
+  const reverifyWhy = `重新验收只对 deployed / verified、failed(verification) 或 failed 但交付已部署的任务开放（当前 ${t.status}${t.failure && t.failure.stage ? "，失败阶段 " + t.failure.stage : ""}）。`;
   const gRun = why(canRun, runWhy), gRetry = why(canRetry, retryWhy);
   const gRelease = why(hasLease, releaseWhy), gDeliver = why(canDeliver, deliverWhy);
   const gResend = why(canResend, resendWhy);
   const gAccept = why(canAccept, acceptWhy);
   const gAdvance = why(canAdvance, advanceWhy);
+  const gReverify = why(canReverify, reverifyWhy);
   rows.push(`<div class="sec"><h3>操作</h3><div class="btnrow">
     <button class="primary${gRun.cls}" id="d-run" ${gRun.attr}>▶ 执行…</button>
     <button${gRun.cls} id="d-resume" ${gRun.attr} title="接着这个任务上一次的执行会话继续，不用从头交代上下文">▶ 继续上次会话</button>
@@ -825,10 +832,11 @@ function renderDrawer() {
     <button${gDeliver.cls ? ` class="${gDeliver.cls.trim()}"` : ""} id="d-deliver" ${gDeliver.attr}>验收（deliver）</button>
     <button${gResend.cls ? ` class="${gResend.cls.trim()}"` : ""} id="d-resend-notify" ${gResend.attr} title="把完成通知再发一次到创建任务的前端监听端口，让原会话再收到一次续接消息">重发完成通知</button>
     <button${gAccept.cls ? ` class="${gAccept.cls.trim()}"` : ""} id="d-accept" ${gAccept.attr} title="前端收到完成通知并自行验收成功后点这里，把任务标记为 frontend_accepted（前端已验收）终态">前端已验收</button>
+    <button${gReverify.cls ? ` class="${gReverify.cls.trim()}"` : ""} id="d-reverify" ${gReverify.attr} title="清除上一次验收结果回到 deployed 并立即重跑部署对齐 + 检查；不重跑执行器、不加 attempt">重新验收</button>
     <button${gAdvance.cls ? ` class="${gAdvance.cls.trim()}"` : ""} id="d-advance" ${gAdvance.attr} title="把中断的后续流程接起来：自动合并 / 重新推送 / 部署对齐 / 验收">恢复推进</button>
     <button id="d-logs">执行日志</button>
   </div>
-  <div class="hint">${canRun ? "执行会真的认领任务、起执行器子进程改代码。「继续上次会话」沿用上一轮的执行器和会话，跳过重新读仓库。" : "灰掉的按钮点一下会告诉你为什么不能用。"}「恢复推进」只接手交付后中断的任务：有 PR 继续自动合并→部署→验收，目录模式先补推送再进人工合并确认，不会伪造 merged / verified。</div></div>`);
+  <div class="hint">${canRun ? "执行会真的认领任务、起执行器子进程改代码。「继续上次会话」沿用上一轮的执行器和会话，跳过重新读仓库。" : "灰掉的按钮点一下会告诉你为什么不能用。"}「恢复推进」只接手交付后中断的任务：有 PR 继续自动合并→部署→验收，目录模式先补推送再进人工合并确认，不会伪造 merged / verified。「重新验收」不重跑执行器：清掉旧验收结果直接重跑检查。</div></div>`);
   const evs = (events || []).slice(-40).map(e => `
     <div class="ev">
       <div>${esc(e.type)} ${e.status ? `<span class="chip st-${esc(e.status)}">${esc(e.status)}</span>` : ""}</div>
@@ -862,6 +870,7 @@ function renderDrawer() {
   });
   bind("d-accept", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/accept`, {reason: "面板：前端验收通过"}, "已标记前端已验收"));
   bind("d-advance", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/advance`, null, "恢复推进已启动（后台执行）"));
+  bind("d-reverify", () => postAction(`/api/tasks/${encodeURIComponent(t.id)}/reverify`, {reason: "面板：重新验收"}, "重新验收已启动（后台执行）"));
   bind("d-logs", () => showLogs(t.id));
   bind("d-steer", () => steer($("d-steer-text") ? $("d-steer-text").value : ""));
   updateDrawerLive();
