@@ -201,7 +201,11 @@ function sendJSON(res, status, body) {
 /** Map a session-controller failure onto the HTTP status the listener retries on. */
 function statusOfRemoteError(code) {
   if (code === "session/not-found") return 404;
-  if (code === "gateway/bad-request" || code === "session/invalid-time-zone") return 400;
+  if (
+    code === "gateway/bad-request" ||
+    code === "session/invalid-time-zone" ||
+    code === "session/model-unavailable"
+  ) return 400;
   if (code === "session/agent-busy") return 409;
   return 500;
 }
@@ -219,11 +223,19 @@ function normalizePrompt(body) {
   const requestId = typeof body.requestId === "string" ? body.requestId.trim() : "";
   const text = typeof body.text === "string" ? body.text : "";
   const mode = body.mode === undefined ? "queue" : body.mode;
+  const hasProvider = body.provider !== undefined && body.provider !== null;
+  const hasModel = body.model !== undefined && body.model !== null;
   if (!sessionId) return { error: "sessionId is required" };
   if (!requestId) return { error: "requestId is required" };
   if (!text.trim()) return { error: "text must contain non-whitespace" };
   if (mode !== "queue" && mode !== "steer") return { error: 'mode must be "queue" or "steer"' };
-  return { sessionId, requestId, text, mode };
+  if (hasProvider !== hasModel) return { error: "provider and model must be provided together" };
+  if (!hasProvider) return { sessionId, requestId, text, mode };
+  const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+  const model = typeof body.model === "string" ? body.model.trim() : "";
+  if (!provider) return { error: "provider must be a non-empty string" };
+  if (!model) return { error: "model must be a non-empty string" };
+  return { sessionId, requestId, text, mode, provider, model };
 }
 
 /**
@@ -379,6 +391,13 @@ function apply(ctx, config) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.promptTimeoutMs);
     try {
+      if (envelope.provider !== undefined) {
+        await ctx.sessionController.selectModel({
+          sessionId: envelope.sessionId,
+          provider: envelope.provider,
+          model: envelope.model,
+        });
+      }
       await ctx.sessionController.prompt(
         {
           requestId: envelope.requestId,

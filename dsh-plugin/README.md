@@ -116,10 +116,18 @@ handoff 侧配 `notifications.dsh_bridge_token_env` 指向一个环境变量。
 {"sessionId": "session-…", "requestId": "handoff-<event id>", "mode": "queue", "text": "…"}
 ```
 
+可选模型覆盖（`provider` 和 `model` 必须同时出现）：
+
+```json
+{"sessionId": "session-…", "requestId": "handoff-<event id>", "mode": "queue", "text": "…", "provider": "deepseek-account", "model": "deepseek-chat"}
+```
+
+插件会先等待 `sessionController.selectModel()` 成功，再调用 `prompt()`；不传两项时完全跳过模型切换，保留会话当前选择。DSH 官方接口还会把成功选择保存为当前 profile 的新会话默认模型。
+
 | 状态 | 含义 |
 |---|---|
 | 200 | 已入队（`{"accepted": true}`） |
-| 400 | envelope 不合法（缺 sessionId/requestId、text 全空白、mode 不是 queue/steer） |
+| 400 | envelope 不合法，或 `session/model-unavailable` |
 | 401 | 令牌不符 |
 | 403 | 非 loopback 来源 |
 | 404 | `session/not-found`——会话已删或 id 写错 |
@@ -147,4 +155,4 @@ node --test test/bridge.test.js
 ```
 
 测试用 `node:test`，把 `webServer.register`、`webServer.port`、`getOrigin()`
-与 `sessionController.prompt` 换成最小假实现后直接打 HTTP，不需要起 DSH。
+与 `sessionController.selectModel` / `sessionController.prompt` 换成最小假实现后直接打 HTTP，不需要起 DSH。

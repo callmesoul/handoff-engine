@@ -16,6 +16,15 @@ codex:
   binary: /usr/local/bin/codex
   timeout_seconds: 3600
 
+# 恢复原前端会话时可按执行器强制切换模型；省略或 null 会保留会话/宿主默认模型。
+notifications:
+  restore_models:
+    codex: null
+    dsh: null
+    # dsh:
+    #   provider: deepseek-account
+    #   model: deepseek-chat
+
 admin:
   database: .handoff-run/index/handoff.sqlite3
 

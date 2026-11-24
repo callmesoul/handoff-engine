@@ -9,7 +9,7 @@ from dataclasses import replace
 
 from handoff import notification
 from handoff.cli import main as cli_main
-from handoff.config import Config, NotificationConfig
+from handoff.config import Config, FrontendRestoreModelsConfig, NotificationConfig
 from handoff.frontend_session import (
     FrontendDispatcher,
     FrontendSessions,
@@ -93,6 +93,7 @@ def test_completion_round_trip_queues_original_thread_once(tmp_path, monkeypatch
 
         argv, kwargs = calls[0]
         assert argv[:4] == ["/bin/true", "queue", "--thread", "thread-original"]
+        assert "--model" not in argv
         assert "handoffctl show" in argv[5]
         assert TASK_ID in argv[5]
         # 前端验收通过后要标记 frontend_accepted（前端已验收）
@@ -110,6 +111,26 @@ def test_completion_round_trip_queues_original_thread_once(tmp_path, monkeypatch
         assert len(calls) == 1
     finally:
         server.stop()
+
+
+def test_codex_restore_model_is_passed_to_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_CODEX", "/bin/true")
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return Result(argv, 0, "", "")
+
+    cfg = config(
+        tmp_path,
+        restore_models=FrontendRestoreModelsConfig(codex="gpt-5.3-codex"),
+    )
+    dispatcher = FrontendDispatcher(tmp_path, cfg, runner=runner, codex_env_resolver=dict)
+    dispatcher.register(TASK_ID, thread_id="thread-original", workspace=tmp_path)
+    dispatcher.enqueue(completed())
+
+    assert dispatcher.send_due()["sent"] == 1
+    assert calls[0][-2:] == ["--model", "gpt-5.3-codex"]
 
 
 def test_completion_without_session_stays_pending(tmp_path, monkeypatch):

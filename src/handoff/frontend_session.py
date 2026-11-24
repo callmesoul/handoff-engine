@@ -576,14 +576,20 @@ class FrontendDispatcher:
         """
         request_id = request_id_for(event_id)
         text = self._message(payload)
+        dsh_model = self.config.restore_models.dsh
+        model_args = (
+            {}
+            if dsh_model is None
+            else {"provider": dsh_model.provider, "model": dsh_model.model}
+        )
         try:
-            self.bridge().post(session["thread_id"], text, request_id=request_id)
+            self.bridge().post(session["thread_id"], text, request_id=request_id, **model_args)
         except ExecutionError as exc:
             if not self._is_connection_error(exc):
                 raise
             # 端点可能已漂移；强制重建后再试一次。
             self._bridge = None
-            self.bridge().post(session["thread_id"], text, request_id=request_id)
+            self.bridge().post(session["thread_id"], text, request_id=request_id, **model_args)
 
     @staticmethod
     def _is_connection_error(exc: ExecutionError) -> bool:
@@ -598,6 +604,8 @@ class FrontendDispatcher:
         codex = executil.require(self.codex_binary, env_var="HANDOFF_CODEX")
         message = self._message(payload)
         argv = [codex, "queue", "--thread", session["thread_id"], "--message", message]
+        if self.config.restore_models.codex:
+            argv.extend(["--model", self.config.restore_models.codex])
         if session["queue_remote"]:
             argv.extend(["--remote", session["queue_remote"]])
         if session["queue_remote_auth_token_env"]:

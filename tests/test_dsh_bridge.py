@@ -12,7 +12,11 @@ from dataclasses import replace
 import pytest
 
 from handoff import notification
-from handoff.config import NotificationConfig
+from handoff.config import (
+    DshRestoreModelConfig,
+    FrontendRestoreModelsConfig,
+    NotificationConfig,
+)
 from handoff.dsh_bridge import BridgeOrigin, DshBridge, bridge_token, bridge_url, request_id_for
 from handoff.errors import ConfigError, ExecutionError
 from handoff.frontend_session import FrontendDispatcher
@@ -55,9 +59,16 @@ class FakeBridge:
         self.calls = []
         self.error = error
 
-    def post(self, session_id, text, *, request_id, mode="queue"):
+    def post(self, session_id, text, *, request_id, mode="queue", provider=None, model=None):
         self.calls.append(
-            {"session_id": session_id, "text": text, "request_id": request_id, "mode": mode}
+            {
+                "session_id": session_id,
+                "text": text,
+                "request_id": request_id,
+                "mode": mode,
+                "provider": provider,
+                "model": model,
+            }
         )
         if self.error is not None:
             raise self.error
@@ -81,11 +92,30 @@ def test_dsh_completion_posts_to_bridge_and_marks_dispatched(tmp_path):
     assert call["session_id"] == "session-abc"
     assert call["request_id"] == request_id_for(event_id)
     assert call["mode"] == "queue"
+    assert call["provider"] is None
+    assert call["model"] is None
     assert TASK_ID in call["text"]
     assert "handoffctl show" in call["text"]
     # 事件幂等：同一条完成事件不会再排一次。
     assert dispatcher.send_due()["sent"] == 0
     assert len(bridge.calls) == 1
+
+
+def test_dsh_restore_model_is_forwarded_to_bridge(tmp_path):
+    bridge = FakeBridge()
+    cfg = config(
+        tmp_path,
+        restore_models=FrontendRestoreModelsConfig(
+            dsh=DshRestoreModelConfig(provider="deepseek-account", model="deepseek-chat")
+        ),
+    )
+    dispatcher = FrontendDispatcher(tmp_path, cfg, bridge=bridge)
+    dispatcher.register(TASK_ID, thread_id="session-abc", workspace=tmp_path, executor="dsh")
+    dispatcher.enqueue(completed())
+
+    assert dispatcher.send_due()["sent"] == 1
+    assert bridge.calls[0]["provider"] == "deepseek-account"
+    assert bridge.calls[0]["model"] == "deepseek-chat"
 
 
 def test_dsh_bridge_failure_keeps_event_pending(tmp_path):
@@ -329,3 +359,29 @@ def test_bridge_posts_expected_envelope(tmp_path):
         "mode": "queue",
         "text": "hello",
     }
+
+    bridge.post(
+        "session-abc",
+        "hello again",
+        request_id="handoff-evt-2",
+        provider="deepseek-account",
+        model="deepseek-chat",
+    )
+    assert json.loads(seen["body"]) == {
+        "sessionId": "session-abc",
+        "requestId": "handoff-evt-2",
+        "mode": "queue",
+        "text": "hello again",
+        "provider": "deepseek-account",
+        "model": "deepseek-chat",
+    }
+
+
+def test_bridge_rejects_partial_model_override():
+    bridge = DshBridge(
+        "http://127.0.0.1:56378/v1/handoff/dsh/prompt",
+        "tok",
+        client=_fake_client(200, '{"accepted": true}'),
+    )
+    with pytest.raises(ConfigError, match="provider"):
+        bridge.post("session-abc", "hello", request_id="evt-1", provider="deepseek-account")

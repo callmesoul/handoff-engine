@@ -271,13 +271,26 @@ class DshBridge:
             "这个文件会指向已经不存在的端口，重启 DSH 里的插件即可刷新）"
         )
 
-    def post(self, session_id: str, text: str, *, request_id: str, mode: str = "queue") -> dict:
+    def post(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        request_id: str,
+        mode: str = "queue",
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> dict:
+        if (provider is None) != (model is None):
+            raise ConfigError("DSH 恢复模型必须同时提供 provider 和 model")
         body = {
             "sessionId": session_id,
             "requestId": request_id,
             "mode": mode,
             "text": text,
         }
+        if provider is not None and model is not None:
+            body.update({"provider": provider, "model": model})
         response = self._client.request(
             "POST",
             self.url,

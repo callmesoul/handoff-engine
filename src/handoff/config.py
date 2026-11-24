@@ -375,6 +375,22 @@ class PanelConfig:
 
 
 @dataclass(frozen=True)
+class DshRestoreModelConfig:
+    """恢复 DSH 会话时要选择的完整 provider/model route。"""
+
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
+class FrontendRestoreModelsConfig:
+    """恢复原前端会话时的可选模型覆盖。"""
+
+    codex: str | None = None
+    dsh: DshRestoreModelConfig | None = None
+
+
+@dataclass(frozen=True)
 class NotificationConfig:
     """局域网任务唤醒配置；密钥只从环境变量读取，不进配置仓。"""
 
@@ -391,6 +407,7 @@ class NotificationConfig:
     queue_remote_auth_token_env: str | None = None
     dsh_bridge_url: str | None = None
     dsh_bridge_token_env: str | None = None
+    restore_models: FrontendRestoreModelsConfig = field(default_factory=FrontendRestoreModelsConfig)
     request_timeout_seconds: float = 5
     max_skew_seconds: int = 300
     retry_initial_seconds: float = 2
@@ -428,6 +445,44 @@ class AdminConfig:
 
     def database_path(self, root: Path) -> Path:
         return _resolve(root, self.database) or (root / ".handoff-run" / "index" / "handoff.sqlite3")
+
+
+def _restore_model_name(value, path: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"config/local.yaml: {path} 必须是非空字符串或 null")
+    return value.strip()
+
+
+def _parse_restore_models(value) -> FrontendRestoreModelsConfig:
+    path = "notifications.restore_models"
+    if value is None:
+        return FrontendRestoreModelsConfig()
+    if not isinstance(value, dict):
+        raise ConfigError(f"config/local.yaml: {path} 必须是映射")
+    unknown = set(value) - {"codex", "dsh"}
+    if unknown:
+        raise ConfigError(f"config/local.yaml: {path} 有未知键: {', '.join(sorted(unknown))}")
+
+    codex = _restore_model_name(value.get("codex"), f"{path}.codex")
+    raw_dsh = value.get("dsh")
+    if raw_dsh is None:
+        dsh = None
+    else:
+        if not isinstance(raw_dsh, dict):
+            raise ConfigError(f"config/local.yaml: {path}.dsh 必须是包含 provider 和 model 的映射")
+        unknown_dsh = set(raw_dsh) - {"provider", "model"}
+        if unknown_dsh:
+            raise ConfigError(
+                f"config/local.yaml: {path}.dsh 有未知键: {', '.join(sorted(unknown_dsh))}"
+            )
+        provider = _restore_model_name(raw_dsh.get("provider"), f"{path}.dsh.provider")
+        model = _restore_model_name(raw_dsh.get("model"), f"{path}.dsh.model")
+        if provider is None or model is None:
+            raise ConfigError(f"config/local.yaml: {path}.dsh 必须同时配置 provider 和 model")
+        dsh = DshRestoreModelConfig(provider=provider, model=model)
+    return FrontendRestoreModelsConfig(codex=codex, dsh=dsh)
 
 
 def _apply_local(local: dict, repositories, environments, checks, admin, codex, zcode, panel, notifications, secrets):
@@ -495,6 +550,8 @@ def _apply_local(local: dict, repositories, environments, checks, admin, codex, 
         patch = dict(local["notifications"])
         if "allowed_cidrs" in patch:
             patch["allowed_cidrs"] = tuple(patch["allowed_cidrs"] or ())
+        if "restore_models" in patch:
+            patch["restore_models"] = _parse_restore_models(patch["restore_models"])
         try:
             notifications = replace(notifications, **patch)
         except TypeError as exc:

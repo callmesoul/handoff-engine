@@ -74,6 +74,19 @@ handoffctl --root "$HANDOFF_ROOT" notifier
 
 这些常驻进程应从引擎虚拟环境启动，但 `--root` 始终指向私有交接仓。
 
+可在私有仓的 `config/local.yaml` 中为恢复动作指定模型，两项均为可选：
+
+```yaml
+notifications:
+  restore_models:
+    codex: gpt-5.3-codex
+    dsh:
+      provider: deepseek-account
+      model: deepseek-chat
+```
+
+省略 `codex` / `dsh`（或设为 `null`）时不会切换模型，由恢复会话沿用自己的选择；配置后则在每次恢复、投递完成消息之前切换。DSH 必须同时给出 `provider` 和 `model`，因为模型 id 在不同 provider 下可能重名。DSH 使用宿主官方 `selectModel` 接口，该接口还会把成功选择保存为当前 profile 的新会话默认模型。
+
 ## Skills
 
 `handoff` / `deliver` skill 从 `$HANDOFF_ENGINE_ROOT/.agents/skills/` 安装。skill 通过 `HANDOFF_ROOT` 找数据仓并调用 PATH 中的 `handoffctl`，不会把引擎目录当成 store。

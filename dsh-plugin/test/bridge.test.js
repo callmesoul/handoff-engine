@@ -32,6 +32,8 @@ const parse = (raw) => {
 function fakeContext() {
   const routes = [];
   const prompts = [];
+  const selections = [];
+  const operations = [];
   const effects = [];
   let disposed = false;
   let port;
@@ -67,9 +69,20 @@ function fakeContext() {
       },
     },
     sessionController: {
+      async selectModel(request) {
+        selections.push(request);
+        operations.push("selectModel");
+        if (request.model === "unavailable") {
+          const error = new Error("model unavailable");
+          error.code = "session/model-unavailable";
+          throw error;
+        }
+        return { selected: true };
+      },
       async prompt(request, signal) {
         if (signal?.aborted) throw new Error("aborted");
         prompts.push(request);
+        operations.push("prompt");
         if (request.sessionId === "session-missing") {
           const error = new Error("session not found");
           error.code = "session/not-found";
@@ -88,6 +101,8 @@ function fakeContext() {
     ctx,
     routes,
     prompts,
+    selections,
+    operations,
     effects,
     disposed: () => disposed,
     bind: (value) => {
@@ -227,7 +242,7 @@ test("prompt requires a bearer token", async () => {
 });
 
 test("prompt queues text for the named session", async () => {
-  const { ctx, routes, prompts } = fakeContext();
+  const { ctx, routes, prompts, selections } = fakeContext();
   apply(ctx, parse({ token: "t0ken", tokenFile: join(workspace, "ok.token") }));
   const server = await serve(ctx, routes);
   try {
@@ -241,6 +256,7 @@ test("prompt queues text for the named session", async () => {
     assert.equal(body.accepted, true);
     assert.equal(body.sessionId, "session-a");
 
+    assert.equal(selections.length, 0);
     assert.equal(prompts.length, 1);
     assert.deepEqual(prompts[0], {
       requestId: "r1",
@@ -248,6 +264,35 @@ test("prompt queues text for the named session", async () => {
       mode: "queue",
       content: [{ type: "text", text: "后端做完了" }],
     });
+  } finally {
+    await server.close();
+  }
+});
+
+test("configured model is selected before prompt", async () => {
+  const { ctx, routes, prompts, selections, operations } = fakeContext();
+  apply(ctx, parse({ token: "t0ken", tokenFile: join(workspace, "model.token") }));
+  const server = await serve(ctx, routes);
+  try {
+    const response = await fetch(`${server.origin}/v1/handoff/dsh/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer t0ken" },
+      body: JSON.stringify({
+        sessionId: "session-a",
+        requestId: "r-model",
+        text: "使用指定模型恢复",
+        provider: "deepseek-account",
+        model: "deepseek-chat",
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(selections, [{
+      sessionId: "session-a",
+      provider: "deepseek-account",
+      model: "deepseek-chat",
+    }]);
+    assert.equal(prompts.length, 1);
+    assert.deepEqual(operations, ["selectModel", "prompt"]);
   } finally {
     await server.close();
   }
@@ -271,7 +316,7 @@ test("steer mode is passed through", async () => {
 });
 
 test("bad envelopes are rejected before prompt", async () => {
-  const { ctx, routes, prompts } = fakeContext();
+  const { ctx, routes, prompts, selections } = fakeContext();
   apply(ctx, parse({ token: "t0ken", tokenFile: join(workspace, "bad.token") }));
   const server = await serve(ctx, routes);
   const post = (body) =>
@@ -285,7 +330,12 @@ test("bad envelopes are rejected before prompt", async () => {
     assert.equal((await post({ sessionId: "s", text: "hi" })).status, 400);
     assert.equal((await post({ sessionId: "s", requestId: "r", text: "   " })).status, 400);
     assert.equal((await post({ sessionId: "s", requestId: "r", text: "hi", mode: "shout" })).status, 400);
+    assert.equal((await post({ sessionId: "s", requestId: "r", text: "hi", provider: "p" })).status, 400);
+    assert.equal((await post({ sessionId: "s", requestId: "r", text: "hi", model: "m" })).status, 400);
+    assert.equal((await post({ sessionId: "s", requestId: "r", text: "hi", provider: "", model: "m" })).status, 400);
+    assert.equal((await post({ sessionId: "s", requestId: "r", text: "hi", provider: "p", model: 1 })).status, 400);
     assert.equal((await post("not json")).status, 400);
+    assert.equal(selections.length, 0);
     assert.equal(prompts.length, 0);
   } finally {
     await server.close();
@@ -304,6 +354,20 @@ test("remote errors map onto retryable statuses", async () => {
     });
     assert.equal(missing.status, 404);
     assert.equal((await missing.json()).code, "session/not-found");
+
+    const unavailable = await fetch(`${server.origin}/v1/handoff/dsh/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer t0ken" },
+      body: JSON.stringify({
+        sessionId: "session-a",
+        requestId: "r4",
+        text: "hi",
+        provider: "deepseek-account",
+        model: "unavailable",
+      }),
+    });
+    assert.equal(unavailable.status, 400);
+    assert.equal((await unavailable.json()).code, "session/model-unavailable");
   } finally {
     await server.close();
   }

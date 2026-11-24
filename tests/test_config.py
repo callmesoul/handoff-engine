@@ -124,6 +124,10 @@ def test_local_notifications_are_machine_specific(tmp_path):
                     "listen_port": 8788,
                     "allowed_cidrs": ["192.168.1.10/32"],
                     "secret_env": "HANDOFF_NOTIFY_SECRET",
+                    "restore_models": {
+                        "codex": "gpt-5.3-codex",
+                        "dsh": {"provider": "deepseek-account", "model": "deepseek-chat"},
+                    },
                 }
             },
             allow_unicode=True,
@@ -136,6 +140,37 @@ def test_local_notifications_are_machine_specific(tmp_path):
     assert cfg.notifications.listen_host == "0.0.0.0"
     assert cfg.notifications.listen_port == 8788
     assert cfg.notifications.allowed_cidrs == ("192.168.1.10/32",)
+    assert cfg.notifications.restore_models.codex == "gpt-5.3-codex"
+    assert cfg.notifications.restore_models.dsh.provider == "deepseek-account"
+    assert cfg.notifications.restore_models.dsh.model == "deepseek-chat"
+
+
+def test_restore_models_default_to_session_selection(tmp_path):
+    _work, cfg = build(tmp_path)
+    assert cfg.notifications.restore_models.codex is None
+    assert cfg.notifications.restore_models.dsh is None
+
+
+@pytest.mark.parametrize(
+    "restore_models",
+    [
+        "gpt-5.3-codex",
+        {"codex": ""},
+        {"claude": "opus"},
+        {"dsh": "deepseek-chat"},
+        {"dsh": {"provider": "deepseek-account"}},
+        {"dsh": {"provider": "deepseek-account", "model": ""}},
+        {"dsh": {"provider": "deepseek-account", "model": "deepseek-chat", "effort": "high"}},
+    ],
+)
+def test_restore_models_reject_malformed_values(tmp_path, restore_models):
+    work, _cfg = build(tmp_path)
+    (work / "config" / "local.yaml").write_text(
+        yaml.safe_dump({"notifications": {"restore_models": restore_models}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="notifications.restore_models"):
+        Config.load(work)
 
 
 def test_panel_port_defaults_off_the_notification_port(tmp_path):
