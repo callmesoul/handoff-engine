@@ -11,6 +11,8 @@ from handoff.secrets import (
     agent_env,
     collect_requirements,
     config_secret,
+    decrypt_provision_value,
+    encrypt_provision_value,
     proof,
     resolve_secret,
     secret_env,
@@ -265,3 +267,24 @@ def test_secret_env_reports_reference_without_value_or_file_path(tmp_path):
     message = str(excinfo.value)
     assert "missing-ref" in message
     assert "private/missing-secret.txt" not in message
+
+
+def test_provision_encryption_roundtrip_and_tamper_detection():
+    control = b"shared-notification-control-secret-32bytes"
+    value = "session=abc123; path=/; HttpOnly\n第二行 ✓"
+    encoded = encrypt_provision_value(value, control_secret=control)
+    assert isinstance(encoded, str)
+    assert value not in encoded
+    assert "abc123" not in encoded
+    assert decrypt_provision_value(encoded, control_secret=control) == value
+    # 不同控制密钥无法解密（tag 校验失败，且不回显任何明文）。
+    with pytest.raises(ExecutionError, match="校验|签名|无效|tag|认证"):
+        decrypt_provision_value(encoded, control_secret=b"another-control-secret-32bytes!!")
+
+    # 篡改密文的任意字节都会被 HMAC tag 拒绝。
+    import base64
+    raw = bytearray(base64.b64decode(encoded))
+    raw[20] ^= 0x01
+    tampered = base64.b64encode(bytes(raw)).decode("ascii")
+    with pytest.raises(ExecutionError):
+        decrypt_provision_value(tampered, control_secret=control)

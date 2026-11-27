@@ -49,6 +49,40 @@ HTTP/OpenAPI check 中实际会展开的 URL/header/body `{env:NAME}` 会被自�
 
 任务单最终只固化 `ref`、`env`、`same_value`；不包含值、路径或 proof。
 
+## 自动同步（可选：前端配一次，后端自动落盘）
+
+如果希望前端配置一次后后端无需手工抄写密钥，可打开 create 时的**受控自动推送**。通知控制面密钥仍是唯一信任根；推送只经已签名的局域网 listener 端点进行，任务单/Git/附件/回报仍只有公开引用。
+
+后端 `config/local.yaml`：
+
+```yaml
+secrets:
+  provision_enabled: true          # 后端接受推送并自动落盘
+  provision_refs: [saas-test-session]  # 仅允许写入这些 reference（空数组=所有合法 ref）
+  provision_dir: .handoff-run/secrets   # 自动落盘目录，0700；密钥文件 0600
+```
+
+前端 `config/local.yaml`（或 create 时显式加 `--provision-secrets`）：
+
+```yaml
+secrets:
+  provision_push: true             # create 时自动把本机密钥加密推给后端
+  refs:
+    saas-test-session: /home/callmesoul/.config/handoff/saas-test-session-cookie
+  bindings:
+    SAAS_TEST_SESSION_COOKIE: saas-test-session
+```
+
+流程：
+
+1. `handoffctl create` 在完整 schema 校验后、预检前调用 `POST /v1/handoff/secret-provision`；
+2. 请求中的值用**纯标准库认证加密**封装：控制面密钥经 HKDF 派生 enc/mac 子密钥，counter keystream XOR + HMAC tag（encrypt-then-MAC），密文 base64 编码；明文不进请求日志、任务单或返回体；
+3. 后端校验 CIDR、时间窗、请求 HMAC 和 `provision_refs` 白名单后，原子写入 `provision_dir/<ref>`（0600），并更新 `provision_dir/refs.json`（只含引用名与文件相对名，不含密钥值）；
+4. 后端当前进程的 resolver 立即看到新 ref/binding，随后的预检直接比较同值；下一次启动时 `Config` 自动从 `refs.json` 合并这些 ref/binding；
+5. 后端未开启 `provision_enabled`、ref 不在白名单、密文 tag 校验失败、请求/响应签名错误都会 fail closed，任务不会创建。
+
+> 自动同步只解决“后端不必手工抄值”的运维负担；它**不降低**安全要求：两端必须共享同一个 `HANDOFF_NOTIFY_SECRET`（≥32 字节，绝不能提交 Git），listener 仍需限制来源 CIDR，且应仅在可信内网或 TLS 后运行。
+
 ## 创建与修订保证
 
 当任务需要密钥时，`handoffctl create` 会在复制契约/附件、登记会话和写任务之前：

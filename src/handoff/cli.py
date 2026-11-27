@@ -315,6 +315,13 @@ def cmd_create(args, config: Config) -> dict:
         draft.pop("required_secrets", None)
     # 先拒绝所有无需文件系统即可发现的结构错误，再访问远端 presence/proof。
     schema.validate_task(new_task(draft))
+    # 前端可选：把本机密钥值经已签名通道加密推给后端，让后端自动写入本机文件。
+    # 只在显式打开 secrets.provision_push 时进行；失败时任务尚未写入。
+    secret_provision = {"status": "disabled"}
+    if required_secrets and (getattr(args, "provision_secrets", False) or getattr(config.secrets, "provision_push", False)):
+        secret_provision = notification.provision_secrets(
+            root, config.notifications, required_secrets
+        )
     secret_preflight = notification.preflight_secrets(root, config.notifications, required_secrets)
 
     # 契约附件：复制进交接仓，记录相对路径与摘要
@@ -416,6 +423,7 @@ def cmd_create(args, config: Config) -> dict:
         "store_commit": created.get("_commit"),
         "notification": notify_result,
         "secret_preflight": secret_preflight,
+        "secret_provision": secret_provision,
         "frontend_session": session_result,
         "next": f"handoffctl show {created['id']}",
     }
@@ -1490,6 +1498,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="已禁用；创建任务必须登记原前端会话",
     )
     p.add_argument("--no-push", action="store_true")
+    p.add_argument(
+        "--provision-secrets",
+        action="store_true",
+        help="创建前把本机验收密钥经已签名通道加密推给后端自动写入（需后端开启 provision_enabled）",
+    )
     p.set_defaults(func=cmd_create)
 
     p = _sub("show", help="查看任务")

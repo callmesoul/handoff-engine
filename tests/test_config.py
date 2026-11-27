@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -271,6 +274,51 @@ def test_local_preflight_url_path_is_exact(tmp_path):
     assert Config.load(work).notifications.preflight_url.endswith("/v1/handoff/secret-preflight")
     local.write_text(yaml.safe_dump({"notifications": {
         "preflight_url": "http://127.0.0.1:8788/v1/handoff/secret-preflight?token=bad"
+    }}), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        Config.load(work)
+
+
+def test_provision_config_and_refs_json_are_loaded(tmp_path):
+    work, _config = build(tmp_path)
+    (work / "config" / "local.yaml").write_text(
+        yaml.safe_dump({"secrets": {
+            "provision_enabled": True,
+            "provision_refs": ["saas-session"],
+            "provision_dir": ".handoff-run/secrets",
+            "provision_push": False,
+        }, "notifications": {
+            "provision_url": "http://127.0.0.1:8788/v1/handoff/secret-provision"
+        }}),
+        encoding="utf-8",
+    )
+    # 后端自动写入的映射文件；只含 ref 文件名与 binding，不含密钥值。
+    provision_dir = work / ".handoff-run" / "secrets"
+    provision_dir.mkdir(parents=True)
+    (provision_dir / "saas-session").write_text("auto-cookie", encoding="utf-8")
+    (provision_dir / "refs.json").write_text(json.dumps({
+        "version": 1,
+        "refs": {"saas-session": "saas-session"},
+        "bindings": {"SAAS_TEST_SESSION_COOKIE": "saas-session"},
+    }), encoding="utf-8")
+
+    cfg = Config.load(work)
+    assert cfg.secrets.provision_enabled is True
+    assert cfg.secrets.provision_refs == ("saas-session",)
+    assert cfg.secrets.provision_push is False
+    assert cfg.notifications.provision_url.endswith("/v1/handoff/secret-provision")
+    # refs.json 里的 ref/binding 在开启 provision_enabled 时被自动合并。
+    assert "saas-session" in cfg.secrets.refs
+    assert cfg.secrets.bindings["SAAS_TEST_SESSION_COOKIE"] == "saas-session"
+    # 显式配置优先：refs.json 指向任意路径无效，只接受 provision_dir 内文件名。
+    assert Path(cfg.secrets.refs["saas-session"]).name == "saas-session"
+
+
+def test_provision_url_path_is_exact(tmp_path):
+    work, _config = build(tmp_path)
+    local = work / "config" / "local.yaml"
+    local.write_text(yaml.safe_dump({"notifications": {
+        "provision_url": "http://127.0.0.1:8788/v1/handoff/secret-provision?x=1"
     }}), encoding="utf-8")
     with pytest.raises(ConfigError):
         Config.load(work)

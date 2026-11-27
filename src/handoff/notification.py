@@ -33,6 +33,7 @@ from .timeutil import iso
 WAKE_PATH = "/v1/handoff/wake"
 COMPLETE_PATH = "/v1/handoff/completed"
 SECRET_PREFLIGHT_PATH = "/v1/handoff/secret-preflight"
+SECRET_PROVISION_PATH = "/v1/handoff/secret-provision"
 MAX_BODY_BYTES = 16 * 1024
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _TASK_RE = re.compile(r"^ho-[0-9]{8}-[0-9A-HJKMNP-TV-Z]{26}$")
@@ -183,6 +184,41 @@ def _validate_secret_preflight(payload: dict) -> None:
         env_refs[normalized["env"]] = normalized["ref"]
 
 
+def _validate_secret_provision(payload: dict) -> None:
+    expected = {"schema_version", "request_id", "occurred_at", "secrets"}
+    if not isinstance(payload, dict):
+        raise SchemaError("密钥自动写入正文必须是 JSON 对象")
+    unknown = set(payload) - expected
+    if unknown:
+        raise SchemaError(f"密钥自动写入包含未知字段: {', '.join(sorted(unknown))}")
+    if payload.get("schema_version") != 1:
+        raise SchemaError("密钥自动写入 schema_version 必须为 1")
+    if not ids.is_ulid(payload.get("request_id")):
+        raise SchemaError("密钥自动写入 request_id 不是合法 ULID")
+    if not isinstance(payload.get("occurred_at"), str) or not payload["occurred_at"]:
+        raise SchemaError("密钥自动写入 occurred_at 缺失")
+    rows = payload.get("secrets")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 50:
+        raise SchemaError("密钥自动写入 secrets 必须包含 1..50 项")
+    seen: set[tuple[str, str]] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"ref", "env", "value"}:
+            raise SchemaError(f"密钥自动写入 secrets[{index}] 结构非法")
+        try:
+            normalized = secret_files.normalize_requirement(
+                {"ref": row["ref"], "env": row["env"], "same_value": True},
+                where=f"secrets[{index}]",
+            )
+        except SchemaError:
+            raise
+        key = (normalized["ref"], normalized["env"])
+        if key in seen:
+            raise SchemaError(f"密钥自动写入 secrets[{index}] 重复")
+        seen.add(key)
+        if not isinstance(row["value"], str) or not row["value"]:
+            raise SchemaError(f"密钥自动写入 secrets[{index}].value 必须是非空密文字符串")
+
+
 def _preflight_url(config: NotificationConfig) -> str:
     explicit = config.preflight_url
     if explicit:
@@ -193,6 +229,19 @@ def _preflight_url(config: NotificationConfig) -> str:
     parts = urlsplit(config.url)
     derived = urlunsplit((parts.scheme, parts.netloc, SECRET_PREFLIGHT_PATH, "", ""))
     _validate_event_url(derived, SECRET_PREFLIGHT_PATH, "密钥预检 URL")
+    return derived
+
+
+def _provision_url(config: NotificationConfig) -> str:
+    explicit = getattr(config, "provision_url", None)
+    if explicit:
+        _validate_event_url(explicit, SECRET_PROVISION_PATH, "密钥自动写入 URL")
+        return explicit
+    if not config.url:
+        raise ConfigError("自动写入密钥但未配置 notifications.provision_url 或 notifications.url")
+    parts = urlsplit(config.url)
+    derived = urlunsplit((parts.scheme, parts.netloc, SECRET_PROVISION_PATH, "", ""))
+    _validate_event_url(derived, SECRET_PROVISION_PATH, "密钥自动写入 URL")
     return derived
 
 
@@ -523,6 +572,101 @@ def preflight_secrets(
     }
 
 
+def provision_secrets(
+    root: str | Path,
+    config: NotificationConfig,
+    requirements: list[dict],
+) -> dict:
+    """把本机密钥值经已签名 LAN 通道加密推送给后端，让后端自动写入本机文件。
+
+    仅在发起端 secrets.provision_push 打开时由 create 调用。请求体只含密文，
+    明文不会进入任务单、Git、日志或预检响应。后端未开启 provision_enabled、
+    未授权 ref 或协议/签名错误都会 fail closed。
+    """
+    if not requirements:
+        return {"status": "not_required", "written": []}
+    app_config = getattr(config, "_app_config", None)
+    if app_config is None:
+        raise ConfigError("密钥自动写入缺少应用配置")
+    control_secret = load_secret(config)
+    normalized = [
+        secret_files.normalize_requirement_for_config(
+            item, app_config, where=f"required_secrets[{index}]"
+        )
+        for index, item in enumerate(requirements)
+    ]
+    local_values = secret_files.secret_env(app_config, normalized)
+    request_id = ids.ulid()
+    rows = []
+    for item in normalized:
+        rows.append({
+            "ref": item["ref"],
+            "env": item["env"],
+            "value": secret_files.encrypt_provision_value(
+                local_values[item["env"]], control_secret=control_secret
+            ),
+        })
+    payload = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "occurred_at": iso(),
+        "secrets": rows,
+    }
+    body = _json_bytes(payload)
+    timestamp = str(int(time.time()))
+    request = Request(_provision_url(config), data=body, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("X-Handoff-Request-ID", request_id)
+    request.add_header("X-Handoff-Timestamp", timestamp)
+    request.add_header("X-Handoff-Signature", _signature(control_secret, timestamp, body))
+    opener = build_opener(ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(request, timeout=config.request_timeout_seconds) as response:
+            raw = response.read(MAX_BODY_BYTES + 1)
+            status = response.status
+            response_headers = response.headers
+    except HTTPError as exc:
+        raw_error = exc.read(500).decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+        raise ExecutionError(f"后端密钥自动写入返回 HTTP {exc.code}: {raw_error}") from exc
+    except (URLError, OSError, TimeoutError) as exc:
+        raise ExecutionError(f"无法连接后端密钥自动写入端点: {exc}") from exc
+    if status != 200:
+        raise ExecutionError(f"后端密钥自动写入返回 HTTP {status}")
+    if len(raw) > MAX_BODY_BYTES:
+        raise ExecutionError("后端密钥自动写入响应过大")
+
+    response_timestamp = response_headers.get("X-Handoff-Timestamp", "")
+    response_signature = response_headers.get("X-Handoff-Signature", "")
+    response_request_id = response_headers.get("X-Handoff-Request-ID", "")
+    try:
+        sent_at = int(response_timestamp)
+    except ValueError as exc:
+        raise ExecutionError("后端密钥自动写入响应时间戳非法") from exc
+    if abs(int(time.time()) - sent_at) > config.max_skew_seconds:
+        raise ExecutionError("后端密钥自动写入响应已过期")
+    if not hmac.compare_digest(
+        response_signature, _signature(control_secret, response_timestamp, raw)
+    ):
+        raise ExecutionError("后端密钥自动写入响应签名无效")
+    if response_request_id != request_id:
+        raise ExecutionError("后端密钥自动写入响应 request_id 不匹配")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ExecutionError("后端密钥自动写入响应不是合法 JSON") from exc
+    if not isinstance(result, dict) or result.get("schema_version") != 1:
+        raise ExecutionError("后端密钥自动写入响应协议不匹配")
+    if result.get("request_id") != request_id or result.get("status") != "written":
+        raise ExecutionError("后端密钥自动写入响应状态非法")
+    written = result.get("written")
+    if not isinstance(written, list) or any(not isinstance(item, str) for item in written):
+        raise ExecutionError("后端密钥自动写入响应 written 非法")
+    expected_refs = {item["ref"] for item in normalized}
+    if set(written) != expected_refs:
+        raise ExecutionError("后端密钥自动写入响应包含未请求的 reference")
+    return {"status": "written", "request_id": request_id, "written": written}
+
+
 class Inbox:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -632,7 +776,7 @@ class WakeServer:
                 self._reply(200, {"ok": True})
 
             def do_POST(self):  # noqa: N802
-                if self.path not in (WAKE_PATH, COMPLETE_PATH, SECRET_PREFLIGHT_PATH):
+                if self.path not in (WAKE_PATH, COMPLETE_PATH, SECRET_PREFLIGHT_PATH, SECRET_PROVISION_PATH):
                     self._reply(404, {"ok": False, "error": "not_found"})
                     return
                 try:
@@ -642,6 +786,16 @@ class WakeServer:
                     body = self.rfile.read(length)
                     if self.path == SECRET_PREFLIGHT_PATH:
                         result = owner._accept_secret_preflight(
+                            body,
+                            request_id=self.headers.get("X-Handoff-Request-ID", ""),
+                            timestamp=self.headers.get("X-Handoff-Timestamp", ""),
+                            signature=self.headers.get("X-Handoff-Signature", ""),
+                            client_ip=self.client_address[0],
+                        )
+                        self._reply(200, result, signed=True, request_id=result["request_id"])
+                        return
+                    if self.path == SECRET_PROVISION_PATH:
+                        result = owner._accept_secret_provision(
                             body,
                             request_id=self.headers.get("X-Handoff-Request-ID", ""),
                             timestamp=self.headers.get("X-Handoff-Timestamp", ""),
@@ -781,6 +935,126 @@ class WakeServer:
             ttl = max(1, self.config.max_skew_seconds * 2)
             self._preflight_receipts[request_id] = (now + ttl, body_digest, response)
             return dict(response)
+
+    def _accept_secret_provision(
+        self,
+        body: bytes,
+        *,
+        request_id: str,
+        timestamp: str,
+        signature: str,
+        client_ip: str,
+    ) -> dict:
+        self._check_source(client_ip)
+        try:
+            sent_at = int(timestamp)
+        except ValueError as exc:
+            raise ExecutionError("通知时间戳非法") from exc
+        if abs(int(time.time()) - sent_at) > self.config.max_skew_seconds:
+            raise ExecutionError("通知已过期")
+        if not hmac.compare_digest(signature, _signature(self._secret, timestamp, body)):
+            raise ExecutionError("通知签名无效")
+        payload = json.loads(body.decode("utf-8"))
+        _validate_secret_provision(payload)
+        if request_id != payload["request_id"]:
+            raise ExecutionError("request_id 与正文不一致")
+
+        app_config = getattr(self.config, "_app_config", None)
+        if app_config is None:
+            raise ExecutionError("后端密钥自动写入缺少应用配置")
+        secrets_config = getattr(app_config, "secrets", None)
+        if secrets_config is None or not getattr(secrets_config, "provision_enabled", False):
+            raise ExecutionError("后端未开启密钥自动写入（secrets.provision_enabled）")
+
+        allowed = tuple(getattr(secrets_config, "provision_refs", ()) or ())
+        provision_dir = Path(getattr(secrets_config, "provision_dir", ".handoff-run/secrets")).expanduser()
+        if not provision_dir.is_absolute():
+            provision_dir = Path(app_config.root) / provision_dir
+        provision_dir.mkdir(parents=True, exist_ok=True)
+        # 0700 目录，密钥文件 0600；refs.json 记录映射但不含密钥值。
+        try:
+            os.chmod(provision_dir, 0o700)
+        except OSError:
+            pass
+
+        # 先把整批全部校验并解密，再落盘；避免某行非法时只写入前半批。
+        decrypted: list[tuple[str, str, str]] = []  # (ref, env, value)
+        for index, row in enumerate(payload["secrets"]):
+            ref = row["ref"]
+            env = row["env"]
+            if allowed and ref not in allowed:
+                raise ExecutionError(
+                    f"密钥自动写入 secrets[{index}]: reference {ref!r} 不在后端 "
+                    "secrets.provision_refs 允许列表"
+                )
+            if "/" in ref or "\\" in ref or ref in (".", ".."):
+                raise SchemaError(f"密钥自动写入 secrets[{index}].ref 非法")
+            value = secret_files.decrypt_provision_value(
+                row["value"], control_secret=self._secret
+            )
+            decrypted.append((ref, env, value))
+
+        written: list[str] = []
+        written_paths: dict[str, str] = {}
+        written_bindings: dict[str, str] = {}
+        for ref, env, value in decrypted:
+            target = provision_dir / ref
+            # 原子写入：先写同目录临时文件再 rename，避免中途失败留下半截密钥。
+            tmp = target.with_name(f".{ref}.tmp-{token_secrets.token_hex(8)}")
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(value)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, target)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+            written.append(ref)
+            written_paths[ref] = ref  # 相对 provision_dir 的文件名
+            written_bindings[env] = ref
+
+        # 更新 refs.json（原子），让下次启动的 Config 自动带上这些 ref/binding。
+        mapping_path = provision_dir / "refs.json"
+        existing: dict = {}
+        if mapping_path.is_file():
+            try:
+                loaded = json.loads(mapping_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                existing = {}
+        refs_map = existing.get("refs") if isinstance(existing.get("refs"), dict) else {}
+        bindings_map = existing.get("bindings") if isinstance(existing.get("bindings"), dict) else {}
+        refs_map.update(written_paths)
+        bindings_map.update(written_bindings)
+        new_mapping = {
+            "version": 1,
+            "refs": refs_map,
+            "bindings": bindings_map,
+        }
+        tmp_map = mapping_path.with_name(f".refs.json.tmp-{token_secrets.token_hex(8)}")
+        try:
+            tmp_map.write_text(json.dumps(new_mapping, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            os.replace(tmp_map, mapping_path)
+        finally:
+            if tmp_map.exists():
+                tmp_map.unlink()
+
+        # 同步更新当前进程中的 resolver，使随后立即执行的 preflight 能看到新值。
+        current_refs = dict(getattr(secrets_config, "refs", {}) or {})
+        current_bindings = dict(getattr(secrets_config, "bindings", {}) or {})
+        for ref in written:
+            current_refs[ref] = str(provision_dir / ref)
+        current_bindings.update(written_bindings)
+        object.__setattr__(secrets_config, "refs", current_refs)
+        object.__setattr__(secrets_config, "bindings", current_bindings)
+
+        return {
+            "schema_version": 1,
+            "request_id": payload["request_id"],
+            "status": "written",
+            "written": written,
+        }
 
     def _accept(
         self,

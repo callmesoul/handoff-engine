@@ -13,7 +13,7 @@ import os
 import re
 from pathlib import Path
 
-from .errors import ExecutionError, SchemaError
+from .errors import ConfigError, ExecutionError, SchemaError
 
 #: 兼容旧配置。键 = 环境变量名；值 = config.secrets 下的 *_FILE 配置项。
 LEGACY_SECRETS: dict[str, str] = {
@@ -352,3 +352,80 @@ def agent_env(config) -> dict[str, str]:
         if value:
             out[env_name] = value
     return out
+
+
+# ---------------------------------------------------------------------------
+# 自动写入（provision）用的认证加密
+# ---------------------------------------------------------------------------
+# 两端共享的通知控制密钥既已用于请求签名，也用作这里的密钥材料。没有引入
+# 第三方加密库：用 HMAC-SHA256 同时派生子密钥、生成 keystream 和做认证标签，
+# 构造 encrypt-then-MAC 的流加密。控制密钥 >=32 字节且每次推送随机 nonce，
+# 足以保护短生命周期的验收密钥在已签名的 LAN 通道内传输。
+
+_PROVISION_KDF_DOMAIN = b"handoff-secret-provision-v1\0"
+_PROVISION_NONCE_BYTES = 16
+_PROVISION_TAG_BYTES = 32
+
+
+def _hkdf_bytes(control_secret: bytes, info: bytes, length: int) -> bytes:
+    prk = hmac.new(control_secret, _PROVISION_KDF_DOMAIN, hashlib.sha256).digest()
+    out = bytearray()
+    counter = 1
+    while len(out) < length:
+        out.extend(hmac.new(prk, info + bytes([counter]), hashlib.sha256).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def encrypt_provision_value(value: str, *, control_secret: bytes) -> str:
+    """把单个密钥值加密成可放进入已签名 JSON 的字符串（base64）。"""
+    import base64
+
+    nonce = token_bytes(_PROVISION_NONCE_BYTES)
+    enc_key = _hkdf_bytes(control_secret, b"enc", 32)
+    mac_key = _hkdf_bytes(control_secret, b"mac", 32)
+    data = value.encode("utf-8")
+    keystream = _keystream(enc_key, nonce, len(data))
+    ciphertext = bytes(a ^ b for a, b in zip(data, keystream))
+    tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()
+    return base64.b64encode(nonce + ciphertext + tag).decode("ascii")
+
+
+def decrypt_provision_value(encoded: str, *, control_secret: bytes) -> str:
+    import base64
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ExecutionError("自动写入密钥的密文格式非法") from exc
+    min_len = _PROVISION_NONCE_BYTES + _PROVISION_TAG_BYTES
+    if len(raw) < min_len or len(raw) > 8192:
+        raise ExecutionError("自动写入密钥的密文长度非法")
+    nonce = raw[:_PROVISION_NONCE_BYTES]
+    ciphertext = raw[_PROVISION_NONCE_BYTES:-_PROVISION_TAG_BYTES]
+    tag = raw[-_PROVISION_TAG_BYTES:]
+    mac_key = _hkdf_bytes(control_secret, b"mac", 32)
+    expected = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag, expected):
+        raise ExecutionError("自动写入密钥的认证标签无效")
+    enc_key = _hkdf_bytes(control_secret, b"enc", 32)
+    keystream = _keystream(enc_key, nonce, len(ciphertext))
+    data = bytes(a ^ b for a, b in zip(ciphertext, keystream))
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ExecutionError("自动写入密钥解密后不是合法文本") from exc
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def token_bytes(n: int) -> bytes:
+    """从 os.urandom 生成随机字节；单独封装便于测试替换。"""
+    return os.urandom(n)

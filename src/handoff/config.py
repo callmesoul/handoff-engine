@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -31,6 +32,65 @@ def _construct_unique_mapping(loader, node, deep=False):
 
 _UniqueKeyLoader.construct_mapping = _construct_unique_mapping
 _UniqueKeyLoader.add_constructor("tag:yaml.org,2002:map", lambda loader, node: _construct_unique_mapping(loader, node, deep=True))
+
+
+def _load_auto_provisioned(
+    provision_dir: str,
+    root: Path,
+    explicit_refs: dict[str, str],
+    explicit_bindings: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """读取后端自动写入的 refs / bindings；local.yaml 显式配置优先。
+
+    自动写入的密钥值落在 provision_dir，映射落在 provision_dir/refs.json：
+    ``{"version":1,"refs":{ref:path},"bindings":{env:ref}}``。这样后端只需在
+    local.yaml 打开 provision_enabled，其余 ref/binding 都无需手工抄写。
+    """
+    candidate = Path(provision_dir).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    mapping_path = candidate / "refs.json"
+    try:
+        data = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    refs: dict[str, str] = {}
+    bindings: dict[str, str] = {}
+    raw_refs = data.get("refs", data if "refs" not in data and "bindings" not in data else {})
+    if isinstance(raw_refs, dict):
+        for ref, path in raw_refs.items():
+            if (
+                isinstance(ref, str)
+                and _SECRET_REF_RE.fullmatch(ref)
+                and "/" not in ref
+                and "\\" not in ref
+                and isinstance(path, str)
+                and path.strip()
+            ):
+                # 只接受位于 provision_dir 内的相对文件名，避免 refs.json 被篡改后
+                # 指向任意文件（值仍由服务端解析，不读取内容到这里）。
+                if Path(path).name == path:
+                    refs[ref] = str(candidate / path)
+    raw_bindings = data.get("bindings", {})
+    if isinstance(raw_bindings, dict):
+        for env, ref in raw_bindings.items():
+            if (
+                isinstance(env, str)
+                and _ENV_NAME_RE.fullmatch(env)
+                and env.upper() == env
+                and env not in _RESERVED_SECRET_ENVS
+                and not env.startswith(_RESERVED_SECRET_ENV_PREFIXES)
+                and isinstance(ref, str)
+                and _SECRET_REF_RE.fullmatch(ref)
+            ):
+                bindings[env] = ref
+    # local.yaml 显式配置优先，覆盖自动写入的同名项。
+    refs.update(explicit_refs)
+    bindings.update(explicit_bindings)
+    return refs, bindings
 
 
 def _read_yaml(path: Path) -> dict:
@@ -103,6 +163,14 @@ class SecretsConfig:
     refs: dict[str, str] = field(default_factory=dict)
     # HTTP/OpenAPI 占位允许的 env → public reference 绑定；防止任务任意换绑窃取密钥。
     bindings: dict[str, str] = field(default_factory=dict)
+    # 后端：是否接受前端在 create 时经已认证通道推送密钥值。默认关闭。
+    provision_enabled: bool = False
+    # 后端：允许被自动写入的 reference 子集；为空表示所有合法 ref 都允许。
+    provision_refs: tuple[str, ...] = ()
+    # 后端：未在 refs 中显式配置的 reference 写入哪个目录（相对交接仓根或绝对路径）。
+    provision_dir: str = ".handoff-run/secrets"
+    # 前端：create 时是否主动把本机密钥值加密推送给后端。默认关闭。
+    provision_push: bool = False
 
     def path(self, root: Path, env_name: str, *, ref: str | None = None) -> Path | None:
         """密钥文件的绝对路径；env_name 为注入变量名或 *_FILE 配置项名。
@@ -466,6 +534,8 @@ class NotificationConfig:
     url: str | None = None
     # 同一后端 listener 的同步密钥预检端点；未配置时从 url 自动派生。
     preflight_url: str | None = None
+    # 同一后端 listener 的密钥自动写入端点；未配置时从 url 自动派生。
+    provision_url: str | None = None
     secret_env: str = "HANDOFF_NOTIFY_SECRET"
     outbox_database: str = ".handoff-run/notify/outbox.sqlite3"
     inbox_database: str = ".handoff-run/notify/inbox.sqlite3"
@@ -599,10 +669,40 @@ def _apply_local(local: dict, repositories, environments, checks, admin, codex, 
             if not isinstance(ref, str) or not _SECRET_REF_RE.fullmatch(ref):
                 raise ConfigError(f"config/local.yaml: secrets.bindings.{env} reference 非法")
             bindings[env] = ref
+        provision_enabled = patch.pop("provision_enabled", secrets.provision_enabled)
+        if type(provision_enabled) is not bool:
+            raise ConfigError("config/local.yaml: secrets.provision_enabled 必须是 boolean")
+        raw_provision_refs = patch.pop("provision_refs", secrets.provision_refs)
+        if raw_provision_refs is None:
+            raw_provision_refs = ()
+        if not isinstance(raw_provision_refs, (list, tuple)):
+            raise ConfigError("config/local.yaml: secrets.provision_refs 必须是 reference 列表")
+        provision_refs: tuple[str, ...] = ()
+        for ref in raw_provision_refs:
+            if not isinstance(ref, str) or not _SECRET_REF_RE.fullmatch(ref):
+                raise ConfigError(f"config/local.yaml: secrets.provision_refs 中 {ref!r} 非法")
+            if "/" in ref or "\\" in ref or ref in (".", ".."):
+                raise ConfigError(f"config/local.yaml: secrets.provision_refs 中 {ref!r} 不能包含路径分隔符")
+            provision_refs = provision_refs + (ref,)
+        provision_dir = patch.pop("provision_dir", secrets.provision_dir)
+        if provision_dir is not None and not isinstance(provision_dir, str):
+            raise ConfigError("config/local.yaml: secrets.provision_dir 必须是路径字符串")
+        provision_push = patch.pop("provision_push", secrets.provision_push)
+        if type(provision_push) is not bool:
+            raise ConfigError("config/local.yaml: secrets.provision_push 必须是 boolean")
         for key, value in patch.items():
             if value is not None and not isinstance(value, str):
                 raise ConfigError(f"config/local.yaml: secrets.{key} 必须是文件路径字符串")
-        secrets = replace(secrets, refs=refs, bindings=bindings, **patch)
+        secrets = replace(
+            secrets,
+            refs=refs,
+            bindings=bindings,
+            provision_enabled=provision_enabled,
+            provision_refs=provision_refs,
+            provision_dir=provision_dir,
+            provision_push=provision_push,
+            **patch,
+        )
 
     repos = dict(repositories)
     for repo_id, patch in (local.get("repositories") or {}).items():
@@ -675,6 +775,12 @@ def _apply_local(local: dict, repositories, environments, checks, admin, codex, 
                 "/v1/handoff/secret-preflight",
                 "preflight_url",
             )
+        if notifications.provision_url:
+            _validate_notification_url(
+                notifications.provision_url,
+                "/v1/handoff/secret-provision",
+                "provision_url",
+            )
         if notifications.completion_url:
             _validate_notification_url(
                 notifications.completion_url,
@@ -739,6 +845,17 @@ class Config:
         self.panel: PanelConfig = panel or PanelConfig()
         self.notifications: NotificationConfig = notifications or NotificationConfig()
         self.secrets: SecretsConfig = secrets or SecretsConfig()
+        # 后端打开自动写入时，把 provision_dir/refs.json 中的引用并入 resolver，
+        # 使自动写入的密钥在重启后立即可用（local.yaml 显式配置优先）。
+        if self.secrets.provision_enabled:
+            merged_refs, merged_bindings = _load_auto_provisioned(
+                self.secrets.provision_dir,
+                self.root,
+                self.secrets.refs,
+                self.secrets.bindings,
+            )
+            object.__setattr__(self.secrets, "refs", merged_refs)
+            object.__setattr__(self.secrets, "bindings", merged_bindings)
         # 让 notification.load_secret 能从配置文件取密钥（它通常只拿到 NotificationConfig）
         object.__setattr__(self.notifications, "_app_config", self)
 

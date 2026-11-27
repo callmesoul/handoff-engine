@@ -37,8 +37,16 @@ admin:
 #   # HTTP/OpenAPI 中自定义 env → ref 必须在前后端各自本机明确授权。
 #   bindings:
 #     SAAS_TEST_SESSION_COOKIE: saas-test-session
+#   # 可选：前端 create 时自动把本机密钥加密推给后端，后端自动落盘。
+#   # 前端只需 provision_push: true（或 create 时加 --provision-secrets）；
+#   # 后端须开启 provision_enabled，且自动写入的 ref 受 provision_refs 白名单限制。
+#   # provision_push: true
+#   # provision_enabled: true
+#   # provision_refs: [saas-test-session]
+#   # provision_dir: .handoff-run/secrets
 #
-# 前端 notifications.url 指向后端 wake endpoint 时，预检 URL 会自动同源派生；
+# 前端 notifications.url 指向后端 wake endpoint 时，预检/自动写入 URL 会自动同源派生；
 # 只有反向代理拓扑不同时才配置精确路径：
 # notifications:
 #   preflight_url: https://handoff.example/v1/handoff/secret-preflight
+#   provision_url: https://handoff.example/v1/handoff/secret-provision
