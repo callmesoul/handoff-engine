@@ -14,6 +14,8 @@ deliver       ◀──   ├─ 专用 clone + 每次 attempt 独立 worktree
 
 worker **不部署**，CI **不改任务状态**。
 
+`dsh-handoff-panel` 是前端发单/跟踪/验收插件，**后端部署不安装**。需要后端 DSH 执行界面时使用独立的 `dsh-handoff-studio`，不要把前端面板装进 worker/operator profile。
+
 两种跑法，选一个：
 
 | | 原生 Windows | WSL（同一台机器） |
@@ -80,6 +82,16 @@ git config --system core.longpaths true
 为什么代码和数据分开：`TaskStore.sync()` 会 `reset --hard`。同一个目录里，一次 sync 可能把运行中的代码换掉，或者被代码改动卡住（"工作区有未提交改动"）。
 
 业务仓不用预先 clone，worker 自己会在 `<store>\.handoff-run\repo-cache\` 下建缓存再开 worktree。
+
+### 2.1 安装后端 DSH 执行面板
+
+`dsh-handoff-studio/` 是后端执行机专用面板：它读取后端交接仓，并用面板中选择的 DSH Agent 执行任务。只在需要这条执行路径的后端 DSH profile 安装，前端部署不安装。
+
+```powershell
+dsh plugin --profile desktop add C:\handoff\app\dsh-handoff-studio
+```
+
+让 `HANDOFF_ROOT` 指向 `C:\handoff\store`，并确保插件使用的 Python 已安装 Handoff Engine；安装后重启 DSH。
 
 ---
 

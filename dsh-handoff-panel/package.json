@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "main": "lib/index.js",
-  "description": "Handoff Panel for DeepSeek Harness: a sidebar entry that frames the local handoffctl task panel.",
+  "description": "Frontend-only Handoff Panel for DeepSeek Harness: create, track, verify, and accept backend tasks.",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",

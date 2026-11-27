@@ -11,6 +11,7 @@ import yaml
 from handoff import ids, notification, schema
 from handoff.cli import detect_source_repo, main as cli_main, slug_from_remote
 from handoff.config import Config, NotificationConfig
+from handoff.errors import TaskNotFound
 from handoff.frontend_session import FrontendSessions
 from handoff.store import TaskStore
 from helpers import (
@@ -94,6 +95,7 @@ def test_create_overrides_stale_draft_repo(tmp_path):
     assert saved["source"]["repo"] == "org/web-a"
     assert saved["source"]["commit_sha"] == git(clone_a, "rev-parse", "HEAD")
     assert "base_sha" not in saved["target"]
+    assert "required_secrets" not in saved  # 无密钥任务保持旧 schema 消费端兼容
     # 旧草稿里的 raw glob 不再决定后端路径，创建时统一固化仓库默认 profile。
     assert saved["scope"]["allowed_paths"] == ["src/**", "tests/**"]
     assert saved["scope"]["forbidden_paths"] == [".github/**", "infra/prod/**"]
@@ -337,6 +339,42 @@ def test_unregistered_frontend_lists_candidates(tmp_path):
 
     code = cli_main(["--root", str(work), "create", "--from-file", str(draft), "--source-path", str(clone_c)])
     assert code != 0
+
+
+def test_create_missing_local_secret_has_no_task_or_session_side_effect(tmp_path, monkeypatch):
+    work, _config, api, clone_a, _clone_b = build(tmp_path)
+    monkeypatch.delenv("SAAS_TEST_SESSION_COOKIE", raising=False)
+    (work / "config" / "local.yaml").write_text(
+        yaml.safe_dump({"secrets": {"refs": {"saas-session": "missing/session.cookie"}}}),
+        encoding="utf-8",
+    )
+    task = make_task(
+        ids.task_id(), base_sha=git(api, "rev-parse", "dev"), source_repo="org/web-a"
+    )
+    task["required_secrets"] = [{
+        "ref": "saas-session", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True
+    }]
+    task["acceptance"]["checks"] = [{
+        "id": "session",
+        "type": "http",
+        "method": "GET",
+        "url": "{base_url}/session",
+        "headers": {"Cookie": "{env:SAAS_TEST_SESSION_COOKIE}"},
+        "expect_status": 200,
+    }]
+    draft = tmp_path / "draft-secret.json"
+    write_draft(draft, task)
+
+    code = cli_main([
+        "--root", str(work), "--json", "create", "--from-file", str(draft),
+        "--source-path", str(clone_a),
+    ])
+
+    assert code != 0
+    cfg = Config.load(work)
+    with pytest.raises(TaskNotFound):
+        TaskStore(work, cfg).get(task["id"])
+    assert not cfg.notifications.session_path(work).exists()
 
 
 def test_create_pushes_then_background_notifier_notifies_backend(tmp_path, monkeypatch):

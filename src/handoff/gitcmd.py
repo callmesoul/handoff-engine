@@ -65,8 +65,18 @@ def run(
     env: dict[str, str] | None = None,
     input_text: str | None = None,
     check_env: bool = True,
+    inherit_env: bool = True,
 ) -> Result:
-    full_env = dict(os.environ)
+    if inherit_env:
+        full_env = dict(os.environ)
+    else:
+        # verifier 脚本只拿到进程启动所需的非敏感基础环境，以及调用方显式注入项。
+        safe_names = (
+            "PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
+            "HOME", "USERPROFILE", "TMP", "TEMP", "TMPDIR",
+            "LANG", "LC_ALL", "TERM",
+        )
+        full_env = {name: os.environ[name] for name in safe_names if name in os.environ}
     if check_env:
         full_env.update(git_env())
     if env:

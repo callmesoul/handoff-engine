@@ -9,11 +9,12 @@ description: 拉取后端交付、等部署对齐、跑结构化验收并回报�
 
 引擎和交接仓是两个独立仓库。开始执行前：
 
-1. 读取环境变量 `HANDOFF_ROOT`，它必须指向包含 `config/repositories.yaml` 的交接仓；未设置时只可使用确实存在的 `$HOME/code/handoff-store`，否则询问用户，不要把引擎目录当交接仓。
-2. 优先调用 PATH 中已安装的 `handoffctl`；若不存在，再从 `HANDOFF_ENGINE_ROOT` 指向的引擎虚拟环境调用。不要从交接仓寻找引擎代码。
-3. 下文 `$CTL` 表示 `handoffctl --root "$HANDOFF_ROOT"`；Windows PowerShell 等价为 `handoffctl.exe --root $env:HANDOFF_ROOT`。
+1. 先在**任务工作区所属的环境**解析 `HANDOFF_ROOT`。Windows DSH 打开 WSL 工作区（`\\wsl.localhost\<distro>\...`）时，不要用宿主 PowerShell 里缺失或陈旧的同名变量；调用 `wsl.exe -d <distro> -- bash -lc 'printenv HANDOFF_ROOT'` 读取该发行版的 login-shell 环境，后续 CLI 也在同一发行版内执行。
+2. `HANDOFF_ROOT` 必须指向包含 `config/repositories.yaml` 的交接仓；未设置时只可使用同一环境中确实存在的 `$HOME/code/handoff-store`，否则询问用户。禁止回退到历史仓名，也不要把引擎目录当交接仓。
+3. 优先调用同一环境 PATH 中已安装的 `handoffctl`；若不存在，再从该环境的 `HANDOFF_ENGINE_ROOT` 指向的引擎虚拟环境调用。不要从交接仓寻找引擎代码。
+4. 下文 `$CTL` 表示 `handoffctl --root "$HANDOFF_ROOT"`；原生 Windows PowerShell 工作区等价为 `handoffctl.exe --root $env:HANDOFF_ROOT`。
 
-安装、环境变量和 Windows 示例见引擎仓的 `doc/DEPLOY-AGENT.md`。
+安装、环境变量和 Windows/WSL 示例见引擎仓的 `doc/DEPLOY-AGENT.md`。
 
 ## 做一件事
 

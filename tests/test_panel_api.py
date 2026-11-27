@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.request
@@ -13,6 +14,7 @@ import pytest
 
 from handoff import ids
 from handoff.config import Config
+from handoff.errors import HandoffError
 from handoff.deploy import CommitAncestry
 from handoff.panel.server import PanelServer
 from handoff.panel.service import PanelService
@@ -78,12 +80,30 @@ def env(tmp_path, monkeypatch):
         "api",
         {"src/orders/Order.java": "class Order {}\n", "README.md": "# api\n"},
     )
+    # 前端来源项目必须有本地路径，面板发单才能读到真实 HEAD（不能伪造全零 SHA）。
+    checks = {
+        "test_suites": {},
+        "repo_scripts": {},
+        "gate": {
+            "required_checks": [],
+            "high_risk_paths": [".github/**", "infra/prod/**", "**/migrations/**"],
+            "deny_auto_merge_if_migration_required": True,
+            "max_changed_files": 50,
+            "max_file_bytes": 65536,
+        },
+        "verifier": {
+            "output_limit_chars": 2000,
+            "max_parallel": 1,
+            "repo_paths": {"org/web": str(backend)},
+        },
+    }
     write_config(
         work,
         repos=[
             repo_entry("org/api", "backend", backend),
             repo_entry("org/web", "frontend", backend),
         ],
+        checks=checks,
     )
     config = Config.load(work)
     base_sha = git(backend, "rev-parse", "dev")
@@ -110,6 +130,25 @@ def env(tmp_path, monkeypatch):
     server.stop()
 
 
+@pytest.fixture()
+def frontend_env(env):
+    """Expose the same fake store through a real frontend-role service and server."""
+    service = PanelService(
+        env.work,
+        env.config,
+        runner_overrides=env.service._runner_overrides,
+        host=env.service._host,
+        role="frontend",
+    )
+    server = PanelServer(service, host="127.0.0.1", port=0)
+    host, port = server.start()
+    try:
+        yield Simple(base_url=f"http://{host}:{port}", service=service, server=server)
+    finally:
+        service.shutdown()
+        server.stop()
+
+
 class Simple:
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -131,6 +170,19 @@ def _codex_factory():
 def _get(url):
     with urllib.request.urlopen(url, timeout=30) as res:
         return json.loads(res.read().decode("utf-8"))
+
+
+def _get_text(url):
+    with urllib.request.urlopen(url, timeout=30) as res:
+        return res.status, res.read().decode("utf-8")
+
+
+def _get_error(url):
+    try:
+        with urllib.request.urlopen(url, timeout=30) as res:
+            return res.status, json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def _post(url, payload=None):
@@ -161,6 +213,7 @@ def _wait_run_done(service, timeout=60):
 
 def test_state_lists_health_and_manual_mode(env):
     state = _get(f"{env.base_url}/api/state")
+    assert state["role"] == "backend"
     assert state["mode"] == "manual"
     assert state["executors"]["zcode"]["version"] == "zcode 0.0.0-fake"
     assert state["executors"]["codex"]["ok"] is True
@@ -215,6 +268,87 @@ def test_sessions_endpoint(env, monkeypatch):
     monkeypatch.setattr(sess, "codex_sessions", lambda limit=50: [])
     data = _get(f"{env.base_url}/api/tasks/{env.task['id']}/sessions?executor=zcode")
     assert data == {"executor": "zcode", "sessions": []}
+
+
+# -- 前端专用面板 -----------------------------------------------------------
+
+
+def test_frontend_panel_serves_dedicated_page_and_minimal_state(frontend_env):
+    status, html = _get_text(f"{frontend_env.base_url}/")
+    assert status == 200
+    assert "前端任务面板" in html
+    for backend_control in ("全自动", "开始执行", "释放租约", "恢复推进", "执行日志"):
+        assert backend_control not in html
+
+    state = _get(f"{frontend_env.base_url}/api/state")
+    assert state["role"] == "frontend"
+    assert "projects" in state and "environments" in state
+    for backend_field in ("mode", "auto", "active", "advance", "executors", "executor_options"):
+        assert backend_field not in state
+
+
+def test_frontend_panel_rejects_backend_routes(frontend_env, env):
+    denied_posts = (
+        "/api/mode",
+        "/api/runs/cancel",
+        "/api/runs/steer",
+        "/api/runs/security",
+        f"/api/tasks/{env.task['id']}/run",
+        f"/api/tasks/{env.task['id']}/retry",
+        f"/api/tasks/{env.task['id']}/release",
+        f"/api/tasks/{env.task['id']}/resend-notify",
+        f"/api/tasks/{env.task['id']}/advance",
+    )
+    for path in denied_posts:
+        status, body = _post(frontend_env.base_url + path, {})
+        assert status == 403, path
+        assert body["code"] == "panel_role_forbidden"
+
+    denied_gets = (
+        f"/api/tasks/{env.task['id']}/sessions",
+        "/api/sessions/codex",
+        f"/api/logs?task={env.task['id']}",
+    )
+    for path in denied_gets:
+        status, body = _get_error(frontend_env.base_url + path)
+        assert status == 403, path
+        assert body["code"] == "panel_role_forbidden"
+
+
+def test_frontend_panel_allows_frontend_mutations(frontend_env, env, monkeypatch):
+    service = frontend_env.service
+    monkeypatch.setattr(service, "sync", lambda: {"added": 0, "total": 1, "ids": []})
+    monkeypatch.setattr(service, "create_task", lambda payload: {"id": "ho-frontend"})
+    monkeypatch.setattr(service, "deliver", lambda task_id: {"task_id": task_id, "started": True})
+    monkeypatch.setattr(service, "accept", lambda task_id, reason: {"id": task_id, "reason": reason})
+
+    assert _post(f"{frontend_env.base_url}/api/sync")[0] == 200
+    assert _post(f"{frontend_env.base_url}/api/tasks", {"title": "x"})[0] == 200
+    assert _post(f"{frontend_env.base_url}/api/deliver", {"task_id": env.task["id"]})[0] == 200
+    assert _post(f"{frontend_env.base_url}/api/tasks/{env.task['id']}/accept", {"reason": "ok"})[0] == 200
+
+
+def test_frontend_service_rejects_backend_operations_directly(frontend_env, env):
+    """服务层是公共 API：即使绕过 HTTP allow-list，也不能借 frontend 服务跑后端操作。"""
+    service = frontend_env.service
+    task_id = env.task["id"]
+    calls = (
+        (service.set_mode, ({"mode": "auto"},)),
+        (service.set_security_mode, ("danger-full-access",)),
+        (service.cancel, ()),
+        (service.steer, ("继续",)),
+        (service.run_task, (task_id,), {"executor": "codex"}),
+        (service.retry, (task_id,)),
+        (service.release, (task_id,)),
+        (service.resend_completed, (task_id,)),
+        (service.advance, (task_id,)),
+    )
+    for call in calls:
+        fn = call[0]
+        args = call[1]
+        kwargs = call[2] if len(call) > 2 else {}
+        with pytest.raises(HandoffError, match="前端面板不支持后端操作"):
+            fn(*args, **kwargs)
 
 
 # -- 手动执行 ---------------------------------------------------------------
@@ -398,6 +532,45 @@ def test_create_task_from_panel(env):
     assert created["scope"]["forbidden_paths"] == [".github/**", "infra/prod/**"]
     assert created["scope"]["out_of_scope"] == ["不改鉴权", "不改部署配置"]
     assert created["acceptance"]["environment"] == "dev"
+    assert created["source"]["role"] == "frontend"
+    assert created["source"]["repo"] == "org/web"
+    assert re.fullmatch(r"[0-9a-f]{40}", created["source"]["commit_sha"])
+    assert created["source"]["commit_sha"] != "0" * 40
+
+
+def test_create_task_rejects_forged_source_provenance(env):
+    base = {
+        "title": "伪造来源",
+        "repo": "org/api",
+        "requirement": "应被拒绝",
+        "scope_profile": "application",
+    }
+    # 用后端项目冒充来源 → 拒绝
+    status, body = _post(f"{env.base_url}/api/tasks", {**base, "source_repo": "org/api"})
+    assert status == 400
+    assert "frontend" in body.get("message", body.get("error", ""))
+
+    # 显式填错 SHA → 与本地 HEAD 不一致，拒绝
+    status, body = _post(
+        f"{env.base_url}/api/tasks",
+        {**base, "source_repo": "org/web", "source_sha": "f" * 40},
+    )
+    assert status == 400
+    assert "HEAD" in body.get("message", body.get("error", ""))
+
+    # 来源项目没配本地路径 → 拒绝，绝不退回全零 SHA
+    from dataclasses import replace
+    original_checks = env.config.checks
+    try:
+        env.config.checks = replace(
+            original_checks,
+            verifier=replace(original_checks.verifier, repo_paths={}),
+        )
+        status, body = _post(f"{env.base_url}/api/tasks", base)
+        assert status == 400
+        assert "本地路径" in body.get("message", body.get("error", ""))
+    finally:
+        env.config.checks = original_checks
 
 
 def test_create_task_rejects_raw_path_scope(env):

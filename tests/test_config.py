@@ -212,6 +212,70 @@ def test_local_notification_paths_are_exact(tmp_path):
             Config.load(work)
 
 
+def test_generic_secret_refs_and_suite_requirements_are_loaded(tmp_path):
+    work, _config = build(tmp_path)
+    (work / "config" / "local.yaml").write_text(
+        yaml.safe_dump({"secrets": {"refs": {"saas-session": "/run/secrets/session"}}}),
+        encoding="utf-8",
+    )
+    (work / "config" / "checks.yaml").write_text(
+        yaml.safe_dump({
+            "test_suites": {
+                "saas": {
+                    "repo": "org/api",
+                    "argv": ["python", "-m", "pytest"],
+                    "required_secrets": [{
+                        "ref": "saas-session",
+                        "env": "SAAS_TEST_SESSION_COOKIE",
+                        "same_value": True,
+                    }],
+                }
+            },
+            "repo_scripts": {},
+        }),
+        encoding="utf-8",
+    )
+
+    cfg = Config.load(work)
+    requirement = cfg.checks.test_suites["saas"].required_secrets[0]
+    assert cfg.secrets.refs == {"saas-session": "/run/secrets/session"}
+    assert requirement.as_dict() == {
+        "ref": "saas-session", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True
+    }
+
+
+def test_secret_requirements_reject_process_control_environment(tmp_path):
+    work, _config = build(tmp_path)
+    (work / "config" / "checks.yaml").write_text(
+        yaml.safe_dump({
+            "test_suites": {
+                "unsafe": {
+                    "repo": "org/api",
+                    "argv": ["true"],
+                    "required_secrets": [{"ref": "payload", "env": "LD_PRELOAD"}],
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="保留的控制面/进程环境变量"):
+        Config.load(work)
+
+
+def test_local_preflight_url_path_is_exact(tmp_path):
+    work, _config = build(tmp_path)
+    local = work / "config" / "local.yaml"
+    local.write_text(yaml.safe_dump({"notifications": {
+        "preflight_url": "http://127.0.0.1:8788/v1/handoff/secret-preflight"
+    }}), encoding="utf-8")
+    assert Config.load(work).notifications.preflight_url.endswith("/v1/handoff/secret-preflight")
+    local.write_text(yaml.safe_dump({"notifications": {
+        "preflight_url": "http://127.0.0.1:8788/v1/handoff/secret-preflight?token=bad"
+    }}), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        Config.load(work)
+
+
 def test_repo_scope_profiles_are_loaded(tmp_path):
     work, config = build(tmp_path)
     scope = config.repo("org/api").scope

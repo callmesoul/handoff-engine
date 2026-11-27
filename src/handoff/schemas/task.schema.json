@@ -81,6 +81,14 @@
     "acceptance": {
       "$ref": "#/$defs/acceptance"
     },
+    "required_secrets": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/secret_requirement"
+      }
+    },
     "migration": {
       "$ref": "#/$defs/migration"
     },
@@ -338,6 +346,30 @@
       "minLength": 1,
       "maxLength": 500,
       "pattern": "^(?!/)(?!.*//)(?!.*(^|/)\\.\\.(/|$)).+$"
+    },
+    "secret_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref",
+        "env",
+        "same_value"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "env": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "same_value": {
+          "type": "boolean"
+        }
+      }
     },
     "acceptance": {
       "type": "object",

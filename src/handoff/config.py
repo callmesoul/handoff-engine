@@ -56,6 +56,13 @@ def _resolve(root: Path, value: str | None) -> Path | None:
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SECRET_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_RESERVED_SECRET_ENVS = {
+    "PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH",
+    "BASH_ENV", "ENV", "SHELLOPTS", "COMSPEC", "PATHEXT", "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HANDOFF_NOTIFY_SECRET",
+}
+_RESERVED_SECRET_ENV_PREFIXES = ("DYLD_", "GIT_CONFIG_")
 
 
 def _validate_dsh_bridge_url(value: str) -> None:
@@ -85,21 +92,27 @@ def _validate_notification_url(value: str, expected_path: str, name: str) -> Non
 class SecretsConfig:
     """密钥文件所在的本机路径（值不进配置仓）。
 
-    各 agent 拿不到启动面板时的系统环境变量，框架读取这些文件后把值注入
-    codex/zcode 子进程环境。字段名与环境变量名一致：*_FILE 里放的是文件
-    路径，不是密钥本身。路径可相对交接仓根，也可用绝对路径 / ~。
+    框架按用途读取：通知密钥只用于控制面签名，通用 refs 只注入声明它的
+    verifier check；不会把全部密钥下放给 codex/zcode。*_FILE 与 refs 的值都是
+    文件路径，不是密钥本身。路径可相对交接仓根，也可用绝对路径 / ~。
     """
 
     HANDOFF_NOTIFY_SECRET_FILE: str | None = None
     OPENAPI_API_KEY_FILE: str | None = None
+    # 通用 secret reference → 本机密钥文件。reference 可以进入任务单，路径和值不能。
+    refs: dict[str, str] = field(default_factory=dict)
+    # HTTP/OpenAPI 占位允许的 env → public reference 绑定；防止任务任意换绑窃取密钥。
+    bindings: dict[str, str] = field(default_factory=dict)
 
-    def path(self, root: Path, env_name: str) -> Path | None:
+    def path(self, root: Path, env_name: str, *, ref: str | None = None) -> Path | None:
         """密钥文件的绝对路径；env_name 为注入变量名或 *_FILE 配置项名。
 
         未配置返回 None。接受两种写法是为了和 secrets.py 的 env 名调用对齐。
         """
-        file_key = env_name if env_name.endswith("_FILE") else env_name + "_FILE"
-        value = getattr(self, file_key, None)
+        value = self.refs.get(ref) if ref else None
+        if not value:
+            file_key = env_name if env_name.endswith("_FILE") else env_name + "_FILE"
+            value = getattr(self, file_key, None)
         if not value:
             return None
         path = Path(value).expanduser()
@@ -272,6 +285,54 @@ class PollConfig:
 
 
 @dataclass(frozen=True)
+class SecretRequirement:
+    """可公开的密钥需求元数据；绝不包含密钥值或文件路径。"""
+
+    ref: str
+    env: str
+    same_value: bool = True
+
+    def as_dict(self) -> dict:
+        return {"ref": self.ref, "env": self.env, "same_value": self.same_value}
+
+
+def _secret_requirements(value, *, where: str) -> tuple[SecretRequirement, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{where} 必须是数组")
+    if len(value) > 50:
+        raise ConfigError(f"{where} 最多允许 50 项")
+    result: list[SecretRequirement] = []
+    seen: set[tuple[str, str]] = set()
+    for index, item in enumerate(value):
+        path = f"{where}[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{path} 必须是映射")
+        unknown = set(item) - {"ref", "env", "same_value"}
+        if unknown:
+            raise ConfigError(f"{path} 有未知键: {', '.join(sorted(unknown))}")
+        ref = item.get("ref")
+        env = item.get("env")
+        same_value = item.get("same_value", True)
+        if not isinstance(ref, str) or not _SECRET_REF_RE.fullmatch(ref):
+            raise ConfigError(f"{path}.ref 必须匹配 {_SECRET_REF_RE.pattern}")
+        if not isinstance(env, str) or not _ENV_NAME_RE.fullmatch(env):
+            raise ConfigError(f"{path}.env 必须是合法的环境变量名")
+        upper_env = env.upper()
+        if upper_env in _RESERVED_SECRET_ENVS or upper_env.startswith(_RESERVED_SECRET_ENV_PREFIXES):
+            raise ConfigError(f"{path}.env {env!r} 是保留的控制面/进程环境变量")
+        if type(same_value) is not bool:
+            raise ConfigError(f"{path}.same_value 必须是 boolean")
+        key = (ref, env)
+        if key in seen:
+            raise ConfigError(f"{where} 包含重复密钥需求 {ref!r}/{env}")
+        seen.add(key)
+        result.append(SecretRequirement(ref=ref, env=env, same_value=same_value))
+    return tuple(result)
+
+
+@dataclass(frozen=True)
 class SuiteSpec:
     name: str
     repo: str
@@ -279,6 +340,7 @@ class SuiteSpec:
     timeout_seconds: float = 900
     cwd: str = "."
     serial_group: str | None = None
+    required_secrets: tuple[SecretRequirement, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -399,9 +461,11 @@ class FrontendRestoreModelsConfig:
 
 @dataclass(frozen=True)
 class NotificationConfig:
-    """局域网任务唤醒配置；密钥只从环境变量读取，不进配置仓。"""
+    """局域网任务唤醒配置；密钥只从环境变量或本机文件读取，不进配置仓。"""
 
     url: str | None = None
+    # 同一后端 listener 的同步密钥预检端点；未配置时从 url 自动派生。
+    preflight_url: str | None = None
     secret_env: str = "HANDOFF_NOTIFY_SECRET"
     outbox_database: str = ".handoff-run/notify/outbox.sqlite3"
     inbox_database: str = ".handoff-run/notify/inbox.sqlite3"
@@ -503,14 +567,42 @@ def _apply_local(local: dict, repositories, environments, checks, admin, codex, 
         raise ConfigError(f"config/local.yaml 里有未知键: {', '.join(sorted(unknown))}")
 
     if local.get("secrets"):
-        patch = dict(local["secrets"])
+        raw_secrets = local["secrets"]
+        if not isinstance(raw_secrets, dict):
+            raise ConfigError("config/local.yaml: secrets 必须是映射")
+        patch = dict(raw_secrets)
         if set(patch) - set(SecretsConfig.__dataclass_fields__):
             bad = sorted(set(patch) - set(SecretsConfig.__dataclass_fields__))
             raise ConfigError(f"config/local.yaml: secrets 有未知键: {', '.join(bad)}")
+        raw_refs = patch.pop("refs", {}) or {}
+        raw_bindings = patch.pop("bindings", {}) or {}
+        if not isinstance(raw_refs, dict):
+            raise ConfigError("config/local.yaml: secrets.refs 必须是 reference 到文件路径的映射")
+        if not isinstance(raw_bindings, dict):
+            raise ConfigError("config/local.yaml: secrets.bindings 必须是环境变量到 reference 的映射")
+        refs: dict[str, str] = {}
+        for ref, value in raw_refs.items():
+            if not isinstance(ref, str) or not _SECRET_REF_RE.fullmatch(ref):
+                raise ConfigError(f"config/local.yaml: secrets.refs 的 reference {ref!r} 非法")
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"config/local.yaml: secrets.refs.{ref} 必须是非空文件路径字符串")
+            refs[ref] = value
+        bindings: dict[str, str] = {}
+        for env, ref in raw_bindings.items():
+            if not isinstance(env, str) or not _ENV_NAME_RE.fullmatch(env):
+                raise ConfigError(f"config/local.yaml: secrets.bindings 环境变量 {env!r} 非法")
+            upper_env = env.upper()
+            if env != upper_env:
+                raise ConfigError(f"config/local.yaml: secrets.bindings.{env} 环境变量必须大写")
+            if upper_env in _RESERVED_SECRET_ENVS or upper_env.startswith(_RESERVED_SECRET_ENV_PREFIXES):
+                raise ConfigError(f"config/local.yaml: secrets.bindings.{env} 是保留环境变量")
+            if not isinstance(ref, str) or not _SECRET_REF_RE.fullmatch(ref):
+                raise ConfigError(f"config/local.yaml: secrets.bindings.{env} reference 非法")
+            bindings[env] = ref
         for key, value in patch.items():
             if value is not None and not isinstance(value, str):
                 raise ConfigError(f"config/local.yaml: secrets.{key} 必须是文件路径字符串")
-        secrets = replace(secrets, **patch)
+        secrets = replace(secrets, refs=refs, bindings=bindings, **patch)
 
     repos = dict(repositories)
     for repo_id, patch in (local.get("repositories") or {}).items():
@@ -577,6 +669,12 @@ def _apply_local(local: dict, repositories, environments, checks, admin, codex, 
             )
         if notifications.url:
             _validate_notification_url(notifications.url, "/v1/handoff/wake", "url")
+        if notifications.preflight_url:
+            _validate_notification_url(
+                notifications.preflight_url,
+                "/v1/handoff/secret-preflight",
+                "preflight_url",
+            )
         if notifications.completion_url:
             _validate_notification_url(
                 notifications.completion_url,
@@ -718,6 +816,10 @@ class Config:
                 timeout_seconds=float(spec.get("timeout_seconds", 900)),
                 cwd=spec.get("cwd", "."),
                 serial_group=spec.get("serial_group"),
+                required_secrets=_secret_requirements(
+                    spec.get("required_secrets"),
+                    where=f"checks.yaml: test_suites.{name}.required_secrets",
+                ),
             )
             for name, spec in (raw_checks.get("test_suites") or {}).items()
         }
@@ -729,6 +831,10 @@ class Config:
                 timeout_seconds=float(spec.get("timeout_seconds", 600)),
                 cwd=spec.get("cwd", "."),
                 serial_group=spec.get("serial_group"),
+                required_secrets=_secret_requirements(
+                    spec.get("required_secrets"),
+                    where=f"checks.yaml: repo_scripts.{name}.required_secrets",
+                ),
             )
             for name, spec in (raw_checks.get("repo_scripts") or {}).items()
         }

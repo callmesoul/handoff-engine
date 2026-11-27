@@ -19,6 +19,13 @@
       "不新增数据库列（先按现有字段推导）"
     ]
   },
+  "required_secrets": [
+    {
+      "ref": "docs-api-key",
+      "env": "DOCS_API_KEY",
+      "same_value": true
+    }
+  ],
   "acceptance": {
     "environment": "dev",
     "checks": [

@@ -1,5 +1,16 @@
 # 任务只能引用这里审核过的命令；argv 不经过 shell。
+# 每个 suite/script 只会拿到自己声明的 required_secrets；ref 对应两端
+# config/local.yaml 的 secrets.refs，值和文件路径都不会进入任务单。
 test_suites: {}
+# 示例：
+# test_suites:
+#   saas-acceptance:
+#     repo: your-org/api
+#     argv: ["python", "-m", "pytest", "tests/saas_acceptance"]
+#     required_secrets:
+#       - ref: saas-test-session
+#         env: SAAS_TEST_SESSION_COOKIE
+#         same_value: true
 repo_scripts: {}
 
 gate:

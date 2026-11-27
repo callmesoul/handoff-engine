@@ -6,6 +6,7 @@ prompt / skill 不允许直接拼 git 命令或改任务单 JSON，只能调这�
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -21,7 +22,7 @@ from . import secrets as _secret_files
 from .codex_runner import CodexRunner
 from .config import Config, find_root
 from .deploy import CommitAncestry, VersionProbe, wait_for_deployment
-from .errors import ConfigError, ExecutionError, HandoffError, SchemaError
+from .errors import ConfigError, ConflictError, ExecutionError, HandoffError, SchemaError
 from .frontend_session import FrontendDispatcher, FrontendSessions
 from .gitcmd import git, resolve_remote_ref, run
 from .sanitize import clean
@@ -106,7 +107,7 @@ def resolve_id_placeholders(task_id: str, task: dict) -> None:
 
 def new_task(draft: dict) -> dict:
     stamp = iso()
-    return {
+    task = {
         "schema_version": 1,
         "id": draft["id"],
         "revision": 1,
@@ -136,6 +137,9 @@ def new_task(draft: dict) -> dict:
         "created_at": stamp,
         "updated_at": stamp,
     }
+    if draft.get("required_secrets"):
+        task["required_secrets"] = draft["required_secrets"]
+    return task
 
 
 def slug_from_remote(url: str) -> str | None:
@@ -302,6 +306,17 @@ def cmd_create(args, config: Config) -> dict:
     # 草稿里的 contracts/<id>/ 是占位（含 openapi_diff 的 expected_path），落库前换真实路径
     resolve_id_placeholders(task_id, draft)
 
+    # 密钥是硬前置：使用与 verifier 相同的 resolver 检查本机，再向后端 listener
+    # 发起有签名响应的一次性 challenge。失败时尚未复制附件、登记会话或写任务。
+    required_secrets = _secret_files.collect_requirements(draft, config)
+    if required_secrets:
+        draft["required_secrets"] = required_secrets
+    else:
+        draft.pop("required_secrets", None)
+    # 先拒绝所有无需文件系统即可发现的结构错误，再访问远端 presence/proof。
+    schema.validate_task(new_task(draft))
+    secret_preflight = notification.preflight_secrets(root, config.notifications, required_secrets)
+
     # 契约附件：复制进交接仓，记录相对路径与摘要
     if contract_src is not None:
         src = contract_src
@@ -400,6 +415,7 @@ def cmd_create(args, config: Config) -> dict:
         "status": created["status"],
         "store_commit": created.get("_commit"),
         "notification": notify_result,
+        "secret_preflight": secret_preflight,
         "frontend_session": session_result,
         "next": f"handoffctl show {created['id']}",
     }
@@ -564,7 +580,7 @@ def cmd_amend(args, config: Config) -> dict:
         raise SchemaError(f"修订文件不存在: {amendment_path}")
     with open(amendment_path, "r", encoding="utf-8") as fh:
         amendment = json.load(fh)
-    allowed = {"acceptance", "requirement_replacements"}
+    allowed = {"acceptance", "requirement_replacements", "required_secrets"}
     extras = sorted(set(amendment) - allowed)
     if extras:
         raise SchemaError("修订文件包含未允许字段", errors=extras)
@@ -580,8 +596,14 @@ def cmd_amend(args, config: Config) -> dict:
 
     current = store.get(args.task_id)
     expected = args.expected_revision if args.expected_revision is not None else current["revision"]
+    if current["revision"] != expected:
+        raise ConflictError(
+            f"{args.task_id}: revision 冲突（本地期望 {expected}，仓库实际 {current['revision']}）",
+            expected=expected,
+            actual=current["revision"],
+        )
 
-    def mutate(task: dict) -> None:
+    def apply_content(task: dict) -> None:
         failure = task.get("failure") or {}
         if task.get("status") != "failed" or failure.get("stage") != "verification":
             raise SchemaError("只有 verification 失败的任务允许修订验收契约")
@@ -597,35 +619,90 @@ def cmd_amend(args, config: Config) -> dict:
                 raise SchemaError(f"requirement_replacements[{idx}].old 必须在 requirement 中恰好出现一次")
             requirement = requirement.replace(old, new, 1)
         task["requirement"] = requirement
+        previous_requirements = task.pop("required_secrets", []) or []
         task["acceptance"] = amendment["acceptance"]
-        # 修订文件同样可能是草稿占位（contracts/<id>/...），落库前换真实路径
+        # 修订文件同样可能是草稿占位（contracts/<id>/...），落库前换真实路径。
         resolve_id_placeholders(task["id"], task)
-        # 清理早期 worker 写入、但当前 schema 已由标准字段替代的别名。
-        task["result"].pop("executor", None)
-        task["result"].pop("executor_session_id", None)
-        if contract_src is not None:
-            dest = store.contract_dir(task["id"]) / contract_src.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(contract_src, dest)
-            task["contract"] = {
-                "kind": (task.get("contract") or {}).get("kind", "text"),
-                "path": str(dest.relative_to(config.root)).replace(os.sep, "/"),
-                "sha256": schema.sha256_file(dest),
-            }
+        placeholder_names, _registered = _secret_files.requirement_usage(task, config)
+        if "required_secrets" in amendment:
+            explicit_requirements = amendment.get("required_secrets") or []
+        else:
+            # 仅保留新 acceptance 仍使用的显式 placeholder 绑定；registered requirements
+            # 必须按当前 checks.yaml 从零物化，不能把旧 suite 的需求带进新修订。
+            explicit_requirements = [
+                item for item in previous_requirements
+                if isinstance(item, dict) and item.get("env") in placeholder_names
+            ]
+        if explicit_requirements:
+            task["required_secrets"] = explicit_requirements
+        required_secrets = _secret_files.collect_requirements(task, config)
+        if required_secrets:
+            task["required_secrets"] = required_secrets
+        else:
+            task.pop("required_secrets", None)
 
-    updated = store.update(
-        args.task_id,
-        expected_revision=expected,
-        mutate=mutate,
-        event_type="task.acceptance_amended",
-        summary=f"修订验收契约：{args.reason}",
-        actor=Actor("user", args.actor or "cli"),
-        metadata={"reason": args.reason},
-    )
+    # 先构造完整候选。新契约暂存到最终路径并保留旧内容；任何校验、预检或
+    # store 更新失败都会原样回滚，避免失败修订遗留/覆盖契约文件。
+    candidate = copy.deepcopy(current)
+    apply_content(candidate)
+    contract_dest: Path | None = None
+    contract_backup: bytes | None = None
+    contract_existed = False
+    if contract_src is not None:
+        contract_dest = store.contract_dir(candidate["id"]) / contract_src.name
+        contract_existed = contract_dest.is_file()
+        if contract_existed:
+            contract_backup = contract_dest.read_bytes()
+        contract_dest.parent.mkdir(parents=True, exist_ok=True)
+        if contract_src.resolve() != contract_dest.resolve():
+            staging = contract_dest.with_name(f".{contract_dest.name}.{ids.ulid()}.tmp")
+            try:
+                shutil.copyfile(contract_src, staging)
+                os.replace(staging, contract_dest)
+            finally:
+                if staging.exists():
+                    staging.unlink()
+        candidate["contract"] = {
+            "kind": (candidate.get("contract") or {}).get("kind", "text"),
+            "path": str(contract_dest.relative_to(config.root)).replace(os.sep, "/"),
+            "sha256": schema.sha256_file(contract_dest),
+        }
+
+    try:
+        schema.validate_task_full(candidate, config, config.root)
+        secret_preflight = notification.preflight_secrets(
+            config.root, config.notifications, candidate.get("required_secrets") or []
+        )
+
+        def mutate(task: dict) -> None:
+            apply_content(task)
+            # 清理早期 worker 写入、但当前 schema 已由标准字段替代的别名。
+            task["result"].pop("executor", None)
+            task["result"].pop("executor_session_id", None)
+            if contract_dest is not None:
+                task["contract"] = copy.deepcopy(candidate["contract"])
+
+        updated = store.update(
+            args.task_id,
+            expected_revision=expected,
+            mutate=mutate,
+            event_type="task.acceptance_amended",
+            summary=f"修订验收契约：{args.reason}",
+            actor=Actor("user", args.actor or "cli"),
+            metadata={"reason": args.reason},
+        )
+    except Exception:
+        if contract_dest is not None:
+            if contract_existed and contract_backup is not None:
+                contract_dest.write_bytes(contract_backup)
+            elif contract_dest.exists():
+                contract_dest.unlink()
+        raise
     return {
         **_task_brief(updated),
         "contract": updated.get("contract"),
         "checks": [check["id"] for check in updated["acceptance"]["checks"]],
+        "secret_preflight": secret_preflight,
     }
 
 
@@ -633,13 +710,40 @@ def cmd_reverify(args, config: Config) -> dict:
     store = TaskStore(config.root, config, push=not args.no_push)
     task = store.get(args.task_id)
     expected = args.expected_revision if args.expected_revision is not None else task["revision"]
+    if task["revision"] != expected:
+        raise ConflictError(
+            f"{args.task_id}: revision 冲突（本地期望 {expected}，仓库实际 {task['revision']}）",
+            expected=expected,
+            actual=task["revision"],
+        )
+    # 所有本地 state/schema 检查先于远端密钥查询，避免非法操作形成 presence oracle。
+    state.assert_reverify_transition(task, args.task_id)
+    if not task.get("deployment", {}).get("target_sha") or not task["deployment"].get("observed_sha"):
+        raise SchemaError(f"{args.task_id}: 缺少 target_sha/observed_sha，不能重新验收")
+    candidate = copy.deepcopy(task)
+    previous_requirements = candidate.pop("required_secrets", []) or []
+    placeholder_names, _registered = _secret_files.requirement_usage(candidate, config)
+    retained_bindings = [
+        item for item in previous_requirements
+        if isinstance(item, dict) and item.get("env") in placeholder_names
+    ]
+    if retained_bindings:
+        candidate["required_secrets"] = retained_bindings
+    requirements = _secret_files.collect_requirements(candidate, config)
+    if requirements:
+        candidate["required_secrets"] = requirements
+    else:
+        candidate.pop("required_secrets", None)
+    schema.validate_task_full(candidate, config, config.root)
+    secret_preflight = notification.preflight_secrets(config.root, config.notifications, requirements)
     updated = store.request_reverify(
         args.task_id,
         expected_revision=expected,
         reason=args.reason,
         actor=Actor("user", args.actor or "cli"),
+        required_secrets=requirements,
     )
-    return _task_brief(updated)
+    return {**_task_brief(updated), "secret_preflight": secret_preflight}
 
 
 def cmd_accept(args, config: Config) -> dict:
@@ -1174,12 +1278,15 @@ def cmd_panel(args, config: Config) -> dict:
     from .panel.server import PanelServer
     from .panel.service import PanelService
 
-    service = PanelService(config.root, config)
+    role = args.role
+    if role == "frontend" and args.mode:
+        raise ConfigError("前端面板不支持 --mode；执行模式只属于后端面板")
+    service = PanelService(config.root, config, role=role)
     if args.mode:
         service.set_mode({"mode": args.mode})
     host = args.host or config.panel.host
     port = args.port if args.port is not None else config.panel.port
-    server = PanelServer(service, host=host, port=port)
+    server = PanelServer(service, host=host, port=port, role=role)
     actual_host, actual_port = server.start()
     url = f"http://{actual_host}:{actual_port}/"
     if args.mode == "auto":
@@ -1580,11 +1687,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int)
     p.set_defaults(func=cmd_admin)
 
-    p = _sub("panel", help="启动桌面面板（任务分发：zcode / codex + 全自动/手动）")
+    p = _sub("panel", help="启动桌面面板（可选前端发单/验收或后端执行面板）")
     p.add_argument("--host", help="默认 127.0.0.1；只允许回环地址")
     p.add_argument("--port", type=int, help="默认 8790（8789 留给 frontend-listener）")
     p.add_argument("--no-open", action="store_true", help="不自动开窗口，自己用浏览器打开")
-    p.add_argument("--mode", choices=["manual", "auto"], help="启动时设置面板模式（默认沿用持久化状态）")
+    p.add_argument("--role", choices=["frontend", "backend"], default="backend", help="面板职责；DSH 插件固定使用 frontend")
+    p.add_argument("--mode", choices=["manual", "auto"], help="后端面板启动模式（默认沿用持久化状态）")
     p.set_defaults(func=cmd_panel)
 
     return parser

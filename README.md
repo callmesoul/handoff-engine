@@ -67,6 +67,8 @@ git init -b main
 - `config/codex.yaml`：Codex 执行器配置
 - `config/local.yaml`：机器专属路径和密钥文件位置；不提交 Git
 
+需要 HTTP/OpenAPI 或 registered suite 使用凭据时，按 [双端验收密钥分发](doc/SECRET-DISTRIBUTION.md) 配置 public reference；创建任务前会同步确认前后端均存在，并可校验同值。
+
 ```bash
 export HANDOFF_ROOT=~/code/handoff-store
 handoffctl --root "$HANDOFF_ROOT" doctor --role frontend
@@ -117,8 +119,8 @@ bash scripts/make-sandbox.sh --reset
 ## 扩展
 
 - `dsh-plugin/`：把完成事件排回原 DSH 会话
-- `dsh-handoff-panel/`：在 DSH 中嵌入本地任务面板
-- `dsh-handoff-studio/`：用 DSH Agent 执行交接任务
+- `dsh-handoff-panel/`：前端部署专用的发单、跟踪与验收面板（后端不安装）
+- `dsh-handoff-studio/`：后端执行机专用面板，用 DSH Agent 执行交接任务（前端部署不安装）
 - `.agents/skills/`：`handoff` / `deliver` skill 模板
 - `deploy/`：systemd、Windows 计划任务与 CI 示例
 

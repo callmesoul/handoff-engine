@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from handoff import notification
-from handoff.config import NotificationConfig
-from handoff.errors import ConfigError, SchemaError
+from handoff.config import NotificationConfig, SecretsConfig
+from handoff.errors import ConfigError, ExecutionError, SchemaError
 
 
 SECRET = "test-secret-that-is-at-least-32-bytes-long"
@@ -27,6 +30,22 @@ def config(tmp_path, **overrides):
         retry_max_seconds=0.1,
     )
     return replace(base, **overrides)
+
+
+def _bind_secret_refs(cfg, root, refs, bindings=None):
+    object.__setattr__(
+        cfg,
+        "_app_config",
+        SimpleNamespace(
+            root=root,
+            secrets=SecretsConfig(
+                refs={k: str(v) for k, v in refs.items()},
+                bindings=dict(bindings or {}),
+            ),
+            checks=SimpleNamespace(repo_scripts={}, test_suites={}),
+        ),
+    )
+    return cfg
 
 
 def payload():
@@ -61,6 +80,112 @@ def test_signed_notification_round_trip_and_duplicate(tmp_path, monkeypatch):
         assert server.inbox.count() == 1
     finally:
         server.stop()
+
+
+def test_secret_preflight_checks_both_sides_and_same_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_TEST_NOTIFY_SECRET", SECRET)
+    monkeypatch.delenv("SAAS_TEST_SESSION_COOKIE", raising=False)
+    frontend_root = tmp_path / "frontend"
+    backend_root = tmp_path / "backend"
+    frontend_root.mkdir()
+    backend_root.mkdir()
+    frontend_secret = frontend_root / "session.cookie"
+    backend_secret = backend_root / "session.cookie"
+    frontend_secret.write_text("shared-cookie\n", encoding="utf-8")
+    backend_secret.write_text("shared-cookie\n", encoding="utf-8")
+
+    wake = threading.Event()
+    receiver = _bind_secret_refs(
+        config(backend_root), backend_root, {"saas-session": backend_secret},
+        {"SAAS_TEST_SESSION_COOKIE": "saas-session"},
+    )
+    server = notification.WakeServer(backend_root, receiver, wake)
+    host, port = server.start()
+    try:
+        sender = replace(
+            config(frontend_root),
+            url=f"http://{host}:{port}{notification.WAKE_PATH}",
+        )
+        _bind_secret_refs(sender, frontend_root, {"saas-session": frontend_secret}, {"SAAS_TEST_SESSION_COOKIE": "saas-session"})
+        requirement = [{
+            "ref": "saas-session", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True
+        }]
+        result = notification.preflight_secrets(frontend_root, sender, requirement)
+
+        assert result["status"] == "passed"
+        assert result["checked"] == requirement
+        assert isinstance(result["request_id"], str)
+        assert not wake.is_set()
+        assert server.inbox.count() == 0
+    finally:
+        server.stop()
+
+
+def test_secret_preflight_rejects_secret_missing_on_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_TEST_NOTIFY_SECRET", SECRET)
+    monkeypatch.delenv("SAAS_TEST_SESSION_COOKIE", raising=False)
+    frontend_root = tmp_path / "frontend"
+    backend_root = tmp_path / "backend"
+    frontend_root.mkdir()
+    backend_root.mkdir()
+    frontend_secret = frontend_root / "session.cookie"
+    frontend_secret.write_text("frontend-only", encoding="utf-8")
+
+    receiver = _bind_secret_refs(
+        config(backend_root), backend_root, {},
+        {"SAAS_TEST_SESSION_COOKIE": "ref"},
+    )
+    server = notification.WakeServer(backend_root, receiver, threading.Event())
+    host, port = server.start()
+    try:
+        sender = replace(config(frontend_root), url=f"http://{host}:{port}{notification.WAKE_PATH}")
+        _bind_secret_refs(sender, frontend_root, {"ref": frontend_secret}, {"SAAS_TEST_SESSION_COOKIE": "ref"})
+        with pytest.raises(ExecutionError, match="后端缺少"):
+            notification.preflight_secrets(frontend_root, sender, [
+                {"ref": "ref", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True}
+            ])
+    finally:
+        server.stop()
+
+
+def test_secret_preflight_rejects_remote_mismatch_without_leaking_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_TEST_NOTIFY_SECRET", SECRET)
+    monkeypatch.delenv("SAAS_TEST_SESSION_COOKIE", raising=False)
+    frontend_root = tmp_path / "frontend"
+    backend_root = tmp_path / "backend"
+    frontend_root.mkdir()
+    backend_root.mkdir()
+    frontend_secret = frontend_root / "session.cookie"
+    backend_secret = backend_root / "session.cookie"
+    frontend_secret.write_text("frontend-canary", encoding="utf-8")
+    backend_secret.write_text("backend-canary", encoding="utf-8")
+
+    receiver = _bind_secret_refs(
+        config(backend_root), backend_root, {"ref": backend_secret},
+        {"SAAS_TEST_SESSION_COOKIE": "ref"},
+    )
+    server = notification.WakeServer(backend_root, receiver, threading.Event())
+    host, port = server.start()
+    try:
+        sender = replace(config(frontend_root), url=f"http://{host}:{port}{notification.WAKE_PATH}")
+        _bind_secret_refs(sender, frontend_root, {"ref": frontend_secret}, {"SAAS_TEST_SESSION_COOKIE": "ref"})
+        with pytest.raises(ExecutionError) as excinfo:
+            notification.preflight_secrets(frontend_root, sender, [
+                {"ref": "ref", "env": "SAAS_TEST_SESSION_COOKIE", "same_value": True}
+            ])
+        message = str(excinfo.value)
+        assert "值不一致" in message
+        assert "frontend-canary" not in message
+        assert "backend-canary" not in message
+    finally:
+        server.stop()
+
+
+def test_secret_preflight_without_requirements_never_connects(tmp_path):
+    cfg = config(tmp_path, url="http://127.0.0.1:1/v1/handoff/wake")
+    assert notification.preflight_secrets(tmp_path, cfg, []) == {
+        "status": "not_required", "checked": []
+    }
 
 
 def test_notification_ignores_env_proxy(tmp_path, monkeypatch):

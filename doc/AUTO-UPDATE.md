@@ -30,6 +30,7 @@
 | `pyproject.toml`、`requirements.txt` | 依赖 | 拉取 + 重装 + 重启 |
 | `config/*.yaml`（`local.yaml` 除外） | 共享配置 | 拉取 + 重启（配置启动时加载） |
 | `.agents/skills/**` | 技能 | 拉取，**不重启**（符号链接，Codex 下次会话读到） |
+| `dsh-handoff-panel/**` | 前端 DSH 插件 | 不由 Python 自更新器安装；仅前端部署按插件 README 独立升级 |
 | `doc/**`、`README.md`、`scripts/**`、`tests/**`、`LICENSE` | 文档/测试 | 忽略，不拉 |
 | `tasks/**`、`events/**`、`contracts/**`、`artifacts/**`、`.handoff-run/**` | 数据 | 忽略，永不触发 |
 

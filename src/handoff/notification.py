@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets as token_secrets
 import sqlite3
 import threading
 import time
@@ -20,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from . import ids
@@ -31,6 +32,7 @@ from .timeutil import iso
 
 WAKE_PATH = "/v1/handoff/wake"
 COMPLETE_PATH = "/v1/handoff/completed"
+SECRET_PREFLIGHT_PATH = "/v1/handoff/secret-preflight"
 MAX_BODY_BYTES = 16 * 1024
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _TASK_RE = re.compile(r"^ho-[0-9]{8}-[0-9A-HJKMNP-TV-Z]{26}$")
@@ -141,6 +143,57 @@ def _validate_payload(payload: dict) -> None:
         repo = payload.get("source_repo")
         if not isinstance(repo, str) or "/" not in repo or len(repo) > 255:
             raise SchemaError("task.completed source_repo 非法")
+
+
+def _validate_secret_preflight(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        raise SchemaError("密钥预检正文必须是 JSON 对象")
+    expected = {"schema_version", "request_id", "challenge", "occurred_at", "requirements"}
+    unknown = set(payload) - expected
+    if unknown:
+        raise SchemaError(f"密钥预检包含未知字段: {', '.join(sorted(unknown))}")
+    if payload.get("schema_version") != 1:
+        raise SchemaError("密钥预检 schema_version 必须为 1")
+    if not ids.is_ulid(payload.get("request_id")):
+        raise SchemaError("密钥预检 request_id 不是合法 ULID")
+    challenge = payload.get("challenge")
+    if not isinstance(challenge, str) or not re.fullmatch(r"[0-9a-f]{64}", challenge):
+        raise SchemaError("密钥预检 challenge 必须是 32 字节随机十六进制串")
+    if not isinstance(payload.get("occurred_at"), str) or not payload["occurred_at"]:
+        raise SchemaError("密钥预检 occurred_at 缺失")
+    requirements = payload.get("requirements")
+    if not isinstance(requirements, list) or not 1 <= len(requirements) <= 50:
+        raise SchemaError("密钥预检 requirements 必须包含 1..50 项")
+    seen: set[tuple[str, str]] = set()
+    env_refs: dict[str, str] = {}
+    for index, item in enumerate(requirements):
+        try:
+            normalized = secret_files.normalize_requirement(item, where=f"requirements[{index}]")
+        except SchemaError:
+            raise
+        key = (normalized["ref"], normalized["env"])
+        if key in seen:
+            raise SchemaError(f"密钥预检 requirements[{index}] 重复")
+        previous_ref = env_refs.get(normalized["env"])
+        if previous_ref is not None and previous_ref != normalized["ref"]:
+            raise SchemaError(
+                f"密钥预检环境变量 {normalized['env']} 同时绑定不同 reference"
+            )
+        seen.add(key)
+        env_refs[normalized["env"]] = normalized["ref"]
+
+
+def _preflight_url(config: NotificationConfig) -> str:
+    explicit = config.preflight_url
+    if explicit:
+        _validate_event_url(explicit, SECRET_PREFLIGHT_PATH, "密钥预检 URL")
+        return explicit
+    if not config.url:
+        raise ConfigError("任务需要验收密钥，但未配置 notifications.preflight_url 或 notifications.url")
+    parts = urlsplit(config.url)
+    derived = urlunsplit((parts.scheme, parts.netloc, SECRET_PREFLIGHT_PATH, "", ""))
+    _validate_event_url(derived, SECRET_PREFLIGHT_PATH, "密钥预检 URL")
+    return derived
 
 
 def _validate_event_url(url: str, expected_path: str, field: str = "url") -> None:
@@ -337,6 +390,139 @@ class Notifier:
             raise ExecutionError(f"通知发送失败: {exc}") from exc
 
 
+def preflight_secrets(
+    root: str | Path,
+    config: NotificationConfig,
+    requirements: list[dict],
+) -> dict:
+    """同步确认前后端都可解析密钥，并按需验证值相同；失败时不允许 create。"""
+    if not requirements:
+        return {"status": "not_required", "checked": []}
+    app_config = getattr(config, "_app_config", None)
+    if app_config is None:
+        raise ConfigError("密钥预检缺少应用配置")
+
+    normalized = [
+        secret_files.normalize_requirement_for_config(
+            item, app_config, where=f"required_secrets[{index}]"
+        )
+        for index, item in enumerate(requirements)
+    ]
+    for index, item in enumerate(normalized):
+        if not secret_files.preflight_allowed(app_config, item["ref"], item["env"]):
+            raise SchemaError(
+                f"required_secrets[{index}]: {item['env']} → {item['ref']} 未在本机授权"
+            )
+    local_values = secret_files.secret_env(app_config, normalized)
+    request_id = ids.ulid()
+    challenge = token_secrets.token_hex(32)
+    payload = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "challenge": challenge,
+        "occurred_at": iso(),
+        "requirements": normalized,
+    }
+    body = _json_bytes(payload)
+    timestamp = str(int(time.time()))
+    control_secret = load_secret(config)
+    url = _preflight_url(config)
+    request = Request(url, data=body, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("X-Handoff-Request-ID", request_id)
+    request.add_header("X-Handoff-Timestamp", timestamp)
+    request.add_header("X-Handoff-Signature", _signature(control_secret, timestamp, body))
+    opener = build_opener(ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(request, timeout=config.request_timeout_seconds) as response:
+            raw = response.read(MAX_BODY_BYTES + 1)
+            status = response.status
+            response_headers = response.headers
+    except HTTPError as exc:
+        raw_error = exc.read(500).decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+        raise ExecutionError(f"后端密钥预检返回 HTTP {exc.code}: {raw_error}") from exc
+    except (URLError, OSError, TimeoutError) as exc:
+        raise ExecutionError(f"无法连接后端密钥预检端点: {exc}") from exc
+    if status != 200:
+        raise ExecutionError(f"后端密钥预检返回 HTTP {status}")
+    if len(raw) > MAX_BODY_BYTES:
+        raise ExecutionError("后端密钥预检响应过大")
+
+    response_timestamp = response_headers.get("X-Handoff-Timestamp", "")
+    response_signature = response_headers.get("X-Handoff-Signature", "")
+    response_request_id = response_headers.get("X-Handoff-Request-ID", "")
+    try:
+        sent_at = int(response_timestamp)
+    except ValueError as exc:
+        raise ExecutionError("后端密钥预检响应时间戳非法") from exc
+    if abs(int(time.time()) - sent_at) > config.max_skew_seconds:
+        raise ExecutionError("后端密钥预检响应已过期")
+    expected_signature = _signature(control_secret, response_timestamp, raw)
+    if not hmac.compare_digest(response_signature, expected_signature):
+        raise ExecutionError("后端密钥预检响应签名无效")
+    if response_request_id != request_id:
+        raise ExecutionError("后端密钥预检响应 request_id 不匹配")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ExecutionError("后端密钥预检响应不是合法 JSON") from exc
+    if not isinstance(result, dict) or result.get("schema_version") != 1 or result.get("request_id") != request_id:
+        raise ExecutionError("后端密钥预检响应协议不匹配")
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        raise ExecutionError("后端密钥预检响应缺少 results")
+    by_key: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"ref", "env", "present", "proof"}:
+            raise ExecutionError("后端密钥预检响应 result 结构非法")
+        key = (row.get("ref"), row.get("env"))
+        if key in by_key or type(row.get("present")) is not bool:
+            raise ExecutionError("后端密钥预检响应包含重复或非法 result")
+        proof_value = row.get("proof")
+        if proof_value is not None and not isinstance(proof_value, str):
+            raise ExecutionError("后端密钥预检响应 proof 非法")
+        by_key[key] = row
+
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for requirement in normalized:
+        key = (requirement["ref"], requirement["env"])
+        row = by_key.get(key)
+        label = f"{requirement['ref']} → {requirement['env']}"
+        if row is None or not row["present"]:
+            missing.append(label)
+            continue
+        if requirement["same_value"]:
+            expected_proof = secret_files.proof(
+                local_values[requirement["env"]],
+                control_secret=control_secret,
+                request_id=request_id,
+                challenge=challenge,
+                ref=requirement["ref"],
+                env=requirement["env"],
+            )
+            if not row["proof"] or not hmac.compare_digest(row["proof"], expected_proof):
+                mismatched.append(label)
+    unexpected = set(by_key) - {(item["ref"], item["env"]) for item in normalized}
+    if unexpected:
+        raise ExecutionError("后端密钥预检响应包含未请求的 reference")
+    problems: list[str] = []
+    if missing:
+        problems.append("后端缺少: " + ", ".join(missing))
+    if mismatched:
+        problems.append("前后端值不一致: " + ", ".join(mismatched))
+    if problems:
+        raise ExecutionError("密钥预检失败；" + "；".join(problems))
+    return {
+        "status": "passed",
+        "request_id": request_id,
+        "checked": [
+            {"ref": item["ref"], "env": item["env"], "same_value": item["same_value"]}
+            for item in normalized
+        ],
+    }
+
+
 class Inbox:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -424,6 +610,9 @@ class WakeServer:
         self.inbox = Inbox(self.config.inbox_path(self.root))
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._preflight_lock = threading.Lock()
+        # request_id -> (expires_monotonic, request_body_sha256, response)
+        self._preflight_receipts: dict[str, tuple[float, str, dict]] = {}
 
     def start(self, host: str | None = None, port: int | None = None) -> tuple[str, int]:
         host = host if host is not None else self.config.listen_host
@@ -443,7 +632,7 @@ class WakeServer:
                 self._reply(200, {"ok": True})
 
             def do_POST(self):  # noqa: N802
-                if self.path not in (WAKE_PATH, COMPLETE_PATH):
+                if self.path not in (WAKE_PATH, COMPLETE_PATH, SECRET_PREFLIGHT_PATH):
                     self._reply(404, {"ok": False, "error": "not_found"})
                     return
                 try:
@@ -451,6 +640,16 @@ class WakeServer:
                     if length < 0 or length > MAX_BODY_BYTES:
                         raise SchemaError("通知正文长度非法")
                     body = self.rfile.read(length)
+                    if self.path == SECRET_PREFLIGHT_PATH:
+                        result = owner._accept_secret_preflight(
+                            body,
+                            request_id=self.headers.get("X-Handoff-Request-ID", ""),
+                            timestamp=self.headers.get("X-Handoff-Timestamp", ""),
+                            signature=self.headers.get("X-Handoff-Signature", ""),
+                            client_ip=self.client_address[0],
+                        )
+                        self._reply(200, result, signed=True, request_id=result["request_id"])
+                        return
                     payload, fresh = owner._accept(
                         body,
                         path=self.path,
@@ -469,11 +668,16 @@ class WakeServer:
                 except (ValueError, UnicodeError, json.JSONDecodeError):
                     self._reply(400, {"ok": False, "error": "通知正文不是合法 JSON"})
 
-            def _reply(self, status: int, payload: dict) -> None:
+            def _reply(self, status: int, payload: dict, *, signed: bool = False, request_id: str = "") -> None:
                 raw = _json_bytes(payload)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
+                if signed:
+                    response_timestamp = str(int(time.time()))
+                    self.send_header("X-Handoff-Request-ID", request_id)
+                    self.send_header("X-Handoff-Timestamp", response_timestamp)
+                    self.send_header("X-Handoff-Signature", _signature(owner._secret, response_timestamp, raw))
                 self.end_headers()
                 self.wfile.write(raw)
 
@@ -493,6 +697,90 @@ class WakeServer:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+    def _accept_secret_preflight(
+        self,
+        body: bytes,
+        *,
+        request_id: str,
+        timestamp: str,
+        signature: str,
+        client_ip: str,
+    ) -> dict:
+        self._check_source(client_ip)
+        try:
+            sent_at = int(timestamp)
+        except ValueError as exc:
+            raise ExecutionError("通知时间戳非法") from exc
+        if abs(int(time.time()) - sent_at) > self.config.max_skew_seconds:
+            raise ExecutionError("通知已过期")
+        if not hmac.compare_digest(signature, _signature(self._secret, timestamp, body)):
+            raise ExecutionError("通知签名无效")
+        payload = json.loads(body.decode("utf-8"))
+        _validate_secret_preflight(payload)
+        if request_id != payload["request_id"]:
+            raise ExecutionError("request_id 与正文不一致")
+        body_digest = hashlib.sha256(body).hexdigest()
+        now = time.monotonic()
+        with self._preflight_lock:
+            self._preflight_receipts = {
+                key: receipt
+                for key, receipt in self._preflight_receipts.items()
+                if receipt[0] > now
+            }
+            existing = self._preflight_receipts.get(request_id)
+            if existing is not None:
+                if existing[1] != body_digest:
+                    raise ExecutionError("相同 request_id 的密钥预检正文不一致")
+                return dict(existing[2])
+            if len(self._preflight_receipts) >= 4096:
+                oldest = min(self._preflight_receipts, key=lambda key: self._preflight_receipts[key][0])
+                self._preflight_receipts.pop(oldest, None)
+
+            app_config = getattr(self.config, "_app_config", None)
+            if app_config is None:
+                raise ExecutionError("后端密钥预检缺少应用配置")
+            rows: list[dict] = []
+            for index, raw_requirement in enumerate(payload["requirements"]):
+                requirement = secret_files.normalize_requirement_for_config(
+                    raw_requirement, app_config, where=f"requirements[{index}]"
+                )
+                if not secret_files.preflight_allowed(
+                    app_config, requirement["ref"], requirement["env"]
+                ):
+                    raise SchemaError(
+                        f"requirements[{index}]: {requirement['env']} → "
+                        f"{requirement['ref']} 未在后端本机授权"
+                    )
+                value = secret_files.resolve_secret(
+                    app_config,
+                    requirement["env"],
+                    ref=requirement["ref"],
+                )
+                proof_value = None
+                if value and requirement.get("same_value", True):
+                    proof_value = secret_files.proof(
+                        value,
+                        control_secret=self._secret,
+                        request_id=payload["request_id"],
+                        challenge=payload["challenge"],
+                        ref=requirement["ref"],
+                        env=requirement["env"],
+                    )
+                rows.append({
+                    "ref": requirement["ref"],
+                    "env": requirement["env"],
+                    "present": bool(value),
+                    "proof": proof_value,
+                })
+            response = {
+                "schema_version": 1,
+                "request_id": payload["request_id"],
+                "results": rows,
+            }
+            ttl = max(1, self.config.max_skew_seconds * 2)
+            self._preflight_receipts[request_id] = (now + ttl, body_digest, response)
+            return dict(response)
 
     def _accept(
         self,

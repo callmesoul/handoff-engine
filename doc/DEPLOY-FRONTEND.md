@@ -23,6 +23,18 @@ cp "$HANDOFF_ROOT/config/local.yaml.example" "$HANDOFF_ROOT/config/local.yaml"
 
 前端机器通常只需要源业务仓权限和私有交接仓权限；不需要后端业务仓写权限。
 
+## DSH 插件边界
+
+前端部署安装 `dsh-plugin/`（完成事件回推）和 `dsh-handoff-panel/`（前端发单/跟踪/验收面板）。`dsh-handoff-studio/` 是后端执行机专用面板，前端机器**不要安装**；历史上误装的应从当前 DSH profile 移除。
+
+`dsh-handoff-panel` **只在前端部署安装**。其默认启动命令为：
+
+```bash
+handoffctl --root "$HANDOFF_ROOT" panel --role frontend --no-open
+```
+
+前端角色使用独立页面和受限 API，不提供执行器、自动模式、认领/重试/释放租约、推进、通知重放或执行日志。Windows DSH + WSL 源码的 staging 与 profile 安装命令见 [`../dsh-handoff-panel/README.md`](../dsh-handoff-panel/README.md)。后端部署不得安装此插件。
+
 ## 自检
 
 ```bash

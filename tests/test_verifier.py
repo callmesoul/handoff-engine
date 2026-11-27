@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -73,7 +74,7 @@ def http_base():
     httpd.shutdown()
 
 
-def build(tmp_path, checks_doc=None, acceptance_checks=None, contract=None):
+def build(tmp_path, checks_doc=None, acceptance_checks=None, contract=None, local_doc=None):
     work, _bare = make_store_repo(tmp_path)
     backend = make_bare_remote(tmp_path, "api", {"src/orders/Order.java": "class Order {}\n"})
     api_dir = tmp_path / "api-work"
@@ -93,6 +94,8 @@ def build(tmp_path, checks_doc=None, acceptance_checks=None, contract=None):
         repos=[repo_entry("org/api", "backend", backend), repo_entry("org/web", "frontend", backend)],
         checks=checks_doc or default_checks,
     )
+    if local_doc is not None:
+        (work / "config" / "local.yaml").write_text(yaml.safe_dump(local_doc), encoding="utf-8")
     config = Config.load(work)
     store = TaskStore(work, config)
     task = make_task(
@@ -344,6 +347,97 @@ def test_repo_script_runs_without_shell(tmp_path, http_base):
     results = verifier.run(task, base_url=http_base)
     assert results[0].status == "passed"
     assert "contract ok" in results[0].output
+
+
+def test_suite_gets_only_declared_secret_and_redacts_output(tmp_path, http_base, monkeypatch):
+    secret_path = tmp_path / "suite-secret.txt"
+    secret_path.write_text("suite-canary-secret\n", encoding="utf-8")
+    monkeypatch.setenv("UNDECLARED_PARENT_CANARY", "must-not-reach-suite")
+    checks_doc = {
+        "test_suites": {
+            "isolated": {
+                "repo": "org/api",
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os; "
+                        "print(os.environ['SUITE_TOKEN']); "
+                        "print(os.environ.get('UNDECLARED_PARENT_CANARY', 'parent-absent'))"
+                    ),
+                ],
+                "required_secrets": [{
+                    "ref": "suite-token", "env": "SUITE_TOKEN", "same_value": True
+                }],
+            }
+        },
+        "repo_scripts": {},
+        "gate": {"high_risk_paths": [".github/**"]},
+        "verifier": {"output_limit_chars": 2000, "repo_paths": {"org/api": str(tmp_path / "api-work")}},
+    }
+    acceptance = [{
+        "id": "isolated", "type": "test_suite", "repo": "org/api", "name": "isolated"
+    }]
+    work, config, _store, task = build(
+        tmp_path,
+        checks_doc=checks_doc,
+        acceptance_checks=acceptance,
+        local_doc={"secrets": {"refs": {"suite-token": str(secret_path)}}},
+    )
+    results = Verifier(work, config, client=HttpClient(timeout=2, allow_private=True)).run(
+        task, base_url=http_base
+    )
+    assert results[0].status == "passed", results[0].output
+    assert "suite-canary-secret" not in results[0].output
+    assert "[REDACTED_SECRET]" in results[0].output
+    assert "parent-absent" in results[0].output
+    assert "must-not-reach-suite" not in results[0].output
+
+
+def test_secret_redaction_happens_before_truncation_and_escaping(tmp_path):
+    secret = "sk-boundary-0123456789"
+    encoded = "%73%6b%2D%62%6F%75%6E%64%61%72%79%2D%30%31%32%33%34%35%36%37%38%39"
+    secret_path = tmp_path / "suite-secret.txt"
+    secret_path.write_text(secret, encoding="utf-8")
+    # Emit the secret first (inside the kept head), then again after > limit chars
+    # (inside the kept tail), plus percent/JSON escaped forms.
+    script = (
+        "import os,json; "
+        "v=os.environ['SUITE_TOKEN']; "
+        f"print('head-'+v); "
+        f"print('x'*3000); "
+        f"print('tail-'+v); "
+        f"print('pct-'+__import__('urllib.parse',fromlist=['quote']).quote(v,safe='')); "
+        f"print('json-'+json.dumps(v)[1:-1])"
+    )
+    checks_doc = {
+        "test_suites": {
+            "isolated": {
+                "repo": "org/api",
+                "argv": [sys.executable, "-c", script],
+                "required_secrets": [{
+                    "ref": "suite-token", "env": "SUITE_TOKEN", "same_value": True
+                }],
+            }
+        },
+        "repo_scripts": {},
+        "verifier": {"output_limit_chars": 2000, "repo_paths": {"org/api": str(tmp_path / "api-work")}},
+    }
+    acceptance = [{
+        "id": "isolated", "type": "test_suite", "repo": "org/api", "name": "isolated",
+    }]
+    work, config, _store, task = build(
+        tmp_path,
+        checks_doc=checks_doc,
+        acceptance_checks=acceptance,
+        local_doc={"secrets": {"refs": {"suite-token": str(secret_path)}}},
+    )
+    results = Verifier(work, config).run(task, base_url="http://127.0.0.1:1")
+    output = results[0].output
+    assert secret not in output
+    assert encoded not in output
+    assert "REDACTED_SECRET" in output
+    assert len(output) <= 2100
 
 
 def test_unregistered_script_is_rejected_before_creation(tmp_path):

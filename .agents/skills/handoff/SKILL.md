@@ -9,11 +9,12 @@ description: 创建、查询、删除前后端交接任务，或触发交付验�
 
 引擎和交接仓是两个独立仓库。开始执行前：
 
-1. 读取环境变量 `HANDOFF_ROOT`，它必须指向包含 `config/repositories.yaml` 的交接仓；未设置时只可使用确实存在的 `$HOME/code/handoff-store`，否则询问用户，不要把引擎目录当交接仓。
-2. 优先调用 PATH 中已安装的 `handoffctl`；若不存在，再从 `HANDOFF_ENGINE_ROOT` 指向的引擎虚拟环境调用。不要从交接仓寻找引擎代码。
-3. 下文 `$CTL` 表示 `handoffctl --root "$HANDOFF_ROOT"`；Windows PowerShell 等价为 `handoffctl.exe --root $env:HANDOFF_ROOT`。
+1. 先在**任务工作区所属的环境**解析 `HANDOFF_ROOT`。Windows DSH 打开 WSL 工作区（`\\wsl.localhost\<distro>\...`）时，不要用宿主 PowerShell 里缺失或陈旧的同名变量；调用 `wsl.exe -d <distro> -- bash -lc 'printenv HANDOFF_ROOT'` 读取该发行版的 login-shell 环境，后续 CLI 也在同一发行版内执行。
+2. `HANDOFF_ROOT` 必须指向包含 `config/repositories.yaml` 的交接仓；未设置时只可使用同一环境中确实存在的 `$HOME/code/handoff-store`，否则询问用户。禁止回退到历史仓名，也不要把引擎目录当交接仓。
+3. 优先调用同一环境 PATH 中已安装的 `handoffctl`；若不存在，再从该环境的 `HANDOFF_ENGINE_ROOT` 指向的引擎虚拟环境调用。不要从交接仓寻找引擎代码。
+4. 下文 `$CTL` 表示 `handoffctl --root "$HANDOFF_ROOT"`；原生 Windows PowerShell 工作区等价为 `handoffctl.exe --root $env:HANDOFF_ROOT`。
 
-安装、环境变量和 Windows 示例见引擎仓的 `doc/DEPLOY-AGENT.md`。
+安装、环境变量和 Windows/WSL 示例见引擎仓的 `doc/DEPLOY-AGENT.md`。
 
 ## 会话里的四个动作
 
@@ -35,6 +36,15 @@ description: 创建、查询、删除前后端交接任务，或触发交付验�
 - 哪个接口、什么方法、请求/响应长什么样
 - 已知的边界情况（空值、历史数据、权限）
 - 怎么算做完（能写成结构化检查吗）
+
+### 创建前的验收环境预检
+
+在写草稿和调用 `$CTL create` 之前，先从需求、契约及 `acceptance.checks` 用到的已登记脚本中盘点验收依赖的环境变量和凭据，例如 `SAAS_TEST_SESSION_COOKIE`：
+
+- 必须确认变量在发起端/前端验收环境与后端 verifier/验收环境中都已配置；需要共用同一凭据时，还要确认双方使用同一来源。检查时只报告“存在/缺失”，不得输出明文值。
+- 不能从当前环境推断远端后端已经配置。若任一侧缺失，或没有可靠方式确认后端侧，必须在创建任务前停下来，明确指出变量名和未确认的一侧，先向用户获取该凭据或请用户完成配置并确认双方均已生效。
+- 只有双方环境变量均已确认后才能调用 `$CTL create`。不得先创建任务再等后端索取凭据，也不得明知会因缺少变量而让验收失败。
+- 凭据值不得写入草稿、`requirement`、契约、附件或回报；用户提供后也只能通过双方约定的安全配置方式注入运行环境。
 
 ## 抽四样东西
 

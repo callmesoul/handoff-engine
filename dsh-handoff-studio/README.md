@@ -1,9 +1,11 @@
-# Handoff Studio
+# Handoff Studio（后端专用）
 
-在原 `handoffctl panel` 之外并行运行的一套面板：**执行器换成了 DSH 自己**——用一个
+> 仅安装在后端执行机。前端部署负责发单、通知和验收，不安装本插件。
+
+在原 `handoffctl panel` 之外并行运行的一套后端执行面板：**执行器换成了 DSH 自己**——用一个
 在面板里选定的模型跑任务实现，而不是拉起 `codex` / `zcode` 子进程。
 
-原面板一行没改。两套面板读同一个交接仓，可以同时开着。
+原面板一行没改。后端执行机上的两套面板读同一个交接仓，可以同时开着。
 
 ## 它做了什么
 
@@ -190,13 +192,15 @@ Invoke-RestMethod "http://127.0.0.1:<DSH端口>/handoff-studio/presets" -Headers
 本机实测：`standard` / `ptc` / `minimal` / `cordis` 都在，`standard` 具备完整
 shell 与文件写入能力。
 
-## 安装
+## 安装（仅后端执行机）
+
+先在后端执行机安装 Handoff Engine，并让 `HANDOFF_ROOT` 指向后端使用的私有交接仓；然后安装插件：
 
 ```powershell
 dsh plugin --profile desktop add C:\Users\you\code\handoff-engine\dsh-handoff-studio
 ```
 
-装完重启 DSH：`dsh.client` 清单在入口 boot 时才读。
+装完重启 DSH：`dsh.client` 清单在入口 boot 时才读。前端机器不要安装；如果历史上误装，应从前端 profile 中移除 `dsh-handoff-studio`。
 
 ## 开发
 

@@ -631,6 +631,7 @@ class TaskStore:
         expected_revision: int,
         reason: str,
         actor: Actor | None = None,
+        required_secrets: list[dict] | None = None,
     ) -> dict:
         """保留已合并产物，只清除验收结果并回到 deployed。"""
 
@@ -644,6 +645,10 @@ class TaskStore:
             task["failure"] = None
             task["claim"] = None
             task["result"]["checks"] = []
+            if required_secrets:
+                task["required_secrets"] = [dict(item) for item in required_secrets]
+            elif required_secrets is not None:
+                task.pop("required_secrets", None)
             task["deployment"]["status"] = "deployed"
             task["deployment"]["error"] = None
             task["deployment"]["updated_at"] = iso()

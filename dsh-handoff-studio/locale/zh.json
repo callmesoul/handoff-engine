@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Handoff 工作台",
-    "description": "用 DSH Agent 执行交接任务，模型在面板里选；任务面板直接开在会话旁边。",
+    "title": "Handoff 后端工作台",
+    "description": "后端执行机专用：用 DSH Agent 执行交接任务，模型在面板里选；前端部署不安装。",
     "detail": "docs/DETAIL.md"
   }
 }

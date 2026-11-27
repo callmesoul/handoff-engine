@@ -23,6 +23,11 @@ from .service import PanelService
 _WEB_DIR = Path(__file__).parent / "web"
 _TASK_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 _DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+_PANEL_ROLES = frozenset({"backend", "frontend"})
+# The frontend panel is a strict allow-list: any newly added backend operation
+# stays unreachable unless it is deliberately added here. The backend panel is
+# the full operator console (a superset), so it keeps every route.
+_FRONTEND_POST_ROUTES = frozenset({"/api/sync", "/api/tasks", "/api/deliver"})
 
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -38,10 +43,26 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class PanelServer:
-    def __init__(self, service: PanelService, *, host: str = "127.0.0.1", port: int = 8790):
+    def __init__(
+        self,
+        service: PanelService,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8790,
+        role: str | None = None,
+    ):
+        service_role = getattr(service, "role", "backend")
+        effective_role = service_role if role is None else role
+        if effective_role not in _PANEL_ROLES:
+            raise HandoffError(f"未知面板角色: {effective_role!r}")
+        if service_role != effective_role:
+            raise HandoffError(
+                f"面板服务角色不一致: service={service_role!r}, server={effective_role!r}"
+            )
         self.service = service
         self.host = host
         self.port = port
+        self.role = effective_role
         self._server: ThreadingHTTPServer | None = None
 
     def start(self) -> tuple[str, int]:
@@ -60,7 +81,12 @@ class PanelServer:
                         self._send_html(owner._index_html())
                         return
                     if path == "/api/state":
-                        self._send_json(owner.service.state())
+                        state = (
+                            owner.service.frontend_state()
+                            if owner.role == "frontend"
+                            else owner.service.state()
+                        )
+                        self._send_json({"role": owner.role, **state})
                         return
                     if path == "/api/tasks":
                         query = parse_qs(parts.query)
@@ -90,11 +116,17 @@ class PanelServer:
                         })
                         return
                     if path.startswith("/api/tasks/") and path.endswith("/sessions"):
+                        if owner.role == "frontend":
+                            self._send_json(_role_forbidden(path), status=HTTPStatus.FORBIDDEN)
+                            return
                         task_id = _task_id_from(path, suffix="/sessions")
                         executor = (parse_qs(parts.query).get("executor") or ["codex"])[-1]
                         self._send_json({"executor": executor, "sessions": owner.service.sessions(executor, task_id=task_id)})
                         return
                     if path.startswith("/api/sessions/"):
+                        if owner.role == "frontend":
+                            self._send_json(_role_forbidden(path), status=HTTPStatus.FORBIDDEN)
+                            return
                         executor = _task_id_from(path, prefix="/api/sessions/")
                         query = parse_qs(parts.query)
                         task_id = (query.get("task") or [None])[-1]
@@ -105,6 +137,9 @@ class PanelServer:
                         self._send_json(owner.service.get_task(task_id))
                         return
                     if path == "/api/logs":
+                        if owner.role == "frontend":
+                            self._send_json(_role_forbidden(path), status=HTTPStatus.FORBIDDEN)
+                            return
                         query = parse_qs(parts.query)
                         task_id = (query.get("task") or [""])[-1]
                         _validate_task_id(task_id)
@@ -123,6 +158,9 @@ class PanelServer:
                 path = parts.path
                 try:
                     self._require_loopback()
+                    if not _post_allowed(owner.role, path):
+                        self._send_json(_role_forbidden(path, owner.role), status=HTTPStatus.FORBIDDEN)
+                        return
                     payload = self._read_json_body()
                     if path == "/api/sync":
                         self._send_json({"ok": True, **owner.service.sync()})
@@ -200,6 +238,9 @@ class PanelServer:
                     raise HandoffError(f"拒绝非本机请求: {ip}")
 
             def _read_json_body(self) -> dict:
+                content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type != "application/json":
+                    raise HandoffError("面板 POST 只接受 application/json")
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length <= 0:
                     return {}
@@ -267,8 +308,25 @@ class PanelServer:
 
     # -- 辅助 ----------------------------------------------------------------
     def _index_html(self) -> str:
-        path = _WEB_DIR / "index.html"
-        return path.read_text(encoding="utf-8")
+        filename = "frontend.html" if self.role == "frontend" else "index.html"
+        return (_WEB_DIR / filename).read_text(encoding="utf-8")
+
+
+def _post_allowed(role: str, path: str) -> bool:
+    """Frontend uses a strict allow-list; backend keeps the full operator console."""
+    if role != "frontend":
+        return True
+    if path in _FRONTEND_POST_ROUTES:
+        return True
+    return path.startswith("/api/tasks/") and path.endswith("/accept")
+
+
+def _role_forbidden(path: str, role: str | None = None) -> dict:
+    return {
+        "ok": False,
+        "error": f"前端面板不提供后端操作: {path}",
+        "code": "panel_role_forbidden",
+    }
 
 
 def _positive_int(query: dict, key: str, *, default: int, cap: int | None = None) -> int:

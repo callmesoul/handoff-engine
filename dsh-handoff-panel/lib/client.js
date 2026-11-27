@@ -12,7 +12,7 @@ window.__ModuleLoader__.load({
     var useCallback = React.useCallback;
 
     var PANEL_ID = "handoff-panel";
-    var PANEL_LABEL = "任务面板";
+    var PANEL_LABEL = "前端任务面板";
     var DEFAULT_URL = "http://127.0.0.1:8790";
     var STATUS_URL = "/handoff-panel/status";
     var LAUNCH_URL = "/handoff-panel/launch";
@@ -99,9 +99,7 @@ window.__ModuleLoader__.load({
         h("span", { className: "hp-dot " + (reachable ? "on" : "off") }),
         h("strong", null, label),
         h("span", null, props.url),
-        reachable && status && status.mode
-          ? h("span", null, "· 模式 " + status.mode)
-          : null,
+        reachable ? h("span", null, "· 前端") : null,
         !reachable && status && status.error
           ? h("span", { className: "hp-err" }, "· " + status.error)
           : null,
@@ -112,7 +110,7 @@ window.__ModuleLoader__.load({
             type: "button",
             className: "hp-btn",
             disabled: props.busy,
-            onClick: props.onLaunch,
+            onClick: reachable ? props.onReload : props.onLaunch,
           },
           props.busy ? "启动中…" : reachable ? "重新载入" : "启动面板",
         ),
@@ -123,11 +121,11 @@ window.__ModuleLoader__.load({
       return h(
         "div",
         { className: "hp-empty" },
-        h("p", null, "未连上任务面板。面板需要先在本机启动："),
+        h("p", null, "未连上前端任务面板。面板需要先在本机启动："),
         h(
           "p",
           null,
-          h("span", { className: "hp-code" }, "handoffctl --root $HANDOFF_ROOT panel"),
+          h("span", { className: "hp-code" }, "handoffctl --root $HANDOFF_ROOT panel --role frontend"),
         ),
         h(
           "button",
@@ -155,6 +153,10 @@ window.__ModuleLoader__.load({
 
       useEffect(function () {
         injectCss();
+        return function () {
+          var style = document.querySelector('style[data-plugin-css="dsh-handoff-panel"]');
+          if (style) style.remove();
+        };
       }, []);
 
       var check = useCallback(function () {
@@ -180,17 +182,19 @@ window.__ModuleLoader__.load({
       }, []);
 
       useEffect(function () {
-        var alive = true;
         var tick = function () {
           check();
         };
         tick();
         var timer = setInterval(tick, 5000);
         return function () {
-          alive = false;
           clearInterval(timer);
         };
       }, [check]);
+
+      var reload = useCallback(function () {
+        setNonce(function (n) { return n + 1; });
+      }, []);
 
       var launch = useCallback(
         function () {
@@ -224,7 +228,7 @@ window.__ModuleLoader__.load({
       return h(
         "div",
         { className: "hp-root" },
-        h(StatusBar, { status: status, url: url, busy: busy, onLaunch: launch }),
+        h(StatusBar, { status: status, url: url, busy: busy, onLaunch: launch, onReload: reload }),
         reachable
           ? h(
               "div",

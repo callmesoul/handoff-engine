@@ -13,6 +13,7 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 
 from .errors import SchemaError
+from . import secrets as secret_files
 from .timeutil import parse
 
 SCHEMA_FILES = {
@@ -187,6 +188,18 @@ def semantic_errors(task: dict, config, root: Path | None = None) -> list[str]:
                 errs.append(
                     f"acceptance.checks[{idx}].repo: 登记表里该检查属于 {spec.repo!r}，任务单写的是 {check.get('repo')!r}"
                 )
+        if check.get("type") in ("http", "openapi_diff"):
+            placeholder_envs, _registered = secret_files.requirement_usage(
+                {"acceptance": {"checks": [check]}}, config
+            )
+            if placeholder_envs:
+                url_field = "url" if check.get("type") == "http" else "actual_url"
+                raw_url = check.get(url_field)
+                suffix = raw_url[len("{base_url}"):] if isinstance(raw_url, str) and raw_url.startswith("{base_url}") else None
+                if suffix is None or (suffix and suffix[0] not in "/?#"):
+                    errs.append(
+                        f"acceptance.checks[{idx}].{url_field}: 含密钥占位时必须使用 {{base_url}} 同源 URL"
+                    )
         if check.get("type") == "openapi_diff":
             rel = str(check.get("expected_path") or "")
             where = f"acceptance.checks[{idx}].expected_path"
@@ -196,6 +209,27 @@ def semantic_errors(task: dict, config, root: Path | None = None) -> list[str]:
                 errs.append(f"{where}: 必须是交接仓内相对路径")
             elif not (root / rel).is_file():
                 errs.append(f"{where}: 文件不存在 {rel}")
+
+    # 新版任务把公开 requirement 固化，防止任务单漏报、篡改或与 registered check 漂移。
+    # 旧任务没有该字段时保持 schema v1 向后兼容。
+    if "required_secrets" in task:
+        try:
+            discovered = secret_files.collect_requirements(task, config)
+            declared = task.get("required_secrets") or []
+            if discovered != declared:
+                errs.append(
+                    "required_secrets: 与 acceptance/checks 实际需要的密钥不一致；"
+                    f"应为 {discovered!r}"
+                )
+            placeholder_envs, registered_keys = secret_files.requirement_usage(task, config)
+            for index, raw in enumerate(declared):
+                item = secret_files.normalize_requirement(raw, where=f"required_secrets[{index}]")
+                if item["env"] not in placeholder_envs and (item["ref"], item["env"]) not in registered_keys:
+                    errs.append(
+                        f"required_secrets[{index}]: 未被 acceptance 占位或 registered check 使用"
+                    )
+        except SchemaError as exc:
+            errs.append(f"required_secrets: {exc.message}")
 
     status = task.get("status")
     claim = task.get("claim")

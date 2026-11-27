@@ -167,9 +167,20 @@ class ActiveRun:
 
 
 class PanelService:
-    def __init__(self, root: str | Path, config: Config, *, runner_overrides: dict | None = None, host=None):
+    def __init__(
+        self,
+        root: str | Path,
+        config: Config,
+        *,
+        runner_overrides: dict | None = None,
+        host=None,
+        role: str = "backend",
+    ):
+        if role not in ("backend", "frontend"):
+            raise ConfigError(f"未知面板角色: {role!r}")
         self.root = Path(root)
         self.config = config
+        self.role = role
         # PR 平台注入点：None 时 worker 按仓库配置现场构造（github/local）；测试传 FakeHost
         self._host = host
         self.state_path = self.root / ".handoff-run" / "panel-state.json"
@@ -203,12 +214,23 @@ class PanelService:
         # 上次面板进程被杀时执行线程一并没了，任务会卡在 in_progress；
         # 启动时先把自己留下的僵尸租约放回 open，否则人只能干瞪眼。
         self._reclaimed: list[dict] = []
-        self._reclaim_stale_leases()
         # 交付链自动推进：自动模式下周期清扫卡在 delivered/merged/deployed/verifying
         # 的任务——历史上这些全靠人点「恢复推进/验收」。_sweep_history 供 /api/state
         # 展示最近动作；_sweep_cooldown 保证同一任务不被连续接管轰炸。
         self._sweep_history: list[dict] = []
         self._sweep_cooldown: dict[str, object] = {}
+        if self.role == "backend":
+            self._reclaim_stale_leases()
+
+    def _require_backend(self, operation: str) -> None:
+        """纵深防御：前端角色的服务即使被直接调用，也拒绝一切后端执行操作。
+
+        HTTP 层已有按角色的 allow-list，但服务层是公共 API，任何调用方（测试、
+        未来的入口、误接的路由）都不应能借 frontend 服务触发后端执行器、
+        改运行模式或释放/重试任务租约。
+        """
+        if self.role != "backend":
+            raise HandoffError(f"前端面板不支持后端操作: {operation}")
 
     # -- 状态持久化 ----------------------------------------------------------
     def _default_state(self) -> dict:
@@ -300,6 +322,23 @@ class PanelService:
             "projects": self._projects(),
             "environments": list(self.config.environments.keys()),
             "executor_options": self._executor_options(),
+            "store_root": str(self.root),
+            "now": iso(),
+        }
+
+    def frontend_state(self) -> dict:
+        """Return only the state needed by the frontend workstation panel.
+
+        In particular this does not probe executors or expose worker controls.  The
+        frontend panel can create and inspect tasks, sync the store, run acceptance,
+        and mark verified work accepted; execution remains a backend responsibility.
+        """
+        with self._lock:
+            deliver = dict(self._deliver) if self._deliver else None
+        return {
+            "deliver": deliver,
+            "projects": self._projects(),
+            "environments": list(self.config.environments.keys()),
             "store_root": str(self.root),
             "now": iso(),
         }
@@ -639,6 +678,7 @@ class PanelService:
         carry_logs: list[str] | None = None,
         reuse_worktree: str | None = None,
     ) -> dict:
+        self._require_backend("run_task")
         if executor not in EXECUTORS:
             raise ConfigError(f"未知执行器: {executor!r}（可选: {', '.join(EXECUTORS)}）")
         codex_sandbox = validate_sandbox(codex_sandbox)
@@ -938,6 +978,7 @@ class PanelService:
         return None
 
     def cancel(self) -> dict:
+        self._require_backend("cancel")
         with self._lock:
             run = self._active
         if run is None or run.phase != "running":
@@ -948,6 +989,7 @@ class PanelService:
 
     def steer(self, text: str) -> dict:
         """会话里说话驱动执行：执行中=打断并带话续跑；已结束=直接带话续跑同一会话。"""
+        self._require_backend("steer")
         text = (text or "").strip()
         if not text:
             raise SchemaError("干预指令不能为空")
@@ -1114,6 +1156,7 @@ class PanelService:
         apply_now=False → 存为默认，从下一轮执行/干预续跑开始生效；
         apply_now=True  → 打断当前 codex，用新档位续跑同一会话，当场生效。
         """
+        self._require_backend("set_security_mode")
         try:
             mode = validate_sandbox(codex_sandbox)
         except ConfigError as exc:
@@ -1176,6 +1219,7 @@ class PanelService:
 
     # -- 模式 ----------------------------------------------------------------
     def set_mode(self, payload: dict) -> dict:
+        self._require_backend("set_mode")
         mode = payload.get("mode")
         if mode not in ("manual", "auto"):
             raise SchemaError("mode 只能是 manual / auto")
@@ -1502,18 +1546,57 @@ class PanelService:
         if environment not in environments:
             raise SchemaError(f"未知环境: {environment!r}（可选: {', '.join(environments) or '无'}）")
 
+        # 来源必须是一个真实的前端项目 + 本机可读的真实 HEAD。
+        # 绝不允许用全零 SHA 或拿目标仓库冒充来源（那会让任务看起来来自后端）。
         source_repo_id = str(payload.get("source_repo") or "").strip()
-        source_sha = str(payload.get("source_sha") or "").strip() or "0" * 40
-        if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_sha):
-            raise SchemaError("来源提交必须是 40 位十六进制 sha（可留空）")
+        source_sha = str(payload.get("source_sha") or "").strip()
+        if source_sha and not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_sha):
+            raise SchemaError("来源提交必须是 40 位十六进制 sha")
+
         if source_repo_id:
             source_repo = self.config.repositories.get(source_repo_id)
             if source_repo is None:
                 raise SchemaError(f"来源项目未注册: {source_repo_id!r}")
-            source = {"role": source_repo.role, "repo": source_repo_id, "commit_sha": source_sha}
+            if source_repo.role != "frontend":
+                raise SchemaError(
+                    f"来源项目必须是 frontend 项目（{source_repo_id} 的角色是 {source_repo.role}）"
+                )
+        elif source_sha:
+            raise SchemaError("指定了来源提交但未指定来源项目")
         else:
-            # 没有前端提交时用目标仓库占位，保证 schema/语义校验都能过
-            source = {"role": repo.role, "repo": repo_id, "commit_sha": source_sha}
+            # 未显式选择时，只有在恰好注册了一个前端项目时才能自动推断。
+            frontends = [r for r in self.config.repositories.values() if r.role == "frontend"]
+            if len(frontends) != 1:
+                raise SchemaError(
+                    "无法自动确定来源项目：请在面板中选择来源项目（已注册的前端项目不是恰好一个）"
+                )
+            source_repo = frontends[0]
+            source_repo_id = source_repo.id
+
+        if source_repo_id == repo_id:
+            raise SchemaError("来源项目不能与目标项目相同（不能用后端仓库冒充前端来源）")
+
+        try:
+            paths = dict(self.config.checks.verifier.repo_paths or {})
+        except AttributeError:
+            paths = {}
+        local_path = paths.get(source_repo_id)
+        if not local_path:
+            raise SchemaError(
+                f"来源项目 {source_repo_id} 未配置本地路径（config/local.yaml 的 repo_paths），"
+                "无法读取真实提交；请先在面板中选好来源项目并配置其本地路径"
+            )
+        try:
+            actual_sha = git_out(local_path, "rev-parse", "HEAD")
+        except Exception as exc:
+            raise SchemaError(f"无法读取来源项目 {source_repo_id} 的本地 HEAD: {exc}") from exc
+        if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", actual_sha):
+            raise SchemaError(f"来源项目 {source_repo_id} 的 HEAD 不是合法 sha: {actual_sha!r}")
+        if source_sha and source_sha != actual_sha:
+            raise SchemaError(
+                f"来源提交与本地 HEAD 不一致（提交 {source_sha[:12]}…，本地 HEAD {actual_sha[:12]}…）"
+            )
+        source = {"role": source_repo.role, "repo": source_repo_id, "commit_sha": actual_sha}
 
         if _path_list(payload.get("allowed_paths")) or _path_list(payload.get("forbidden_paths")):
             raise SchemaError("路径范围由后端仓库的 scope 模板管理；请提交 scope_profile 和语义边界")
@@ -1713,6 +1796,7 @@ class PanelService:
             return []
 
     def retry(self, task_id: str) -> dict:
+        self._require_backend("retry")
         store = self._store(push=True)
         task = store.get(task_id)
         if task["status"] != "failed":
@@ -1731,6 +1815,7 @@ class PanelService:
         )
 
     def release(self, task_id: str, reason: str = "面板释放租约") -> dict:
+        self._require_backend("release")
         store = self._store(push=True)
         return store.release_lease(task_id, actor=self.PANEL_ACTOR, reason=reason)
 
@@ -1751,6 +1836,7 @@ class PanelService:
 
     def resend_completed(self, task_id: str) -> dict:
         """手动补发一次完成通知到创建任务的前端监听端口。"""
+        self._require_backend("resend_completed")
         from .. import notification
 
         store = self._store(push=False)
@@ -1793,6 +1879,7 @@ class PanelService:
     # -- 恢复推进 ------------------------------------------------------------
     def advance(self, task_id: str) -> dict:
         """把中断在交付链路上的任务重新接上后续流程（后台执行，进度进 state）。"""
+        self._require_backend("advance")
         # 同步挡掉明显不合法的状态，别让按钮点了只回一句"已启动"再默默失败
         try:
             current = self._store(push=True).peek(task_id)

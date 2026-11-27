@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Handoff Studio: run handoff tasks with a DSH Agent on a model chosen in the panel.",
+  "description": "Backend-only Handoff Studio: run handoff tasks with a DSH Agent on a model chosen in the panel.",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",

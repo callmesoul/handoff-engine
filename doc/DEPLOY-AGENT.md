@@ -46,6 +46,17 @@ setx HANDOFF_ROOT $HandoffRoot
 
 重新打开终端或 Agent 宿主，让新环境变量生效。
 
+### Windows DSH 打开 WSL 工作区
+
+DSH 宿主是 Windows 进程时，`$env:HANDOFF_ROOT` 可能为空或仍是启动 DSH 时的旧值；这不代表 WSL 发行版里的 login-shell 环境也为空。对 `\\wsl.localhost\<distro>\...` 工作区，应在对应发行版里解析并执行：
+
+```powershell
+wsl.exe -d <distro> -- bash -lc 'printenv HANDOFF_ROOT'
+wsl.exe -d <distro> -- bash -lc 'handoffctl --root "$HANDOFF_ROOT" doctor --role frontend'
+```
+
+不要因 Windows 宿主变量缺失而回退到旧交接仓。若希望原生 Windows 工作区直接使用该变量，仍需 `setx` 后重启 DSH 宿主。
+
 ## 安装 skills
 
 Codex/DSH 能发现的 skill 应来自引擎仓，而不是数据仓：
@@ -60,13 +71,17 @@ Windows 可创建目录联接，或把这两个目录复制到宿主的 skills �
 
 ## DSH 插件
 
-三个插件都从引擎仓安装：
+插件按部署角色安装，不能在前后端无差别全装：
 
-- `dsh-plugin/`：完成事件回推原会话
-- `dsh-handoff-panel/`：嵌入本地任务面板
-- `dsh-handoff-studio/`：使用 DSH Agent 执行任务
+| 插件 | 前端部署 | 后端部署 | 用途 |
+|---|---:|---:|---|
+| `dsh-plugin/` | 安装 | 不安装 | 完成事件回推原前端会话 |
+| `dsh-handoff-panel/` | **安装** | **不安装** | 前端发单、跟踪、验收与最终确认 |
+| `dsh-handoff-studio/` | **不安装** | 安装 | 后端专用执行面板，用 DSH Agent 实现任务 |
 
-Handoff Studio 使用 `HANDOFF_ROOT` 寻找私有交接仓；其 Python 环境必须已经安装 `handoff-engine`。不要在 `cordis.patch.yml` 提交本机绝对路径。
+`dsh-handoff-panel` 固定启动 `handoffctl panel --role frontend`；页面和 HTTP API 都不暴露执行器、自动模式、认领、重试、租约、推进或执行日志等后端操作。后端部署不得安装该插件；历史上装入后端 profile 的应执行 `dsh plugin --profile <profile> remove dsh-handoff-panel`。
+
+Handoff Studio 使用后端机器的 `HANDOFF_ROOT` 寻找私有交接仓；其 Python 环境必须已经安装 `handoff-engine`。不要在 `cordis.patch.yml` 提交本机绝对路径。历史上在前端 profile 安装过 `dsh-handoff-studio` 的，应将它移除。
 
 ## 升级
 

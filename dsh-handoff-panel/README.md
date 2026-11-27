@@ -1,19 +1,28 @@
 # dsh-handoff-panel
 
-DeepSeek Harness 插件：在侧边栏加一行「任务面板」，主区里直接用 iframe 嵌入
-本机运行的 Python 任务面板（`handoffctl panel`）。
+DeepSeek Harness 的**前端交接面板**插件：在侧边栏增加「前端任务面板」，并在主区嵌入本机的 `handoffctl panel --role frontend`。
+
+本插件只应安装在**前端开发机的 DSH profile**，后端 worker / operator 部署不要安装。它只提供前端职责：
+
+- 查看、筛选和同步交接任务；
+- 向 backend 仓库创建任务；
+- 查看 PR、部署状态、验收要求和事件时间线；
+- 运行部署对齐与结构化验收（deliver）；
+- 将 `verified` 任务标记为「前端已验收」。
+
+它不提供后端执行器、手动/自动执行模式、认领/重试/释放租约、会话续跑、日志、合并/部署推进或通知重放。角色边界不仅在页面中隐藏，Python HTTP 服务也会拒绝这些后端 API。
 
 和已有的 `dsh-handoff-board`（「交接板」）是两回事：
 
-| | 交接板 `dsh-handoff-board` | 任务面板 `dsh-handoff-panel` |
+| | 交接板 `dsh-handoff-board` | 前端任务面板 `dsh-handoff-panel` |
 | --- | --- | --- |
-| 数据源 | 插件自己扫 `~/.codex` 与会话文件 | 直接内嵌 `handoffctl panel` 的 HTTP 页 |
-| 功能 | 列出交接单、开 DSH 会话 | 完整的发单/执行/验收/日志/模式切换 |
-| 端口 | 无（挂在 DSH 宿主 `:58995/handoff-board`） | 面板自身 `127.0.0.1:8790` |
+| 数据源 | 插件自己扫会话文件 | 嵌入 `handoffctl panel --role frontend` |
+| 功能 | 列出交接单、开 DSH 会话 | 前端发单、跟踪、验收与最终确认 |
+| 端口 | DSH 宿主路由 | 面板自身 `127.0.0.1:8790` |
 
 ## 结构
 
-```
+```text
 dsh-handoff-panel/
 ├── package.json      # dsh.bundle.patch + dsh.client（platform: web）
 ├── cordis.patch.yml  # 插入 handoff-panel 宿主 fiber
@@ -27,56 +36,56 @@ dsh-handoff-panel/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/HEAD | `/handoff-panel/health` | `{ ok: true }` |
-| GET/HEAD | `/handoff-panel/status` | `{ ok, url, reachable, status, mode, error }`，1.5 秒探测 `/api/state` |
-| POST | `/handoff-panel/launch` | 分离进程拉起面板，返回 `202 { ok, started, command }` |
+| GET/HEAD | `/handoff-panel/status` | 探测 `/api/state`，并要求返回 `role: frontend` |
+| POST | `/handoff-panel/launch` | 分离进程拉起前端面板 |
 
-面板**不经过** DSH 反代：浏览器半直接框面板自己的 origin，这样面板里那 11 处绝对路径
-`fetch("/api/...")` 仍然是同源请求，不需要改写前缀。
+面板不经过 DSH 反代：浏览器半直接嵌入面板自己的 loopback origin，页面中的 `/api/...` 请求仍与 Python 服务同源。
 
 ## 浏览器半
 
-- `sidebar.panellist` 注册 `id: handoff-panel`、`order: 25`、`label: 任务面板`
-- `main` 注册同一个 key —— 侧边栏那行必须与 main 成对，缺一个点击就会抛错
-- 主面板：顶部状态条（在线/未启动、地址、模式、重新载入/启动按钮）+ 下方 iframe
-- 未启动时显示启动指引，并提供「帮我启动」，走宿主半的 `/launch`
+- `sidebar.panellist` 注册 `id: handoff-panel`、`order: 25`、`label: 前端任务面板`；
+- `main` 注册同一个 key；
+- 状态条只接受 `role: frontend` 的面板，避免误嵌入后端控制台；
+- 「重新载入」只刷新 iframe，不会再启动一个面板进程；
+- 未启动时可通过宿主路由启动前端角色面板。
 
 ## 配置（可选）
 
-在 `~/.dsh/profiles/desktop/cordis.patch.yml` 里给这一行加配置：
+在 profile 的 `cordis.patch.yml` 中给插件配置：
 
 ```yaml
 - id: handoff-panel
   config:
     url: http://127.0.0.1:8790
-    # 面板端口变了就同步改这里；给了 port 会自动补到启动命令后面
     # port: 8790
-    # startCommand: ~/code/handoff-engine/.venv/bin/handoffctl --root ~/code/handoff-store panel --no-open
-    # wslDistro: Ubuntu   # 面板跑在 WSL 里时，用 wsl.exe -d <distro> 拉起
+    # 未写 --role 时插件会自动补 frontend；显式写其他角色会拒绝加载
+    # startCommand: ~/code/handoff-engine/.venv/bin/handoffctl --root ~/code/handoff-store panel --role frontend --no-open
+    # wslDistro: Ubuntu
 ```
 
-`url` 只接受回环地址（`127.0.0.1` / `localhost` / `::1`），其他一律在加载时报错。
+`url` 只接受回环地址。Windows 宿主默认通过 `wsl.exe -d Ubuntu` 启动；Linux/macOS 默认直接通过 `/bin/bash -lc` 启动。
 
-`wslDistro` 在 Windows 上**默认就是 `Ubuntu`**（宿主跑在 Windows、面板跑在 WSL，这是本机的常态）；要想让启动命令在本机原生执行，把它显式设成空字符串。Linux/macOS 上默认值为空，直接走 `/bin/bash -lc`。
+## 安装（仅前端部署）
 
-## 安装
+后端部署跳过本节，不要把本插件加入后端 DSH profile。
 
-pnpm 不能从 UNC 路径装，先拷到本地磁盘：
+pnpm 不能从 UNC 路径安装，Windows DSH + WSL 源码场景先复制到本地磁盘：
 
 ```powershell
+$Stage = "$env:LOCALAPPDATA\dsh-handoff-panel-stage"
+Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 Copy-Item -Recurse -Force `
   '\\wsl.localhost\Ubuntu\home\you\code\handoff-engine\dsh-handoff-panel' `
-  "$env:LOCALAPPDATA\dsh-handoff-panel-stage"
-```
+  $Stage
 
-把示例中的 `you` 换成 WSL 用户名。然后（务必在 Windows 本地目录执行，UNC 下 `cmd.exe` 会拒绝）：
-
-```powershell
 Set-Location $HOME
 & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" `
-  plugin --profile desktop add "file:$env:LOCALAPPDATA\dsh-handoff-panel-stage"
+  plugin --profile desktop add "file:$Stage"
 ```
 
-装完**必须重启应用**：`dsh.client` 清单在入口 boot 时才读。
+把 `you` 换成 WSL 用户名。安装或升级后重启 DSH，使 Host/Client 清单重新加载。
+
+自定义 `startCommand` 未写角色时，插件会自动补上 `--role frontend`；显式配置其他角色会被拒绝。默认命令已包含该参数。
 
 ## 卸载
 

@@ -28,6 +28,17 @@ notifications:
 admin:
   database: .handoff-run/index/handoff.sqlite3
 
+# 本文件不进 Git。通知控制面密钥与通用验收密钥都只配置路径，不写明文。
 # secrets:
 #   HANDOFF_NOTIFY_SECRET_FILE: /etc/handoff/notify-secret
 #   OPENAPI_API_KEY_FILE: /etc/handoff/openapi-api-key
+#   refs:
+#     saas-test-session: /run/secrets/saas-test-session-cookie
+#   # HTTP/OpenAPI 中自定义 env → ref 必须在前后端各自本机明确授权。
+#   bindings:
+#     SAAS_TEST_SESSION_COOKIE: saas-test-session
+#
+# 前端 notifications.url 指向后端 wake endpoint 时，预检 URL 会自动同源派生；
+# 只有反向代理拓扑不同时才配置精确路径：
+# notifications:
+#   preflight_url: https://handoff.example/v1/handoff/secret-preflight

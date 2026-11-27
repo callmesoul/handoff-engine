@@ -19,12 +19,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote, quote_plus, urlsplit
 
 import yaml
 
 from .config import Config, SuiteSpec
 from . import secrets as secret_files
-from .errors import ExecutionError
+from .errors import ExecutionError, SchemaError
 from .gitcmd import run
 from .http_client import HttpClient
 from .sanitize import clean
@@ -112,9 +113,9 @@ class Verifier:
         try:
             kind = check["type"]
             if kind == "http":
-                status, output = self._http(check, base_url)
+                status, output = self._http(check, base_url, task)
             elif kind == "openapi_diff":
-                status, output = self._openapi_diff(check, base_url)
+                status, output = self._openapi_diff(check, base_url, task)
             elif kind == "repo_script":
                 status, output = self._suite(check, task, script=True)
             elif kind == "test_suite":
@@ -123,6 +124,7 @@ class Verifier:
                 status, output = "error", f"未知检查类型: {kind}"
         except Exception as exc:  # noqa: BLE001 - 单条检查失败不能拖垮整轮验收
             status, output = "error", f"{type(exc).__name__}: {exc}"
+        output = _redact_required_secrets(str(output), self.config, task)
         duration = int((time.monotonic() - started) * 1000)
         result = CheckResult(
             id=check["id"],
@@ -136,21 +138,28 @@ class Verifier:
         return result
 
     # -- http ----------------------------------------------------------
-    def _http(self, check: dict, base_url: str) -> tuple[str, str]:
-        url = _substitute(check["url"], base_url, self.config)
-        headers = {k: _substitute(v, base_url, self.config) for k, v in (check.get("headers") or {}).items()}
+    def _http(self, check: dict, base_url: str, task: dict) -> tuple[str, str]:
+        secret_bearing = _validate_secret_sink(check, "url", base_url, self.config, task)
+        url = _substitute(check["url"], base_url, self.config, task)
+        headers = {
+            k: _substitute(v, base_url, self.config, task)
+            for k, v in (check.get("headers") or {}).items()
+        }
         body = check.get("body")
         if body is not None:
-            body = _substitute(body, base_url, self.config)
+            body = _substitute(body, base_url, self.config, task)
         timeout = float(check.get("timeout_seconds") or self.config.verify_poll.request_timeout_seconds)
         client = self.client if client_timeout_is(self.client, timeout) else HttpClient(
             timeout=timeout, deny_cidrs=self.config.checks.verifier.deny_cidrs
         )
-        resp = client.request(check["method"], url, headers=headers, body=body)
+        resp = client.request(
+            check["method"], url, headers=headers, body=body,
+            max_redirects=0 if secret_bearing else 3,
+        )
         shown = _display_url(check["url"], base_url)
         lines = [f"{check['method']} {shown} → HTTP {resp.status}（期望 {check['expect_status']}）"]
         if resp.status != check["expect_status"]:
-            lines.append("响应体：\n" + clean(resp.body, 2000))
+            lines.append("响应体：\n" + resp.body)
             return "failed", "\n".join(lines)
 
         assertions = check.get("expect_jsonpath") or []
@@ -182,18 +191,23 @@ class Verifier:
         return "passed", "\n".join(lines)
 
     # -- openapi -------------------------------------------------------
-    def _openapi_diff(self, check: dict, base_url: str) -> tuple[str, str]:
+    def _openapi_diff(self, check: dict, base_url: str, task: dict) -> tuple[str, str]:
+        secret_bearing = _validate_secret_sink(check, "actual_url", base_url, self.config, task)
         expected_path = self.root / check["expected_path"]
         if not expected_path.is_file():
             return "error", f"期望契约文件不存在: {check['expected_path']}"
         expected = _load_spec(expected_path)
         shown = _display_url(check["actual_url"], base_url)
-        actual_url = _substitute(check["actual_url"], base_url, self.config)
+        actual_url = _substitute(check["actual_url"], base_url, self.config, task)
         timeout = float(check.get("timeout_seconds") or self.config.verify_poll.request_timeout_seconds)
         client = self.client if client_timeout_is(self.client, timeout) else HttpClient(
             timeout=timeout, deny_cidrs=self.config.checks.verifier.deny_cidrs
         )
-        resp = client.request("GET", actual_url, headers={"Accept": "application/json, application/yaml"})
+        resp = client.request(
+            "GET", actual_url,
+            headers={"Accept": "application/json, application/yaml"},
+            max_redirects=0 if secret_bearing else 3,
+        )
         if resp.status >= 400:
             return "failed", f"{shown} 返回 HTTP {resp.status}"
         try:
@@ -228,9 +242,17 @@ class Verifier:
             argv = _interpreter_for(target) + [str(target)]
 
         timeout = float(check.get("timeout_seconds") or spec.timeout_seconds)
-        result = run(argv, cwd=workdir / spec.cwd, timeout=timeout, check_env=False)
+        required_env = secret_files.secret_env(self.config, list(spec.required_secrets))
+        result = run(
+            argv,
+            cwd=workdir / spec.cwd,
+            timeout=timeout,
+            env=required_env,
+            check_env=False,
+            inherit_env=False,
+        )
         output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-        return ("passed" if result.ok else "failed"), clean(output.strip() or f"exit {result.returncode}", self.limit)
+        return ("passed" if result.ok else "failed"), output.strip() or f"exit {result.returncode}"
 
     def _repo_dir(self, repo: str) -> Path | None:
         configured = self.config.checks.verifier.repo_paths.get(repo)
@@ -244,6 +266,45 @@ class Verifier:
 
 def client_timeout_is(client: HttpClient, timeout: float) -> bool:
     return abs(float(getattr(client, "timeout", 0)) - float(timeout)) < 1e-6
+
+
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return parts.scheme, parts.hostname.lower(), port
+
+
+def _validate_secret_sink(
+    check: dict, url_field: str, base_url: str, config: Config, task: dict
+) -> bool:
+    """密钥型 HTTP 只能发往环境 base_url 同源，且 ref 绑定须由本机批准。"""
+    placeholder_names, _registered = secret_files.requirement_usage(
+        {"acceptance": {"checks": [check]}}, config
+    )
+    if not placeholder_names:
+        return False
+    if not base_url:
+        raise SchemaError("含密钥占位的 HTTP/OpenAPI 检查必须配置 environment base_url")
+    raw_url = check.get(url_field)
+    suffix = (
+        raw_url[len("{base_url}"):]
+        if isinstance(raw_url, str) and raw_url.startswith("{base_url}")
+        else None
+    )
+    if suffix is None or (suffix and suffix[0] not in "/?#"):
+        raise SchemaError("含密钥占位的 HTTP/OpenAPI URL 必须使用 {base_url} 同源 URL")
+    actual_url = _substitute(raw_url, base_url, config, task)
+    if _url_origin(actual_url) != _url_origin(base_url):
+        raise SchemaError("含密钥占位的 HTTP/OpenAPI URL 必须与 environment base_url 同源")
+    for env_name in sorted(placeholder_names):
+        ref = _requirement_ref(task, env_name)
+        if not secret_files.binding_allowed(config, ref, env_name):
+            raise SchemaError(
+                f"HTTP/OpenAPI 密钥绑定 {env_name} → {ref} 未在本机 secrets.bindings 授权"
+            )
+    return True
 
 
 _SECRET_CACHE: dict[str, str] = {}
@@ -291,32 +352,38 @@ def _secret_from_file(name: str) -> str:
 
 
 #: verifier 的 {env:DOCS_API_KEY} 与配置里的 OPENAPI_API_KEY 是同一把 key。
-_VERIFIER_SECRET_ALIASES = {"DOCS_API_KEY": "OPENAPI_API_KEY"}
+def _requirement_ref(task: dict | None, env_name: str) -> str:
+    for item in (task or {}).get("required_secrets") or []:
+        if isinstance(item, dict) and item.get("env") == env_name:
+            return item.get("ref") or secret_files.canonical_name(env_name)
+    # 旧任务没有固化映射时，与 collect_requirements 的自动发现规则一致。
+    return secret_files.canonical_name(env_name)
 
 
-def _resolve_env(name: str, config: "Config | None" = None) -> str:
-    """取值优先级：进程环境变量 → 配置 *FILE 指向的文件 → secrets/<name>.txt。
-
-    这样从面板起任务时，验收脚本不必依赖启动进程的系统环境；不传 config 时
-    兼容旧的独立调用与测试。
-    """
-    value = os.environ.get(name)
-    if value:
-        return value
-    canonical = _VERIFIER_SECRET_ALIASES.get(name, name)
+def _resolve_env(name: str, config: "Config | None" = None, task: dict | None = None) -> str:
+    """使用与 create preflight 相同的 resolver；保留旧目录回退兼容独立调用。"""
     if config is not None:
-        configured = secret_files.config_secret(config, canonical)
+        configured = secret_files.resolve_secret(config, name, ref=_requirement_ref(task, name))
         if configured:
             return configured
+    else:
+        value = os.environ.get(name)
+        if value:
+            return value
     return _secret_from_file(name)
 
 
-def _substitute(text: str, base_url: str, config: "Config | None" = None) -> str:
+def _substitute(
+    text: str,
+    base_url: str,
+    config: "Config | None" = None,
+    task: dict | None = None,
+) -> str:
     out = text.replace("{base_url}", base_url) if base_url else text
 
     def _env(match: re.Match) -> str:
         name = match.group(1)
-        value = _resolve_env(name, config)
+        value = _resolve_env(name, config, task)
         if not value:
             raise ExecutionError(f"环境变量 {name} 未配置，无法解析占位 {match.group(0)}")
         return value
@@ -327,6 +394,34 @@ def _substitute(text: str, base_url: str, config: "Config | None" = None) -> str
 def _display_url(text: str, base_url: str) -> str:
     """输出里只展开 {base_url}，{env:*} 保持占位——密钥不落任务单。"""
     return text.replace("{base_url}", base_url) if base_url else text
+
+
+def _redact_required_secrets(text: str, config: Config, task: dict) -> str:
+    """防止被测服务或 suite 把动态密钥回显进持久化 CheckResult。"""
+    redacted = text
+    try:
+        requirements = secret_files.collect_requirements(task, config)
+    except (SchemaError, KeyError, TypeError):
+        requirements = task.get("required_secrets") or []
+    for item in requirements:
+        if not isinstance(item, dict):
+            continue
+        try:
+            value = secret_files.resolve_secret(config, item["env"], ref=item["ref"])
+        except (KeyError, TypeError):
+            continue
+        if not value:
+            continue
+        variants = {
+            value,
+            quote(value, safe=""),
+            quote_plus(value, safe=""),
+            json.dumps(value, ensure_ascii=False)[1:-1],
+            repr(value)[1:-1],
+        }
+        for variant in sorted((item for item in variants if item), key=len, reverse=True):
+            redacted = redacted.replace(variant, "[REDACTED_SECRET]")
+    return redacted
 
 
 def _interpreter_for(path: Path) -> list[str]:

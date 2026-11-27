@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Handoff Studio",
-    "description": "Runs handoff task implementations with a DSH Agent on a model you pick, and opens the task panel beside your conversation.",
+    "title": "Handoff Backend Studio",
+    "description": "Backend-only panel that runs handoff task implementations with a DSH Agent on a model you pick; do not install it on frontend deployments.",
     "detail": "docs/DETAIL.md"
   }
 }

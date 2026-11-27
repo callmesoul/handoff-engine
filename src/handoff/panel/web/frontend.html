@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handoff 前端任务面板</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d212b;
+    --line: #2a2f3c;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --accent: #4f8cff;
+    --accent-2: #7aa2ff;
+    --green: #34c98e;
+    --red: #ff6b6b;
+    --amber: #f5b455;
+    --purple: #b48cff;
+    --cyan: #4fd8e0;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.55 "Segoe UI", "Microsoft YaHei", sans-serif; }
+  button, input, select, textarea { font: inherit; }
+  button { border: 1px solid var(--line); background: var(--panel-2); color: var(--text); border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button:disabled { opacity: .48; cursor: not-allowed; }
+  button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+  input, select, textarea { width: 100%; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; }
+  textarea { min-height: 92px; resize: vertical; line-height: 1.55; }
+  a { color: var(--accent-2); text-decoration: none; overflow-wrap: anywhere; }
+  a:hover { text-decoration: underline; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .muted { color: var(--muted); }
+  .spacer { flex: 1; }
+
+  header { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 12px; min-height: 50px; padding: 9px 18px; background: color-mix(in srgb, var(--panel) 94%, transparent); border-bottom: 1px solid var(--line); backdrop-filter: blur(8px); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 650; white-space: nowrap; }
+  header h1 span { margin-left: 8px; color: var(--muted); font-size: 12px; font-weight: 400; }
+  .state-note { min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: var(--green); vertical-align: middle; }
+  .dot.bad { background: var(--red); }
+
+  main { width: 100%; padding: 16px 18px 56px; }
+  .toolbar { display: flex; align-items: center; gap: 9px; margin-bottom: 11px; flex-wrap: wrap; }
+  .toolbar h2 { margin: 0; color: var(--muted); font-size: 14px; font-weight: 550; }
+  #status-filter { width: 150px; }
+  .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  table { width: 100%; min-width: 850px; border-collapse: collapse; }
+  th, td { padding: 9px 11px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; z-index: 1; color: var(--muted); background: var(--panel-2); font-size: 12px; font-weight: 550; white-space: nowrap; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.selected { background: var(--panel-2); }
+  tbody tr.selected { box-shadow: inset 3px 0 0 var(--accent); }
+  tbody tr:last-child td { border-bottom: 0; }
+  .task-title { min-width: 190px; }
+  .task-id { cursor: copy; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
+  .empty { padding: 36px 12px !important; color: var(--muted); text-align: center; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; background: #8b93a722; color: var(--muted); }
+  .st-open { background: #4f8cff22; color: var(--accent-2); }
+  .st-claimed, .st-in_progress { background: #f5b45522; color: var(--amber); }
+  .st-delivered, .st-awaiting_merge { background: #b48cff22; color: var(--purple); }
+  .st-merged, .st-deployed, .st-verifying { background: #4fd8e022; color: var(--cyan); }
+  .st-verified, .st-frontend_accepted { background: #34c98e22; color: var(--green); }
+  .st-failed { background: #ff6b6b22; color: var(--red); }
+  .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .pager button { padding: 4px 10px; }
+  #page-size { width: 92px; }
+
+  #drawer-overlay { display: none; position: fixed; inset: 0; z-index: 40; background: #000a; }
+  #drawer-overlay.show { display: block; }
+  #drawer { position: fixed; top: 0; right: min(-720px, -100vw); z-index: 50; display: flex; flex-direction: column; width: min(700px, 100vw); height: 100dvh; background: var(--panel); border-left: 1px solid var(--line); transition: right .18s ease; }
+  #drawer.show { right: 0; }
+  .drawer-head { display: flex; align-items: center; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+  .drawer-title { flex: 1; min-width: 0; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 16px 18px 30px; }
+  .section { margin-bottom: 19px; }
+  .section h3 { margin: 0 0 8px; color: var(--muted); font-size: 13px; font-weight: 650; letter-spacing: .2px; }
+  .kv { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 5px 10px; font-size: 13px; }
+  .kv .key { color: var(--muted); }
+  .pre { max-height: 280px; overflow: auto; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 12.5px; }
+  .failure { background: #ff6b6b12; border-color: #ff6b6b55; }
+  .action-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .action-note { margin-top: 7px; color: var(--muted); font-size: 12px; }
+  .timeline { margin-left: 6px; padding-left: 15px; border-left: 2px solid var(--line); }
+  .event { position: relative; padding: 0 0 12px; }
+  .event::before { content: ""; position: absolute; top: 6px; left: -20px; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+  .event-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+  .overlay { display: none; position: fixed; inset: 0; z-index: 60; align-items: center; justify-content: center; padding: 14px; background: #000a; }
+  .overlay.show { display: flex; }
+  .modal { display: flex; flex-direction: column; width: min(640px, 100%); max-height: 92dvh; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .modal-head { padding: 13px 18px; border-bottom: 1px solid var(--line); font-weight: 650; }
+  .modal-body { overflow-y: auto; padding: 16px 18px; }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); }
+  .form-row { margin-bottom: 14px; }
+  .form-row label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12.5px; }
+  .hint { margin-top: 5px; color: var(--muted); font-size: 12px; }
+  details summary { color: var(--muted); font-size: 12.5px; cursor: pointer; }
+
+  #toast { display: none; position: fixed; left: 50%; bottom: 22px; z-index: 100; max-width: min(620px, calc(100vw - 28px)); padding: 9px 16px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 28px #0009; transform: translateX(-50%); text-align: center; }
+  #toast.error { color: var(--red); border-color: var(--red); }
+
+  @media (max-width: 760px) {
+    header { padding: 9px 12px; flex-wrap: wrap; }
+    header .spacer { display: none; }
+    .state-note { order: 3; width: 100%; }
+    main { padding: 12px 10px 44px; }
+    .toolbar .spacer { display: none; }
+    .toolbar h2 { width: 100%; }
+    #status-filter { flex: 1; width: auto; min-width: 130px; }
+    .drawer-body { padding: 14px 13px 26px; }
+    .kv { grid-template-columns: 88px minmax(0, 1fr); }
+    .modal-body { padding: 14px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Handoff<span>前端任务面板</span></h1>
+  <div class="state-note" id="state-note">正在读取状态…</div>
+  <div class="spacer"></div>
+  <div class="state-note" id="state-health"></div>
+</header>
+
+<main>
+  <div class="toolbar">
+    <h2>后端任务</h2>
+    <select id="status-filter" aria-label="按状态筛选">
+      <option value="">全部状态</option>
+      <option>open</option>
+      <option>claimed</option>
+      <option>in_progress</option>
+      <option>delivered</option>
+      <option>awaiting_merge</option>
+      <option>merged</option>
+      <option>deployed</option>
+      <option>verifying</option>
+      <option>verified</option>
+      <option>frontend_accepted</option>
+      <option>failed</option>
+      <option>cancelled</option>
+    </select>
+    <div class="spacer"></div>
+    <button id="sync-button" title="显式从交接仓拉取最新任务">⟳ 拉取最新</button>
+    <button class="primary" id="new-button">+ 新建后端任务</button>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>状态</th>
+          <th>标题</th>
+          <th>任务</th>
+          <th>来源项目</th>
+          <th>后端仓库</th>
+          <th>PR</th>
+          <th>部署</th>
+          <th>更新</th>
+        </tr>
+      </thead>
+      <tbody id="task-rows"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="pager">
+    <button id="page-prev">‹ 上一页</button>
+    <span id="page-info">—</span>
+    <button id="page-next">下一页 ›</button>
+    <span class="spacer"></span>
+    <span id="page-total"></span>
+    <select id="page-size" aria-label="每页条数">
+      <option value="10">10 / 页</option>
+      <option value="20" selected>20 / 页</option>
+      <option value="50">50 / 页</option>
+      <option value="100">100 / 页</option>
+    </select>
+  </div>
+</main>
+
+<div id="drawer-overlay"></div>
+<aside id="drawer" aria-label="任务详情" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="drawer-title" id="drawer-title"></div>
+    <span class="chip" id="drawer-status"></span>
+    <button id="drawer-close" aria-label="关闭详情">✕</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="overlay" id="new-task-overlay" role="dialog" aria-modal="true" aria-labelledby="new-task-title">
+  <div class="modal">
+    <div class="modal-head" id="new-task-title">新建后端任务</div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label for="task-repo">目标项目</label>
+        <select id="task-repo"></select>
+        <div class="hint">仅列出已注册的 backend 项目。</div>
+      </div>
+      <div class="form-row">
+        <label for="task-base-ref">基线分支</label>
+        <select id="task-base-ref"></select>
+      </div>
+      <div class="form-row">
+        <label for="task-title-input">标题</label>
+        <input id="task-title-input" type="text" maxlength="200" placeholder="例：补齐 /healthz 健康检查接口">
+      </div>
+      <div class="form-row">
+        <label for="task-requirement">需求正文</label>
+        <textarea id="task-requirement" rows="6" placeholder="要做什么、验收标准、不要碰什么…"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="task-scope-profile">后端路径模板</label>
+        <select id="task-scope-profile"></select>
+        <div class="hint">路径由目标仓库维护，创建时固化。</div>
+        <div class="pre" id="scope-preview" style="margin-top:8px;max-height:150px"></div>
+      </div>
+      <div class="form-row">
+        <label for="task-out-of-scope">不在本任务范围内的事项（每行一项，可留空）</label>
+        <textarea id="task-out-of-scope" rows="3" placeholder="例：不改鉴权与租户隔离"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="task-environment">验收环境</label>
+        <select id="task-environment"></select>
+      </div>
+      <div class="form-row">
+        <label for="task-source-repo">来源项目（必选，必须是前端项目）</label>
+        <select id="task-source-repo"></select>
+        <div class="hint">任务来源必须是一个真实的前端项目；服务端会读取它的本地 HEAD 作为真实来源提交，不接受全零 SHA。</div>
+      </div>
+      <div class="form-row">
+        <label for="task-source-sha">来源提交 SHA（可选，留空自动取本地 HEAD）</label>
+        <input id="task-source-sha" type="text" maxlength="64" placeholder="40 位十六进制 sha；填写必须与本地 HEAD 一致">
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button id="new-task-cancel">取消</button>
+      <button class="primary" id="new-task-submit">创建</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+const byId = (id) => document.getElementById(id);
+const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+})[char]);
+
+const knownStatuses = new Set([
+  "open", "claimed", "in_progress", "delivered", "awaiting_merge", "merged",
+  "deployed", "verifying", "verified", "frontend_accepted", "failed", "cancelled"
+]);
+
+function statusClass(status) {
+  const value = String(status || "");
+  return knownStatuses.has(value) ? `st-${value}` : "";
+}
+
+function safeHttpUrl(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(String(value), window.location.href);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function externalLink(value, label) {
+  const url = safeHttpUrl(value);
+  return url
+    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label || value)}</a>`
+    : escapeHtml(value || "—");
+}
+
+function shortSha(value) {
+  return value ? String(value).slice(0, 12) : "—";
+}
+
+function shortRepo(value) {
+  const parts = String(value || "").split("/");
+  return parts[parts.length - 1] || "—";
+}
+
+function timeAgo(value) {
+  if (!value) return "—";
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return String(value);
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return `${seconds}秒前`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}时前`;
+  return `${Math.floor(seconds / 86400)}天前`;
+}
+
+let panelState = null;
+let tasks = [];
+let currentPage = 1;
+let pageCount = 1;
+let totalTasks = 0;
+let pageSize = 20;
+let selectedTask = null;
+let drawerRequest = 0;
+
+async function api(path, body) {
+  const options = body === undefined ? undefined : {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)
+  };
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({error: `HTTP ${response.status}`}));
+  if (!response.ok) throw new Error(data.error || data.message || `HTTP ${response.status}`);
+  return data;
+}
+
+function toast(message, isError) {
+  const node = byId("toast");
+  node.textContent = String(message || "");
+  node.className = isError ? "error" : "";
+  node.style.display = "block";
+  clearTimeout(node.hideTimer);
+  node.hideTimer = setTimeout(() => { node.style.display = "none"; }, isError ? 5000 : 2600);
+}
+
+async function copyText(value) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(String(value));
+      return true;
+    }
+  } catch (_) { /* 使用兼容回退 */ }
+  const input = document.createElement("textarea");
+  input.value = String(value);
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.appendChild(input);
+  input.select();
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch (_) { copied = false; }
+  input.remove();
+  return copied;
+}
+
+async function refreshState() {
+  try {
+    panelState = await api("/api/state");
+    const root = panelState.store_root ? ` · ${panelState.store_root}` : "";
+    byId("state-note").textContent = `交接仓${root}`;
+    const delivery = panelState.deliver;
+    if (delivery && !delivery.done) {
+      byId("state-health").innerHTML = `<span class="dot"></span>正在验收 ${escapeHtml(delivery.task_id || "")}`;
+    } else {
+      const when = panelState.now ? new Date(panelState.now).toLocaleTimeString() : "刚刚";
+      byId("state-health").innerHTML = `<span class="dot"></span>状态已更新 · ${escapeHtml(when)}`;
+    }
+  } catch (error) {
+    byId("state-health").innerHTML = `<span class="dot bad"></span>${escapeHtml(error.message)}`;
+  }
+}
+
+async function refreshTasks(resetPage = false) {
+  if (resetPage) currentPage = 1;
+  const query = new URLSearchParams();
+  const status = byId("status-filter").value;
+  if (status) query.set("status", status);
+  query.set("page", String(currentPage));
+  query.set("page_size", String(pageSize));
+  try {
+    const data = await api(`/api/tasks?${query.toString()}`);
+    tasks = Array.isArray(data.tasks) ? data.tasks : (Array.isArray(data.items) ? data.items : []);
+    totalTasks = Number(data.total ?? data.count ?? tasks.length) || 0;
+    pageCount = Math.max(1, Number(data.pages) || 1);
+    currentPage = Math.max(1, Number(data.page) || currentPage);
+    renderTasks();
+    renderPager();
+    if (selectedTask) refreshDrawer(false);
+  } catch (error) {
+    byId("task-rows").innerHTML = `<tr><td colspan="8" class="empty">加载失败：${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderTasks() {
+  const body = byId("task-rows");
+  if (!tasks.length) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">暂无任务</td></tr>';
+    return;
+  }
+  body.innerHTML = tasks.map((task) => {
+    const deployment = typeof task.deployment === "string"
+      ? task.deployment
+      : ((task.deployment || {}).status || "—");
+    const pr = safeHttpUrl(task.pr_url) ? externalLink(task.pr_url, "PR") : "—";
+    const selected = selectedTask && selectedTask.id === task.id ? "selected" : "";
+    return `<tr data-task-id="${escapeHtml(task.id)}" class="${selected}">
+      <td><span class="chip ${statusClass(task.status)}">${escapeHtml(task.status || "—")}</span></td>
+      <td class="task-title">${escapeHtml(task.title || "（无标题）")}${task.failure ? ' <span style="color:var(--red)" title="失败">✘</span>' : ""}</td>
+      <td class="mono"><span class="task-id" data-copy-id="${escapeHtml(task.id)}" title="点击复制">${escapeHtml(task.id)}</span></td>
+      <td class="mono" title="${escapeHtml(task.frontend_repo || "")}">${escapeHtml(shortRepo(task.frontend_repo))}</td>
+      <td class="mono">${escapeHtml(task.repo || "—")}</td>
+      <td>${pr}</td>
+      <td>${escapeHtml(deployment)}</td>
+      <td class="muted">${escapeHtml(timeAgo(task.updated_at))}</td>
+    </tr>`;
+  }).join("");
+
+  body.querySelectorAll("tr[data-task-id]").forEach((row) => {
+    row.addEventListener("click", () => openDrawer(row.dataset.taskId));
+  });
+  body.querySelectorAll("[data-copy-id]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const value = node.dataset.copyId || "";
+      const copied = await copyText(value);
+      toast(copied ? `已复制任务 ID：${value}` : "复制失败，请手动选择", !copied);
+    });
+  });
+}
+
+function renderPager() {
+  byId("page-info").textContent = `第 ${currentPage} / ${pageCount} 页`;
+  byId("page-total").textContent = `共 ${totalTasks} 个任务`;
+  byId("page-prev").disabled = currentPage <= 1;
+  byId("page-next").disabled = currentPage >= pageCount;
+}
+
+function goPage(delta) {
+  const next = Math.max(1, Math.min(pageCount, currentPage + delta));
+  if (next === currentPage) return;
+  currentPage = next;
+  refreshTasks();
+}
+
+async function openDrawer(taskId) {
+  if (!taskId) return;
+  selectedTask = {id: taskId, task: null, events: []};
+  byId("drawer").classList.add("show");
+  byId("drawer").setAttribute("aria-hidden", "false");
+  byId("drawer-overlay").classList.add("show");
+  byId("drawer-title").textContent = taskId;
+  byId("drawer-status").textContent = "加载中";
+  byId("drawer-status").className = "chip";
+  byId("drawer-body").innerHTML = `<div class="empty">读取任务 ${escapeHtml(taskId)} …</div>`;
+  renderTasks();
+  await refreshDrawer(true);
+}
+
+function closeDrawer() {
+  selectedTask = null;
+  drawerRequest += 1;
+  byId("drawer").classList.remove("show");
+  byId("drawer").setAttribute("aria-hidden", "true");
+  byId("drawer-overlay").classList.remove("show");
+  renderTasks();
+}
+
+async function refreshDrawer(explicit) {
+  if (!selectedTask || !selectedTask.id) return;
+  const taskId = selectedTask.id;
+  const requestId = ++drawerRequest;
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+    if (requestId !== drawerRequest || !selectedTask || selectedTask.id !== taskId) return;
+    selectedTask = {
+      id: taskId,
+      task: data.task || data,
+      events: Array.isArray(data.events) ? data.events : []
+    };
+    renderDrawer();
+  } catch (error) {
+    if (requestId !== drawerRequest) return;
+    if (explicit) toast(`加载任务失败：${error.message}`, true);
+    if (selectedTask && !selectedTask.task) {
+      byId("drawer-body").innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
+    }
+  }
+}
+
+function describeCheck(check) {
+  if (!check || typeof check !== "object") return String(check || "");
+  if (check.type === "http") return `http ${check.method || "GET"} ${check.url || ""} → ${check.expect_status ?? ""}`;
+  if (check.type === "openapi_diff") return `openapi_diff ${check.expected_path || ""} ≡ ${check.actual_url || ""}`;
+  return [check.type, check.repo, check.name].filter(Boolean).join(" ");
+}
+
+function renderDrawer() {
+  if (!selectedTask || !selectedTask.task) return;
+  const task = selectedTask.task;
+  const result = task.result || {};
+  const target = task.target || {};
+  const source = task.source || {};
+  const deployment = task.deployment || {};
+  const acceptance = task.acceptance || {};
+  const scope = task.scope || {};
+  const canDeliver = ["merged", "deployed", "verifying"].includes(task.status);
+  const canAccept = task.status === "verified";
+
+  byId("drawer-title").textContent = task.title || task.id;
+  byId("drawer-status").textContent = task.status || "—";
+  byId("drawer-status").className = `chip ${statusClass(task.status)}`;
+
+  const sections = [];
+  sections.push(`<section class="section"><h3>概况</h3><div class="kv">
+    <span class="key">任务</span><span class="mono">${escapeHtml(task.id || selectedTask.id)}</span>
+    <span class="key">来源项目</span><span class="mono">${escapeHtml(source.repo || "—")}${source.commit_sha ? ` @ ${escapeHtml(shortSha(source.commit_sha))}` : ""}</span>
+    <span class="key">后端仓库</span><span class="mono">${escapeHtml(target.repo || "—")} @ ${escapeHtml(target.base_ref || "—")}</span>
+    <span class="key">版本</span><span>revision ${escapeHtml(task.revision ?? "—")} · 第 ${escapeHtml(task.attempt ?? 0)} 次</span>
+    <span class="key">分支</span><span class="mono">${escapeHtml(result.branch || "—")}</span>
+    <span class="key">提交</span><span class="mono">${escapeHtml(shortSha(result.head_sha))}</span>
+    <span class="key">PR</span><span>${externalLink(result.pr_url, result.pr_url)}</span>
+    <span class="key">合并 SHA</span><span class="mono">${escapeHtml(shortSha(result.merge_sha))}</span>
+    <span class="key">部署状态</span><span>${escapeHtml(deployment.status || "—")}</span>
+    <span class="key">目标 / 当前</span><span class="mono">${escapeHtml(shortSha(deployment.target_sha))} / ${escapeHtml(shortSha(deployment.observed_sha))}</span>
+    <span class="key">部署地址</span><span>${externalLink(deployment.url, deployment.url)}</span>
+    <span class="key">创建 / 更新</span><span>${escapeHtml(task.created_at || "—")}<br>${escapeHtml(task.updated_at || "—")}</span>
+  </div></section>`);
+
+  if (task.failure) {
+    sections.push(`<section class="section"><h3>失败信息 · ${escapeHtml(task.failure.stage || "未知阶段")}</h3><div class="pre failure">${escapeHtml(task.failure.message || "")}</div></section>`);
+  }
+  sections.push(`<section class="section"><h3>需求</h3><div class="pre">${escapeHtml(task.requirement || "（空）")}</div></section>`);
+
+  const checks = (Array.isArray(acceptance.checks) ? acceptance.checks : []).map(describeCheck).join("\n");
+  sections.push(`<section class="section"><h3>验收 · ${escapeHtml(acceptance.environment || deployment.environment || "—")}</h3><div class="pre">${escapeHtml(checks || "（无预设检查项）")}</div></section>`);
+
+  const allowed = Array.isArray(scope.allowed_paths) ? scope.allowed_paths : [];
+  const forbidden = Array.isArray(scope.forbidden_paths) ? scope.forbidden_paths : [];
+  sections.push(`<section class="section"><h3>范围</h3><div class="pre">允许：\n${escapeHtml(allowed.join("\n") || "（无）")}\n\n禁止：\n${escapeHtml(forbidden.join("\n") || "（无额外项）")}</div></section>`);
+
+  if (result.diff_summary || (Array.isArray(result.changed_paths) && result.changed_paths.length) || result.notes) {
+    const changed = Array.isArray(result.changed_paths) ? result.changed_paths.join("\n") : "";
+    sections.push(`<section class="section"><h3>后端交付摘要</h3><div class="pre">${escapeHtml(result.diff_summary || "")}${changed ? `\n\n变更路径：\n${escapeHtml(changed)}` : ""}${result.notes ? `\n\n备注：\n${escapeHtml(result.notes)}` : ""}</div></section>`);
+  }
+
+  if (canDeliver || canAccept) {
+    const buttons = [];
+    if (canDeliver) buttons.push('<button class="primary" id="deliver-button">拉取交付并验收</button>');
+    if (canAccept) buttons.push('<button class="primary" id="accept-button">确认前端验收通过</button>');
+    sections.push(`<section class="section"><h3>前端操作</h3><div class="action-row">${buttons.join("")}</div><div class="action-note">验收仅适用于 merged / deployed / verifying；确认接收仅适用于 verified。</div></section>`);
+  }
+
+  const timeline = selectedTask.events.slice(-50).map((event) => {
+    const eventStatus = event.status
+      ? ` <span class="chip ${statusClass(event.status)}">${escapeHtml(event.status)}</span>`
+      : "";
+    const meta = [event.at || event.created_at, event.summary].filter(Boolean).join(" · ");
+    return `<div class="event"><div>${escapeHtml(event.type || "event")}${eventStatus}</div><div class="event-meta">${escapeHtml(meta)}</div></div>`;
+  }).join("");
+  sections.push(`<section class="section"><h3>事件时间线（最近 50 条）</h3><div class="timeline">${timeline || '<div class="muted">暂无事件</div>'}</div></section>`);
+
+  byId("drawer-body").innerHTML = sections.join("");
+  const deliverButton = byId("deliver-button");
+  if (deliverButton) deliverButton.addEventListener("click", () => deliverTask(task.id));
+  const acceptButton = byId("accept-button");
+  if (acceptButton) acceptButton.addEventListener("click", () => acceptTask(task.id));
+}
+
+async function deliverTask(taskId) {
+  if (!selectedTask || selectedTask.task.id !== taskId || !["merged", "deployed", "verifying"].includes(selectedTask.task.status)) {
+    toast("当前状态不能发起前端验收", true);
+    return;
+  }
+  const button = byId("deliver-button");
+  if (button) { button.disabled = true; button.textContent = "验收中…"; }
+  try {
+    await api("/api/deliver", {task_id: taskId});
+    toast("已开始拉取交付并验收");
+    await Promise.all([refreshState(), refreshTasks()]);
+    await refreshDrawer(false);
+  } catch (error) {
+    toast(error.message, true);
+    if (button) { button.disabled = false; button.textContent = "拉取交付并验收"; }
+  }
+}
+
+async function acceptTask(taskId) {
+  if (!selectedTask || selectedTask.task.id !== taskId || selectedTask.task.status !== "verified") {
+    toast("只有 verified 任务可以确认前端验收通过", true);
+    return;
+  }
+  const button = byId("accept-button");
+  if (button) { button.disabled = true; button.textContent = "提交中…"; }
+  try {
+    await api(`/api/tasks/${encodeURIComponent(taskId)}/accept`, {reason: "前端面板：验收通过"});
+    toast("已标记为前端验收通过");
+    await refreshTasks();
+    await refreshDrawer(false);
+  } catch (error) {
+    toast(error.message, true);
+    if (button) { button.disabled = false; button.textContent = "确认前端验收通过"; }
+  }
+}
+
+function currentProject(repoId) {
+  const projects = panelState && Array.isArray(panelState.projects) ? panelState.projects : [];
+  return projects.find((project) => project.id === repoId) || null;
+}
+
+function openNewTask() {
+  const projects = panelState && Array.isArray(panelState.projects) ? panelState.projects : [];
+  const backendProjects = projects.filter((project) => project.role === "backend");
+  if (!backendProjects.length) {
+    toast("没有已注册的 backend 项目", true);
+    return;
+  }
+  byId("task-repo").innerHTML = backendProjects.map((project) =>
+    `<option value="${escapeHtml(project.id)}">${escapeHtml(project.id)}</option>`
+  ).join("");
+  const frontendProjects = projects.filter((project) => project.role === "frontend");
+  byId("task-source-repo").innerHTML = frontendProjects.map((project) =>
+    `<option value="${escapeHtml(project.id)}">${escapeHtml(project.id)} [${escapeHtml(project.role || "")}]</option>`
+  ).join("");
+  const environments = panelState && Array.isArray(panelState.environments) ? panelState.environments : [];
+  byId("task-environment").innerHTML = (environments.length ? environments : ["dev"]).map((value) =>
+    `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`
+  ).join("");
+  byId("task-title-input").value = "";
+  byId("task-requirement").value = "";
+  byId("task-out-of-scope").value = "";
+  byId("task-source-sha").value = "";
+  renderBaseRefs();
+  renderScopeProfiles();
+  byId("new-task-overlay").classList.add("show");
+  byId("task-title-input").focus();
+}
+
+function closeNewTask() {
+  byId("new-task-overlay").classList.remove("show");
+}
+
+function renderBaseRefs() {
+  const project = currentProject(byId("task-repo").value);
+  const refs = project && Array.isArray(project.base_refs) && project.base_refs.length
+    ? project.base_refs
+    : [(project && project.default_branch) || "dev"];
+  byId("task-base-ref").innerHTML = refs.map((value) =>
+    `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`
+  ).join("");
+}
+
+function renderScopeProfiles() {
+  const project = currentProject(byId("task-repo").value);
+  const profiles = project && Array.isArray(project.scope_profiles) ? project.scope_profiles : [];
+  const select = byId("task-scope-profile");
+  select.innerHTML = profiles.length
+    ? profiles.map((profile) => `<option value="${escapeHtml(profile.name)}"${profile.default ? " selected" : ""}>${escapeHtml(profile.name)}${profile.default ? "（默认）" : ""}</option>`).join("")
+    : '<option value="">未配置</option>';
+  select.disabled = !profiles.length;
+  renderScopePreview();
+}
+
+function renderScopePreview() {
+  const project = currentProject(byId("task-repo").value);
+  const profiles = project && Array.isArray(project.scope_profiles) ? project.scope_profiles : [];
+  const profile = profiles.find((item) => item.name === byId("task-scope-profile").value);
+  if (!profile) {
+    byId("scope-preview").textContent = "目标仓库尚未配置 scope，无法创建任务。";
+    return;
+  }
+  const allowed = Array.isArray(profile.allowed_paths) ? profile.allowed_paths : [];
+  const forbidden = Array.isArray(profile.forbidden_paths) ? profile.forbidden_paths : [];
+  byId("scope-preview").textContent = `允许：\n${allowed.map((value) => `  ${value}`).join("\n") || "  （无）"}\n\n禁止：\n${forbidden.map((value) => `  ${value}`).join("\n") || "  （无）"}`;
+}
+
+async function submitNewTask() {
+  const body = {
+    title: byId("task-title-input").value.trim(),
+    repo: byId("task-repo").value,
+    base_ref: byId("task-base-ref").value,
+    requirement: byId("task-requirement").value.trim(),
+    scope_profile: byId("task-scope-profile").value,
+    out_of_scope: byId("task-out-of-scope").value,
+    environment: byId("task-environment").value,
+    source_repo: byId("task-source-repo").value,
+    source_sha: byId("task-source-sha").value.trim()
+  };
+  if (!body.title) { toast("请填写标题", true); return; }
+  if (!body.requirement) { toast("请填写需求正文", true); return; }
+  if (!body.scope_profile) { toast("目标仓库尚未配置 scope，不能创建任务", true); return; }
+  if (!body.source_repo) { toast("请选择来源前端项目", true); return; }
+  const button = byId("new-task-submit");
+  button.disabled = true;
+  button.textContent = "创建中…";
+  try {
+    const data = await api("/api/tasks", body);
+    closeNewTask();
+    toast(`已创建 ${data.id}`);
+    await refreshTasks(true);
+    await openDrawer(data.id);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "创建";
+  }
+}
+
+async function syncTasks() {
+  const button = byId("sync-button");
+  button.disabled = true;
+  button.textContent = "拉取中…";
+  try {
+    const data = await api("/api/sync", {});
+    const added = Number(data.added) || 0;
+    toast(added ? `拉到 ${added} 个新任务` : "已是最新");
+    await refreshTasks();
+    if (selectedTask) await refreshDrawer(false);
+  } catch (error) {
+    toast(`拉取失败：${error.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "⟳ 拉取最新";
+  }
+}
+
+byId("status-filter").addEventListener("change", () => refreshTasks(true));
+byId("page-prev").addEventListener("click", () => goPage(-1));
+byId("page-next").addEventListener("click", () => goPage(1));
+byId("page-size").addEventListener("change", (event) => {
+  pageSize = Number.parseInt(event.target.value, 10) || 20;
+  refreshTasks(true);
+});
+byId("sync-button").addEventListener("click", syncTasks);
+byId("new-button").addEventListener("click", openNewTask);
+byId("new-task-cancel").addEventListener("click", closeNewTask);
+byId("new-task-submit").addEventListener("click", submitNewTask);
+byId("task-repo").addEventListener("change", () => { renderBaseRefs(); renderScopeProfiles(); });
+byId("task-scope-profile").addEventListener("change", renderScopePreview);
+byId("drawer-close").addEventListener("click", closeDrawer);
+byId("drawer-overlay").addEventListener("click", closeDrawer);
+byId("new-task-overlay").addEventListener("click", (event) => {
+  if (event.target === byId("new-task-overlay")) closeNewTask();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (byId("new-task-overlay").classList.contains("show")) closeNewTask();
+  else closeDrawer();
+});
+
+refreshState();
+refreshTasks();
+setInterval(refreshState, 10000);
+setInterval(refreshTasks, 5000);
+</script>
+</body>
+</html>

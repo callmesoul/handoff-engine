@@ -1,6 +1,8 @@
-# Handoff Studio
+# Handoff Studio（后端专用）
 
-Handoff Studio 在原任务面板之外，把**实现执行器换成了 DSH 自己**：用面板里选定的
+> 本插件只部署在后端执行机；前端部署不安装。
+
+Handoff Studio 在后端原任务面板之外，把**实现执行器换成了 DSH 自己**：用面板里选定的
 模型跑任务实现，而不是拉起 `codex` / `zcode` 子进程。
 
 ## 它解决什么
