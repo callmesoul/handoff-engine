@@ -41,7 +41,7 @@ description: 创建、查询、删除前后端交接任务，或触发交付验�
 
 在写草稿和调用 `$CTL create` 之前，先从需求、契约及 `acceptance.checks` 用到的已登记脚本中盘点验收依赖的环境变量和凭据，例如 `SAAS_TEST_SESSION_COOKIE`：
 
-- 发起端/前端：`$CTL create` 会用与 verifier 相同的 resolver 检查本机 secret。缺失时必须先停下来，明确指出变量名并向用户索取；拿到后由助手写入前端本机 secret 文件与 `local.yaml` 的 `refs`/`bindings`（只写路径和引用名，不写明文进任务）。检查时只报告“存在/缺失”，不得输出明文值。
+- 发起端/前端：先查 `config/local.yaml` 的 `secrets`（含 `refs`/`bindings` 与 `*_FILE`）和进程环境，已经配置且文件存在/可解析的 secret（如 `OPENAPI_API_KEY`、`DOCS_API_KEY`、`SAAS_TEST_SESSION_COOKIE`）直接取用，不再询问用户。只有确实缺失本机配置或文件时，才停下来明确指出变量名并向用户索取；拿到后由助手写入前端本机 secret 文件与 `local.yaml` 的 `refs`/`bindings`，后续 create 直接复用。检查时只报告“存在/缺失”，不得输出明文值。
 - 后端：不要从本机环境推断远端状态，也不要在 create 前追问后端是否手工配置。后端侧以 `$CTL create` 的 `secret_provision` + `secret_preflight` 实测结果为准：前者在已签名通道内把前端 secret 加密推送给后端 listener 自动落盘，后者验证双方均存在且按 `same_value` 要求一致。
 - `secret_provision` / `secret_preflight` 任一步 fail closed（本机缺失、后端未开启 provision、ref 未授权、值不一致、协议/签名错误）就不写任务，绝不先创建再等后端索取凭据。
 - 凭据值不得写入草稿、`requirement`、契约、附件或回报；用户提供后只能通过双方约定的安全配置方式注入本机运行环境，明文绝不进任务/Git/日志。
